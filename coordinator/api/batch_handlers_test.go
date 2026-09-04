@@ -457,7 +457,7 @@ func (e *batchEnv) settleSucceeded(item *store.BatchItem, body []byte) {
 func (e *batchEnv) settleFailed(item *store.BatchItem) {
 	e.t.Helper()
 	ok, err := e.st.FinishItem(store.ItemResult{
-		ItemID: item.ID, Succeeded: false, ErrorCode: batchItemErrorRequestFailed,
+		ItemID: item.ID, Succeeded: false, ErrorCode: batchRequestFailedCode,
 	}, time.Now().UTC())
 	if err != nil || !ok {
 		e.t.Fatalf("finish failed item: ok=%v err=%v", ok, err)

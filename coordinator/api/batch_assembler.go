@@ -28,16 +28,17 @@ import (
 
 // Terminal error codes an item can carry, and the fixed message each renders
 // as. Provider text never reaches an error file.
+// batchRequestFailedCode (batch_dispatch.go) is the third member of this set;
+// it is the code the dispatch funnel already settles a failed attempt with.
 const (
-	batchItemErrorRequestFailed = "request_failed"
-	batchItemErrorExpired       = "batch_expired"
-	batchItemErrorCancelled     = "batch_cancelled"
+	batchItemErrorExpired   = "batch_expired"
+	batchItemErrorCancelled = "batch_cancelled"
 )
 
 var batchItemErrorMessages = map[string]string{
-	batchItemErrorRequestFailed: "The request could not be completed by any provider.",
-	batchItemErrorExpired:       "The batch expired before this request was processed.",
-	batchItemErrorCancelled:     "The batch was cancelled before this request was processed.",
+	batchRequestFailedCode:  "The request could not be completed by any provider.",
+	batchItemErrorExpired:   "The batch expired before this request was processed.",
+	batchItemErrorCancelled: "The batch was cancelled before this request was processed.",
 }
 
 // BatchOutputRetention is how long an assembled output or error file, and the
@@ -109,7 +110,7 @@ func (s *Server) FinalizeBatchIfDone(batchID string, now time.Time) (*FinalizeRe
 	}
 
 	if outputFileID != nil || errorFileID != nil {
-		attached, err := s.store.AttachOutputFiles(batchID, outputFileID, errorFileID, now)
+		attached, err := s.store.AttachOutputFiles(batchID, outputFileID, errorFileID)
 		if err != nil {
 			return nil, fmt.Errorf("batch: attach output files: %w", err)
 		}
@@ -236,7 +237,7 @@ func batchItemError(it *store.BatchItem) itemErrorBody {
 		code = batchItemErrorExpired
 	}
 	if _, known := batchItemErrorMessages[code]; !known {
-		code = batchItemErrorRequestFailed
+		code = batchRequestFailedCode
 	}
 	return itemErrorBody{Code: code, Message: batchItemErrorMessages[code]}
 }

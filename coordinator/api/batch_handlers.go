@@ -14,6 +14,7 @@ package api
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -177,6 +178,13 @@ func (s *Server) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.store.CreateBatch(batch, records); err != nil {
 		s.rollbackItemBlobs(blobs, written)
+		if errors.Is(err, store.ErrDuplicateCustomID) {
+			// The parser already rejects duplicates; this is the store's
+			// backstop, reported as the same 400 rather than a 500.
+			s.writeBatchError(w, batchErr("duplicate_custom_id", "custom_id",
+				"two requests in this batch share a custom_id"))
+			return
+		}
 		s.logger.Error("batch: create failed", "batch_id", batchID, "error", err)
 		s.writeBatchError(w, internalBatchError(err))
 		return

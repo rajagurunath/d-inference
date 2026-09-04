@@ -138,10 +138,10 @@ func TestFinalizeWritesOutputAndErrorFiles(t *testing.T) {
 	if errorLines[0].CustomID != "req-2" || errorLines[0].Response != nil {
 		t.Fatalf("unexpected error line: %+v", errorLines[0])
 	}
-	if errorLines[0].Error == nil || errorLines[0].Error.Code != batchItemErrorRequestFailed {
+	if errorLines[0].Error == nil || errorLines[0].Error.Code != batchRequestFailedCode {
 		t.Fatalf("error code = %+v", errorLines[0].Error)
 	}
-	if errorLines[0].Error.Message != batchItemErrorMessages[batchItemErrorRequestFailed] {
+	if errorLines[0].Error.Message != batchItemErrorMessages[batchRequestFailedCode] {
 		t.Fatalf("error message is not the fixed string: %q", errorLines[0].Error.Message)
 	}
 
