@@ -305,6 +305,11 @@ type SuiteConfig struct {
 	// REQUESTS a backend, this one asserts the CONSTRUCTED one — a lane
 	// exercising the `.auto` default sets only the expectation.
 	ExpectKVBackend string
+	// ListenAddr pins the coordinator's HTTP listener to a fixed address
+	// (e.g. "127.0.0.1:18080") instead of the ephemeral 127.0.0.1:0 default.
+	// Empty preserves the ephemeral-port behaviour every existing suite
+	// relies on.
+	ListenAddr string
 }
 
 func DefaultSuiteConfig() SuiteConfig {
