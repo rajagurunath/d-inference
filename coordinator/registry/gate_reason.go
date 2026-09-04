@@ -45,6 +45,13 @@ const (
 	GateExcluded
 	GateAllowlist
 	GateNotServingModel
+	// GateBatchHeadroom: the request is on the batch lane (RequestTraits.Lane
+	// == LaneBatch) and this provider's slot for the model has no headroom the
+	// batch lane may use — either a waiting row (any lane) or a running count
+	// already at Registry.BatchRowsAllowed. Distinct from GateNoHeadroom, which
+	// is the online admission cap: a slot can be perfectly admittable online and
+	// still be closed to batch.
+	GateBatchHeadroom
 	// GateReasonCount is the number of reasons; it sizes the tally arrays and
 	// is not itself a reason.
 	GateReasonCount
@@ -78,6 +85,7 @@ var gateReasonNames = [GateReasonCount]string{
 	GateExcluded:             "excluded",
 	GateAllowlist:            "allowlist",
 	GateNotServingModel:      "not_serving_model",
+	GateBatchHeadroom:        "batch_headroom",
 }
 
 // String returns the snake_case name of the reason ("unknown" for an

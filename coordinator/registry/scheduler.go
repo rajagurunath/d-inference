@@ -131,12 +131,19 @@ type routingSnapshot struct {
 	pendingBytesKnown        bool
 	backendRunning           int
 	backendWaiting           int
-	maxTokensPotential       int64
-	decodeTPS                float64
-	prefillTPS               float64
-	systemMetrics            protocol.SystemMetrics
-	gpuMemoryActiveGB        float64
-	totalMemoryGB            float64
+	// batchRowsAllowed is Registry.BatchRowsAllowed for this (provider, model)
+	// pair, captured under the same p.mu as backendRunning/backendWaiting so the
+	// batch-lane candidate filter compares the allowance against exactly the live
+	// slot state the online reservation is scored on. Filled ONLY for a batch-lane
+	// snapshot (traits.Lane == LaneBatch); zero — and unread — otherwise, so the
+	// online hot path pays nothing for it.
+	batchRowsAllowed   int
+	maxTokensPotential int64
+	decodeTPS          float64
+	prefillTPS         float64
+	systemMetrics      protocol.SystemMetrics
+	gpuMemoryActiveGB  float64
+	totalMemoryGB      float64
 	// freeForLoadGB is the provider-reported max additional model-weight (GB) it
 	// can load right now (net of cap/reserve/headroom, idle models reclaimed).
 	// When non-nil it is the authoritative cold-load gate; nil = legacy provider
@@ -737,7 +744,11 @@ func (r *Registry) commitProviderReservation(
 	if !slotStateModelLoaded(candidate.snapshot.slotState) {
 		r.RecordWarmPoolColdDispatch(model)
 	}
-	if !pr.RequiresVision && candidate.breakdown.RawTTFTMs > 0 && candidate.breakdown.StateMs == 0 {
+	// Warm text ONLINE dispatches only: a batch attempt runs against a 120s
+	// deadline on a slot chosen for headroom, so its actual/predicted ratio
+	// would teach the calibrator about a lane the live TTFT ceiling never gates.
+	if !pr.RequiresVision && pr.Traits.Lane != LaneBatch &&
+		candidate.breakdown.RawTTFTMs > 0 && candidate.breakdown.StateMs == 0 {
 		ttftCalibration.notePrediction(
 			pr.RequestID, pr.Attempt, model, candidate.snapshot.chipFamily,
 			candidate.breakdown.RawTTFTMs)
@@ -1776,6 +1787,12 @@ func (r *Registry) snapshotProviderReasonLockedEx(p *Provider, model string, tra
 	// rate for TTFT/cost estimation, and NOT the observed-under-load value.
 	// No-op (legacy flat cap) when the cap is disabled.
 	snap.hasHeadroom = r.hasConcurrencyHeadroomForModelCapResolvedLocked(p, model)
+	// Batch-lane allowance, resolved here so the candidate filter reads it from
+	// the same locked view as the slot counters below (buildCandidateGateLocked
+	// runs after p.mu has been released). Online snapshots skip it entirely.
+	if traits.Lane == LaneBatch {
+		snap.batchRowsAllowed = r.batchRowsAllowedLocked(p, model)
+	}
 	snap.hasBackendCapacity = p.BackendCapacity != nil
 
 	if p.BackendCapacity != nil {
@@ -2085,6 +2102,20 @@ func (r *Registry) buildCandidateGateLocked(snap routingSnapshot, pr *PendingReq
 	}
 	if !snap.hasHeadroom {
 		return nil, rejectCapacity, GateNoHeadroom, false
+	}
+	// Batch lane: headroom-only placement. A batch attempt may occupy a slot
+	// ONLY while nothing is already waiting on it (any lane — a waiting row means
+	// the slot is oversubscribed right now) and its running count is still below
+	// the batch row allowance, which is the router's own quality-concurrency cap
+	// for the pair minus the row reserved for online traffic. Both terms come
+	// from the SAME live snapshot the online reservation is scored on, so batch
+	// can never be admitted against a stale or parallel view of the slot.
+	// Reported as a capacity rejection (transient — the slot reopens as soon as
+	// online traffic drains), with its own gate reason so co-serving telemetry
+	// can tell a closed batch slot apart from a full one.
+	if pr.Traits.Lane == LaneBatch &&
+		(snap.backendWaiting > 0 || snap.backendRunning >= snap.batchRowsAllowed) {
+		return nil, rejectCapacity, GateBatchHeadroom, false
 	}
 
 	if snap.systemMetrics.ThermalState == "critical" {

@@ -271,6 +271,14 @@ func quoteHedgeConfidence(confidence string) hedgeQuoteConfidence {
 //     still really in flight, so it acquires a slot ungoverned: capacity-
 //     aware requests must see it against their budget.
 func (d *dispatchState) tryAcquireBackupHedge(primaryID string) (hedgeVerdict, bool) {
+	// Batch lane: never hedge, and never claim a budget slot. A hedge is
+	// latency insurance for a request with a first-content SLA; a batch item
+	// has 24 hours and is placed only on headroom, so a racing copy would spend
+	// a second headroom slot — capacity an online request could have had — to
+	// buy nothing. Returned unacquired, so there is no counter to release.
+	if d.lane == registry.LaneBatch {
+		return hedgeSuppressBatchLane, false
+	}
 	g := d.s.hedgeGov
 	if g == nil {
 		return hedgeAllow, false

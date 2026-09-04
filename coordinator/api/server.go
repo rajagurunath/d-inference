@@ -80,7 +80,25 @@ const (
 	ctxKeyConsumer contextKey = iota
 	ctxKeyRequestID
 	ctxKeyAPIKey
+	ctxKeyLane
 )
+
+// withRequestLane stamps the service lane a request must route on. Only
+// coordinator-internal callers set it — today DispatchBatchItem, which drives
+// the ordinary consumer handler with a synthetic request. A consumer-supplied
+// lane arrives through the request BODY (service_tier), never through here.
+func withRequestLane(ctx context.Context, lane registry.Lane) context.Context {
+	return context.WithValue(ctx, ctxKeyLane, lane)
+}
+
+// laneFromContext returns the coordinator-stamped lane, or registry.LaneOnline
+// (the zero value) when nothing stamped one.
+func laneFromContext(ctx context.Context) registry.Lane {
+	if v, ok := ctx.Value(ctxKeyLane).(registry.Lane); ok {
+		return v
+	}
+	return registry.LaneOnline
+}
 
 // requestIDFromContext returns the per-request correlation ID set by
 // the logging middleware. Empty if the request didn't pass through the

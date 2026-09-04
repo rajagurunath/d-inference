@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"sync"
 	"testing"
@@ -110,6 +111,121 @@ func TestCreateBatchStartsValidating(t *testing.T) {
 				if it.State != ItemPending {
 					t.Errorf("item %d state = %q, want %q", i, it.State, ItemPending)
 				}
+			}
+		})
+	}
+}
+
+// TestCreateBatchScalesToLargeItemCount guards against CreateBatch inserting
+// items one at a time under a fixed timeout: a batch this size must load via
+// a bulk path (CopyFrom on Postgres) well inside a few seconds.
+func TestCreateBatchScalesToLargeItemCount(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			const n = 5000
+			started := time.Now()
+			b, items := seedBatch(t, s, uniqueID("acct"), n)
+			if elapsed := time.Since(started); elapsed > 5*time.Second {
+				t.Fatalf("CreateBatch(%d items) took %v, want under 5s", n, elapsed)
+			}
+
+			listed, err := s.ListItems(b.ID)
+			if err != nil {
+				t.Fatalf("ListItems: %v", err)
+			}
+			if len(listed) != len(items) {
+				t.Fatalf("ListItems returned %d items, want %d", len(listed), len(items))
+			}
+		})
+	}
+}
+
+func TestCreateBatchRejectsDuplicateCustomID(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			acct := uniqueID("acct")
+			file := &BatchFile{
+				ID:        uniqueID("file"),
+				AccountID: acct,
+				Purpose:   "batch",
+				Filename:  "requests.jsonl",
+				SizeBytes: 256,
+				CreatedAt: time.Now().UTC(),
+				SealedBy:  "coordinator",
+			}
+			file.BlobRef = file.ID
+			if err := s.CreateBatchFile(file); err != nil {
+				t.Fatalf("CreateBatchFile: %v", err)
+			}
+
+			now := time.Now().UTC()
+			b := &Batch{
+				ID:               uniqueID("batch"),
+				AccountID:        acct,
+				InputFileID:      file.ID,
+				Endpoint:         "/v1/chat/completions",
+				CompletionWindow: "24h",
+				CreatedAt:        now,
+				ExpiresAt:        now.Add(24 * time.Hour),
+				CountsTotal:      2,
+				SealedTo:         "coordinator",
+				Source:           "file",
+			}
+			dup := uniqueID("req")
+			id1, id2 := uniqueID("bitem"), uniqueID("bitem")
+			items := []*BatchItem{
+				{ID: id1, BatchID: b.ID, CustomID: dup, LineNo: 1, State: ItemPending, BlobRef: id1},
+				{ID: id2, BatchID: b.ID, CustomID: dup, LineNo: 2, State: ItemPending, BlobRef: id2},
+			}
+
+			err := s.CreateBatch(b, items)
+			if !errors.Is(err, ErrDuplicateCustomID) {
+				t.Fatalf("CreateBatch = %v, want ErrDuplicateCustomID", err)
+			}
+			if _, ok := s.GetBatch(acct, b.ID); ok {
+				t.Fatal("batch was created despite a duplicate custom_id")
+			}
+		})
+	}
+}
+
+// TestCreateBatchInlineSourceHasNoInputFile covers the inline batch form,
+// which has no uploaded file: input_file_id must accept an empty string
+// rather than requiring a row in batch_files.
+func TestCreateBatchInlineSourceHasNoInputFile(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			acct := uniqueID("acct")
+			now := time.Now().UTC()
+			b := &Batch{
+				ID:               uniqueID("batch"),
+				AccountID:        acct,
+				InputFileID:      "",
+				Endpoint:         "/v1/chat/completions",
+				CompletionWindow: "24h",
+				CreatedAt:        now,
+				ExpiresAt:        now.Add(24 * time.Hour),
+				CountsTotal:      1,
+				SealedTo:         "coordinator",
+				Source:           "inline",
+				Model:            "some-model",
+			}
+			id := uniqueID("bitem")
+			items := []*BatchItem{{ID: id, BatchID: b.ID, CustomID: uniqueID("req"), LineNo: 1, State: ItemPending, BlobRef: id}}
+
+			if err := s.CreateBatch(b, items); err != nil {
+				t.Fatalf("CreateBatch(inline): %v", err)
+			}
+
+			got, ok := s.GetBatch(acct, b.ID)
+			if !ok {
+				t.Fatal("GetBatch: batch not found")
+			}
+			if got.InputFileID != "" {
+				t.Fatalf("input_file_id = %q, want empty", got.InputFileID)
+			}
+			if got.Source != "inline" {
+				t.Fatalf("source = %q, want inline", got.Source)
 			}
 		})
 	}
@@ -563,11 +679,11 @@ func TestAttachOutputFilesFirstWriterWins(t *testing.T) {
 			second := uniqueID("file-out")
 			errFile := uniqueID("file-err")
 
-			ok, err := s.AttachOutputFiles(b.ID, &first, &errFile, time.Now().UTC())
+			ok, err := s.AttachOutputFiles(b.ID, &first, &errFile)
 			if err != nil || !ok {
 				t.Fatalf("AttachOutputFiles = %v, %v; want true, nil", ok, err)
 			}
-			ok, err = s.AttachOutputFiles(b.ID, &second, nil, time.Now().UTC())
+			ok, err = s.AttachOutputFiles(b.ID, &second, nil)
 			if err != nil {
 				t.Fatalf("second AttachOutputFiles: %v", err)
 			}
@@ -665,6 +781,65 @@ func TestListBatchesIsScopedPagedAndNewestFirst(t *testing.T) {
 	}
 }
 
+func TestListBatchesDefaultsLimitTo20(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			acct := uniqueID("acct")
+			for range 25 {
+				seedBatch(t, s, acct, 0)
+			}
+
+			page, err := s.ListBatches(acct, 0, "")
+			if err != nil {
+				t.Fatalf("ListBatches: %v", err)
+			}
+			if len(page) != 20 {
+				t.Fatalf("page = %d batches, want 20 (default limit)", len(page))
+			}
+		})
+	}
+}
+
+func TestListBatchesUnknownCursorReturnsFirstPage(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			acct := uniqueID("acct")
+			b, _ := seedBatch(t, s, acct, 0)
+
+			page, err := s.ListBatches(acct, 10, uniqueID("missing-batch"))
+			if err != nil {
+				t.Fatalf("ListBatches(unknown cursor): %v", err)
+			}
+			if len(page) != 1 || page[0].ID != b.ID {
+				t.Fatalf("page = %+v, want [%q] (first page)", page, b.ID)
+			}
+		})
+	}
+}
+
+// TestListBatchesCursorIsAccountScoped covers a cursor that names a real
+// batch belonging to a different account: it must not resolve, since a
+// resolved cursor would let one account probe another's page boundaries.
+func TestListBatchesCursorIsAccountScoped(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			acct := uniqueID("acct")
+			other := uniqueID("acct")
+
+			mine, _ := seedBatch(t, s, acct, 0)
+			theirs, _ := seedBatch(t, s, other, 0)
+
+			page, err := s.ListBatches(acct, 10, theirs.ID)
+			if err != nil {
+				t.Fatalf("ListBatches: %v", err)
+			}
+			if len(page) != 1 || page[0].ID != mine.ID {
+				t.Fatalf("page = %+v, want [%q] (cross-account cursor ignored)", page, mine.ID)
+			}
+		})
+	}
+}
+
 func TestCompletionRateWindow(t *testing.T) {
 	for name, s := range storeBackends(t) {
 		t.Run(name, func(t *testing.T) {
@@ -695,6 +870,38 @@ func TestCompletionRateWindow(t *testing.T) {
 			}
 			if rate < 0.199 || rate > 0.201 {
 				t.Fatalf("rate = %v, want 0.2/s", rate)
+			}
+		})
+	}
+}
+
+// TestCompletionRateExcludesExpiredAndCancelled guards against counting an
+// expired or cancelled item as finished: closeOpenItems stamps finished_at on
+// both, but neither is a completion.
+func TestCompletionRateExcludesExpiredAndCancelled(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now().UTC()
+
+			b, _ := startBatch(t, s, uniqueID("acct"), 2)
+			claimed, err := s.ClaimPendingItems(b.ID, 2, now)
+			if err != nil || len(claimed) != 2 {
+				t.Fatalf("ClaimPendingItems = %d items, %v", len(claimed), err)
+			}
+			if ok, err := s.FinishItem(ItemResult{ItemID: claimed[0].ID, Succeeded: true}, now); err != nil || !ok {
+				t.Fatalf("FinishItem = %v, %v", ok, err)
+			}
+			// The other item expires rather than finishing; it must not count.
+			if _, err := s.ExpireOpenItems(b.ID, now); err != nil {
+				t.Fatalf("ExpireOpenItems: %v", err)
+			}
+
+			rate, known := s.CompletionRate(time.Minute, now)
+			if !known {
+				t.Fatal("CompletionRate reported unknown with one succeeded item")
+			}
+			if want := 1.0 / 60.0; rate < want-0.0001 || rate > want+0.0001 {
+				t.Fatalf("rate = %v, want %v (expired item must not count)", rate, want)
 			}
 		})
 	}

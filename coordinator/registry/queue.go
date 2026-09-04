@@ -31,6 +31,16 @@ import (
 // ErrQueueFull is returned when the queue for a model has reached maxSize.
 var ErrQueueFull = errors.New("request queue is full")
 
+// ErrBatchLaneNotQueueable is returned by Enqueue for a batch-lane request. The
+// batch lane exists to fill headroom the online quality cap leaves empty: a
+// batch item that finds no headroom is released back to the batch store and
+// re-claimed on a later dispatcher tick, so parking it in the coordinator wait
+// queue would hold a slot reservation hostage against online traffic for up to
+// the queue's whole 120s wait, for work that has 24 hours to complete. The
+// consumer path answers such a request with a retryable 429 instead; this error
+// is the structural backstop for any future caller.
+var ErrBatchLaneNotQueueable = errors.New("batch-lane requests are never queued")
+
 // ErrQueueTimeout is returned when a queued request times out waiting for a provider.
 var ErrQueueTimeout = errors.New("request queue timeout")
 
@@ -287,6 +297,9 @@ func NewRequestQueueFromEnv() *RequestQueue {
 // Enqueue adds a request to the queue for the given model.
 // Returns ErrQueueFull if the queue for this model is at capacity.
 func (q *RequestQueue) Enqueue(req *QueuedRequest) error {
+	if req != nil && req.Pending != nil && req.Pending.Traits.Lane == LaneBatch {
+		return ErrBatchLaneNotQueueable
+	}
 	req.init()
 
 	q.mu.Lock()

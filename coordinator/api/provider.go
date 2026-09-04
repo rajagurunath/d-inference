@@ -2211,7 +2211,14 @@ func (s *Server) handleCompleteAt(
 	// dispatch.writeCommittedResponse), because that goroutine owns pr.Timing;
 	// reading it from this provider read-loop goroutine would race the dispatch
 	// writes. Passing 0 latency counts the success without touching the EWMA.
-	s.registry.RecordJobSuccess(providerID, 0)
+	// Batch attempts are invisible to provider reputation. Co-serving must not
+	// let the lane a request happened to arrive on move a provider's score:
+	// batch is placed on headroom with a 120s budget and settles on its own
+	// retry ladder, so counting it would reward boxes that merely take more
+	// batch work and punish nothing an online consumer ever felt.
+	if pr.Traits.Lane != registry.LaneBatch {
+		s.registry.RecordJobSuccess(providerID, 0)
+	}
 	// Serving this model proves the pair can load — lift any cool-down early.
 	s.registry.ClearDispatchLoadCooldown(providerID, pr.Model)
 
@@ -2816,7 +2823,11 @@ func (s *Server) handleInferenceErrorOwned(providerID string, provider *registry
 	cancelTerminal := msg.FailureCode == protocol.FailureCodeCancelled ||
 		msg.TerminalCause == terminalCauseCancelled
 	providerHealthNeutral := isProviderHealthNeutralErrorReason(msg.ErrorReason)
-	if !capacityRejection && !cancelTerminal && !providerHealthNeutral && !causeNeutralForHealth {
+	// Batch attempts never take a reputation strike either (see the success
+	// side in handleCompleteAt): the batch lane owns its own retry ladder and
+	// must not erode a provider's online standing.
+	if !capacityRejection && !cancelTerminal && !providerHealthNeutral && !causeNeutralForHealth &&
+		pr.Traits.Lane != registry.LaneBatch {
 		s.registry.RecordJobFailure(providerID)
 	}
 
