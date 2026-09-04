@@ -1,6 +1,6 @@
 # Single-Mac dev loop
 
-> Last updated: 2026-09-04 · commit `a0a03dca8`
+> Last updated: 2026-09-04 · commit `1a541c33b`
 
 Run a coordinator and one provider on one Mac for manual testing, without
 touching the shared dev environment or writing a throwaway launch script. For
@@ -168,50 +168,51 @@ COORD=http://127.0.0.1:18080 API_KEY=$DARKBLOOM_DEV_KEY \
 MODEL=$DARKBLOOM_TESTBED_MODEL ./scripts/dev-smoke-batch-api.sh
 ```
 
-Expect, on a coordinator with the batch lane wired:
+Expect:
 
 ```
+--- warm the model with one synchronous completion ---
+model warm
 --- POST /v1/files ---
 uploaded file-…
 --- POST /v1/batches ---
 created batch_…
---- GET /v1/batches/batch_… ---
-batch batch_… is in_progress with 3 requests
+--- GET /v1/batches/batch_… (poll to completed, up to 180s) ---
+  status=in_progress completed=0 failed=0 total=3
+  status=in_progress completed=1 failed=0 total=3
+  status=completed completed=3 failed=0 total=3
+batch batch_… completed with 3 of 3 requests
 batch API smoke PASSED
 ```
 
-**Two caveats you will hit today**, both in the harness rather than in the
-coordinator:
+The warm-up step is load-bearing. The dispatcher claims items only for a model
+some provider slot has headroom for, and a provider that has never served the
+model has no slot for it — so a batch created against a freshly started stack
+sits at `in_progress` indefinitely with nothing in the log. One ordinary chat
+completion loads the model and the next dispatcher tick starts claiming.
 
-1. **`make dev-stack` does not wire the batch lane.** The sealed blob store
-   and the dispatcher are installed only by
-   `coordinator/cmd/coordinator/main.go` and
-   `coordinator/cmd/coordinator/batch_lane.go`; the testbed builds
-   `api.NewServer` directly (`e2e/testbed/suite.go`) and never calls
-   `SetBatchBlobStore`. The two `EIGENINFERENCE_BATCH_*` variables above are
-   therefore inert against the devstack, and every batch route answers
-   `503 batch_unavailable` — the script aborts at `POST /v1/files`. A
-   coordinator started from `coordinator/cmd/coordinator` does read them, but
-   a bare memory-store coordinator has an empty model catalog and refuses
-   every model with `model_not_found`. Until the devstack installs the blob
-   store, the batch round trip is exercised by
-   `GOTOOLCHAIN=auto go test ./api/ -run Batch` and
-   `go test ./batchlane/`, not by this script.
-2. **`dev-smoke-batch-api.sh` asserts `in_progress`.** It was written before
-   the dispatcher landed. With the dispatcher running, three short items can
-   settle in under a second, and the script then prints
-   `FAIL: status = completed, want in_progress` on a batch that in fact
-   worked. Export `EIGENINFERENCE_BATCH_LANE_ENABLED=false` to hold the batch
-   at `in_progress`, or read the batch id it prints and poll
-   `GET /v1/batches/{id}` by hand.
+**`make dev-stack` wires the batch lane, but only if the two
+`EIGENINFERENCE_BATCH_*` variables are exported before you start it.**
+`e2e/testbed/suite.go` builds the sealed blob store from
+`api.ReadBatchConfig()` and starts the dispatcher
+(`startTestbedBatchDispatcher`) exactly the way
+`coordinator/cmd/coordinator/batch_lane.go` does for the production binary —
+but `api.NewBatchBlobStore` returns `(nil, nil)` when there is neither a
+mnemonic nor `EIGENINFERENCE_BATCH_DEV_INSECURE_KEY`, and then every batch
+route answers `503 batch_unavailable` and the script aborts at
+`POST /v1/files`. The variables are read once at startup, so exporting them
+after `make dev-stack` is running has no effect: stop the stack, export, start
+again. Startup logs `batch lane enabled blob_dir=…` and
+`batch lane dispatcher started` when it worked.
 
-Batch environment for any coordinator you *do* start yourself:
+Batch environment (exported before `make dev-stack`, and for any coordinator
+you start yourself):
 
 | Variable | Dev value | Why |
 |---|---|---|
 | `EIGENINFERENCE_BATCH_DEV_INSECURE_KEY` | `true` | No mnemonic locally, so the lane would otherwise refuse to start. Blobs become unreadable at restart; that is fine for a dev loop |
 | `EIGENINFERENCE_BATCH_BLOB_DIR` | `$TMPDIR/darkbloom-batch` | The default is `/mnt/disks/userdata/batch`, which does not exist on a Mac |
-| `EIGENINFERENCE_BATCH_LANE_ENABLED` | unset (`true`) | Set `false` to keep the API serving while nothing dispatches |
+| `EIGENINFERENCE_BATCH_LANE_ENABLED` | unset (`true`) | Set `false` to keep the API serving while nothing dispatches. Read only by `coordinator/cmd/coordinator/batch_lane.go`; `make dev-stack` starts its dispatcher unconditionally once the blob store exists |
 
 Full descriptions:
 [`../reference/configuration.md#batch-lane`](../reference/configuration.md#batch-lane).
@@ -266,7 +267,8 @@ operator-facing surface for the model-load verdict.
 | smoke script prints `no SSE 'data:' line within 60s` | Slow first load, or the wrong model was requested | Re-run; confirm the script's `DARKBLOOM_TESTBED_MODEL` matches what `make dev-stack` served |
 | `DARKBLOOM_DEV_KEY not set` | Forgot to copy the key `make dev-stack` printed | Copy it from terminal A's startup output |
 | Port 18080 still held after you stopped the stack | SIGINT went to `make`/`sh`, not the Go binary | `kill -INT "$(pgrep -f 'exe/devstack')"` |
-| Every `/v1/files` or `/v1/batches` call returns `503 batch_unavailable` | The coordinator has no batch blob store — expected against `make dev-stack` today | See caveat 1 in the [Morning checklist](#morning-checklist) |
+| A batch stays at `in_progress` with `completed: 0` and nothing in the log | The model is not resident on any provider, so no slot has batch headroom and the dispatcher claims nothing | Serve one ordinary chat completion for that model first (`dev-smoke-batch-api.sh` now does this itself) |
+| Every `/v1/files` or `/v1/batches` call returns `503 batch_unavailable` | The coordinator has no batch blob store: `EIGENINFERENCE_BATCH_DEV_INSECURE_KEY` / `EIGENINFERENCE_BATCH_BLOB_DIR` were not exported *before* the stack started | Stop the stack, export both, start again; confirm `batch lane enabled` in the startup log |
 
 ## Related
 

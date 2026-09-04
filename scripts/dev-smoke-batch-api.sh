@@ -1,11 +1,16 @@
 #!/bin/bash
 # Smoke test for the coordinator's Batch API surface (Tidal batch lane, PR2).
 #
-# Uploads a three-line JSONL input file, creates a batch from it, and asserts
-# the batch is admitted with request_counts.total == 3. It deliberately stops
-# there: nothing dispatches batch items until the batch dispatcher lands
-# (PR3b), so a batch that reaches in_progress with all three items counted is
-# the whole of what this PR can prove end to end.
+# Warms the model with one synchronous completion, uploads a three-line JSONL
+# input file, creates a batch from it, polls until the batch is `completed`, and
+# asserts request_counts.completed == 3. With the dispatcher running and the
+# model resident, three short items settle in seconds; the 180 s budget is there
+# for a slow box.
+#
+# The warm-up is not optional: the dispatcher claims items only for a model some
+# provider slot has headroom for, and a provider that has never served the model
+# has no slot for it, so a batch created against a cold stack sits at
+# `in_progress` forever.
 #
 # The coordinator must be running with the batch lane enabled, i.e. a mnemonic
 # configured, or EIGENINFERENCE_BATCH_DEV_INSECURE_KEY=true for local
@@ -65,6 +70,22 @@ PY
 done
 green "wrote $(wc -l < "$INPUT" | tr -d ' ') lines"
 
+step "warm the model with one synchronous completion"
+# The batch dispatcher only claims items for a model some provider slot has
+# headroom for, and a provider that has never served the model has no slot for
+# it at all. On a freshly started stack the batch therefore sits at
+# in_progress indefinitely. One ordinary chat completion loads the model (a few
+# seconds, cold) and the dispatcher starts claiming on its next tick.
+WARM_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$COORD/v1/chat/completions" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK.\"}],\"max_tokens\":8}")
+if [ "$WARM_CODE" != "200" ]; then
+  red "FAIL: warm-up completion returned HTTP $WARM_CODE — the model is not servable, so no batch item can be either"
+  exit 1
+fi
+green "model warm"
+
 step "POST /v1/files"
 FILE_JSON=$(curl -fsS -X POST "$COORD/v1/files" \
   -H "Authorization: Bearer $API_KEY" \
@@ -89,21 +110,36 @@ if [ -z "$BATCH_ID" ]; then
 fi
 green "created $BATCH_ID"
 
-step "GET /v1/batches/$BATCH_ID"
-GET_JSON=$(curl -fsS "$COORD/v1/batches/$BATCH_ID" -H "Authorization: Bearer $API_KEY")
-STATUS=$(printf '%s' "$GET_JSON" | jq_field status)
-TOTAL=$(printf '%s' "$GET_JSON" | jq_field request_counts.total)
+step "GET /v1/batches/$BATCH_ID (poll to completed, up to ${POLL_TIMEOUT:-180}s)"
+POLL_TIMEOUT="${POLL_TIMEOUT:-180}"
+POLL_INTERVAL="${POLL_INTERVAL:-2}"
+DEADLINE=$(( $(date +%s) + POLL_TIMEOUT ))
+STATUS=""
+GET_JSON=""
 
-if [ "$STATUS" != "in_progress" ]; then
-  red "FAIL: status = $STATUS, want in_progress"
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  GET_JSON=$(curl -fsS "$COORD/v1/batches/$BATCH_ID" -H "Authorization: Bearer $API_KEY")
+  STATUS=$(printf '%s' "$GET_JSON" | jq_field status)
+  COMPLETED=$(printf '%s' "$GET_JSON" | jq_field request_counts.completed)
+  FAILED=$(printf '%s' "$GET_JSON" | jq_field request_counts.failed)
+  TOTAL=$(printf '%s' "$GET_JSON" | jq_field request_counts.total)
+  printf '  status=%s completed=%s failed=%s total=%s\n' "$STATUS" "$COMPLETED" "$FAILED" "$TOTAL"
+  case "$STATUS" in
+    completed|failed|cancelled|expired) break ;;
+  esac
+  sleep "$POLL_INTERVAL"
+done
+
+if [ "$STATUS" != "completed" ]; then
+  red "FAIL: status = ${STATUS:-<none>}, want completed within ${POLL_TIMEOUT}s"
   printf '%s\n' "$GET_JSON"
   exit 1
 fi
-if [ "$TOTAL" != "3" ]; then
-  red "FAIL: request_counts.total = $TOTAL, want 3"
+if [ "$COMPLETED" != "3" ]; then
+  red "FAIL: request_counts.completed = $COMPLETED, want 3"
   printf '%s\n' "$GET_JSON"
   exit 1
 fi
 
-green "batch $BATCH_ID is in_progress with 3 requests"
+green "batch $BATCH_ID completed with 3 of 3 requests"
 green "batch API smoke PASSED"
