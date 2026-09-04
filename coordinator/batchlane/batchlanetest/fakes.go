@@ -140,15 +140,28 @@ type FakeFinalize struct {
 	calls []string
 	// Err, when non-nil, is returned by every call.
 	Err error
+	// Then, when non-nil, runs after the call is recorded. The terminal status
+	// transition belongs to finalize, so a test that asserts on a batch reaching
+	// expired or cancelled has to supply the part of the assembler that performs
+	// it; Then is where that goes.
+	Then func(batchID string, now time.Time) error
 }
 
 // Fn returns the finalize hook to hand to batchlane.New.
 func (f *FakeFinalize) Fn() func(batchID string, now time.Time) error {
-	return func(batchID string, _ time.Time) error {
+	return func(batchID string, now time.Time) error {
 		f.mu.Lock()
-		defer f.mu.Unlock()
 		f.calls = append(f.calls, batchID)
-		return f.Err
+		err, then := f.Err, f.Then
+		f.mu.Unlock()
+
+		if err != nil {
+			return err
+		}
+		if then != nil {
+			return then(batchID, now)
+		}
+		return nil
 	}
 }
 

@@ -850,6 +850,12 @@ func (d *Dispatcher) sweep(batches []*store.Batch, now time.Time) {
 
 // expire closes a batch that ran out of window. Expired items move neither
 // counts_completed nor counts_failed, so completed + failed stays ≤ total.
+//
+// The terminal transition belongs to finalize, not here: finalize assembles the
+// output and error files (an expired item becomes an error line carrying
+// batch_expired) and only then CASes in_progress → expired. Closing the batch
+// first would hand finalize a batch that is no longer open, and the consumer
+// would get an expired batch with no files at all.
 func (d *Dispatcher) expire(b *store.Batch, now time.Time) {
 	d.cancelBatch(b.ID)
 	n, err := d.st.ExpireOpenItems(b.ID, now)
@@ -857,44 +863,45 @@ func (d *Dispatcher) expire(b *store.Batch, now time.Time) {
 		d.logger.Error("batch lane: could not expire open items", "batch_id", b.ID, "error", err)
 		return
 	}
-	// TODO(pr3b-review-1): finalize while the batch is still open and let
-	// finalize perform the in_progress → expired transition, so the output and
-	// error files are attached before the batch goes terminal. Taking the
-	// transition here first means finalize sees a batch that has already left
-	// the open list and writes no files for it. Needs the assembler in api/.
-	ok, err := d.st.SetBatchStatus(b.ID, store.BatchInProgress, store.BatchExpired, now)
-	if err != nil {
-		d.logger.Error("batch lane: could not expire batch", "batch_id", b.ID, "error", err)
-		return
-	}
-	if !ok {
-		return
-	}
-	d.logger.Info("batch lane: batch expired", "batch_id", b.ID, "expired_items", n)
-	d.runFinalize(b.ID, now)
+	d.logger.Info("batch lane: batch window closed", "batch_id", b.ID, "expired_items", n)
+	d.closeBatch(b, store.BatchInProgress, store.BatchExpired, now)
 }
 
 // drainCancelled stops a cancelling batch's in-flight work and closes it once
 // nothing is outstanding. Items are cancelled immediately so a result that
-// lands after this point is ignored by FinishItem.
+// lands after this point is ignored by FinishItem; as in expire, finalize
+// performs the cancelling → cancelled transition once the files are attached.
 func (d *Dispatcher) drainCancelled(b *store.Batch, now time.Time) {
 	d.cancelBatch(b.ID)
 	if _, err := d.st.CancelOpenItems(b.ID, now); err != nil {
 		d.logger.Error("batch lane: could not cancel open items", "batch_id", b.ID, "error", err)
 		return
 	}
-	// TODO(pr3b-review-1): as in expire — finalize while the batch is still
-	// open and let finalize perform the cancelling → cancelled transition.
-	ok, err := d.st.SetBatchStatus(b.ID, store.BatchCancelling, store.BatchCancelled, now)
+	d.closeBatch(b, store.BatchCancelling, store.BatchCancelled, now)
+}
+
+// closeBatch hands the terminal transition to finalize, which performs it after
+// attaching the assembled files. A crash before that leaves the batch open with
+// its items already terminal, and the next tick retries the whole pass.
+//
+// With no finalize hook wired there is no assembler and so nothing to order
+// against, and the batch would otherwise sit open forever: the dispatcher
+// performs the CAS itself in that case.
+func (d *Dispatcher) closeBatch(b *store.Batch, from, to store.BatchStatus, now time.Time) {
+	if d.finalize != nil {
+		d.runFinalize(b.ID, now)
+		return
+	}
+	ok, err := d.st.SetBatchStatus(b.ID, from, to, now)
 	if err != nil {
-		d.logger.Error("batch lane: could not cancel batch", "batch_id", b.ID, "error", err)
+		d.logger.Error("batch lane: could not close a batch",
+			"batch_id", b.ID, "status", string(to), "error", err)
 		return
 	}
-	if !ok {
-		return
+	if ok {
+		d.logger.Info("batch lane: batch closed without an assembler",
+			"batch_id", b.ID, "status", string(to))
 	}
-	d.logger.Info("batch lane: batch cancelled", "batch_id", b.ID)
-	d.runFinalize(b.ID, now)
 }
 
 // cancelBatch cancels every dispatch the batch has in flight.

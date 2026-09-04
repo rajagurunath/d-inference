@@ -148,6 +148,46 @@ func (h *harness) tick(t *testing.T, ctx context.Context, now time.Time) {
 	h.d.AwaitDispatch()
 }
 
+// assemblerFinalize is the part of api's FinalizeBatchIfDone the dispatcher's
+// sweep now depends on: once a batch has no open items left, finalize — not the
+// sweep — performs the terminal transition. Expired items make the target
+// expired, a cancelling batch becomes cancelled, everything else completes.
+func assemblerFinalize(st store.Store) func(string, time.Time) error {
+	return func(batchID string, now time.Time) error {
+		b, ok := st.GetBatchByID(batchID)
+		if !ok {
+			return nil
+		}
+		_, pending, inflight, _, _, err := st.CountItems(batchID)
+		if err != nil {
+			return err
+		}
+		if pending+inflight > 0 {
+			return nil
+		}
+		to := store.BatchCompleted
+		switch b.Status {
+		case store.BatchCancelling:
+			to = store.BatchCancelled
+		case store.BatchInProgress:
+			items, err := st.ListItems(batchID)
+			if err != nil {
+				return err
+			}
+			for _, it := range items {
+				if it.State == store.ItemExpired {
+					to = store.BatchExpired
+					break
+				}
+			}
+		default:
+			return nil
+		}
+		_, err = st.SetBatchStatus(batchID, b.Status, to, now)
+		return err
+	}
+}
+
 func itemStates(t *testing.T, st store.Store, batchID string) map[store.ItemState]int {
 	t.Helper()
 	items, err := st.ListItems(batchID)
@@ -399,6 +439,9 @@ func TestSweepExpiresPastDeadline(t *testing.T) {
 	h := newHarness(t, batchlane.Config{MaxAttempts: 3})
 	idleSlot(h.view, 4)
 	h.dispatch.Block = make(chan struct{})
+	// The sweep expires the items and hands the terminal transition to
+	// finalize, which is where the assembled files are attached first.
+	h.finalize.Then = assemblerFinalize(h.st)
 	expires := testStart.Add(30 * time.Second)
 	seedBatch(t, h.st, h.blobs, "batch_expire", 3, expires)
 
@@ -469,6 +512,7 @@ func TestCancelStopsInflightWork(t *testing.T) {
 	idleSlot(h.view, 4)
 	release := make(chan struct{})
 	h.dispatch.Block = release
+	h.finalize.Then = assemblerFinalize(h.st)
 	seedBatch(t, h.st, h.blobs, "batch_cancel", 2, testStart.Add(24*time.Hour))
 
 	h.d.Tick(ctx, testStart)
