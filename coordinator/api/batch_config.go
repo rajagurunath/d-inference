@@ -84,6 +84,17 @@ func (s *Server) SetBatchBlobStore(bs *sealedblob.Store) {
 // result blobs through it.
 func (s *Server) BatchBlobs() *sealedblob.Store { return s.batchBlobs }
 
+// BatchItemInputRef is the blob ref an item's sealed request body lives under.
+// It is deliberately distinct from the result ref: finalize deletes every input
+// blob as soon as a batch settles, and a shared ref would take the results with
+// it. The suffix keeps the ref inside sealedblob's [A-Za-z0-9_-] shape.
+func BatchItemInputRef(itemID string) string { return itemID + "-in" }
+
+// BatchItemResultRef is the blob ref the batch dispatcher writes an item's
+// sealed result under, before it settles the item. Rewriting it is idempotent,
+// so a retried attempt is safe.
+func BatchItemResultRef(itemID string) string { return itemID }
+
 // batchStore returns the blob store, or a 503 batch_unavailable error when the
 // lane has no key. Every batch handler starts here so a coordinator without a
 // mnemonic never half-accepts a batch.

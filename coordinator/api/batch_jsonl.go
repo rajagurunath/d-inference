@@ -136,8 +136,14 @@ type modelResolver func(requested string) (string, bool)
 // before any of it is stored. It returns the first failure, so a consumer
 // fixes one problem per round trip and a partially valid file never becomes a
 // half-populated batch.
+//
+// An empty endpoint means "take it from the first line": a file is uploaded
+// before the consumer says which endpoint the batch targets, so upload-time
+// validation infers it and then holds every later line to it. The caller reads
+// the settled endpoint back off items[0].Line.URL.
 func parseBatchJSONL(r io.Reader, endpoint string, maxLines int, resolveModel modelResolver) ([]parsedItem, error) {
-	if !batchEndpoints[endpoint] {
+	inferEndpoint := endpoint == ""
+	if !inferEndpoint && !batchEndpoints[endpoint] {
 		return nil, batchErr("invalid_endpoint", "endpoint",
 			"endpoint %q is not available for batch — use /v1/chat/completions or /v1/completions", endpoint)
 	}
@@ -168,6 +174,13 @@ func parseBatchJSONL(r io.Reader, endpoint string, maxLines int, resolveModel mo
 		if line.Method != "" && !strings.EqualFold(line.Method, http.MethodPost) {
 			return nil, batchErr("invalid_line", "method",
 				"line %d: method must be POST", lineNo)
+		}
+		if inferEndpoint && endpoint == "" {
+			if !batchEndpoints[line.URL] {
+				return nil, batchErr("invalid_endpoint", "url",
+					"line %d: url must be /v1/chat/completions or /v1/completions", lineNo)
+			}
+			endpoint = line.URL
 		}
 		if line.URL != endpoint {
 			return nil, batchErr("invalid_line", "url",
