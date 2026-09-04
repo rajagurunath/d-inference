@@ -514,3 +514,12 @@ func (s *MemoryStore) CountItems(batchID string) (total, pending, inflight, succ
 	}
 	return total, pending, inflight, succeeded, failed, nil
 }
+
+// BatchItemExists reports whether an item row exists, in any state.
+func (s *MemoryStore) BatchItemExists(itemID string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	_, ok := s.batchItems[itemID]
+	return ok, nil
+}
