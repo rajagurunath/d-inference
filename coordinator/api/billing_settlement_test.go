@@ -437,3 +437,70 @@ func TestBatchLaneSettlementHalvesPriceWithNoMinimumCharge(t *testing.T) {
 		})
 	}
 }
+
+// TestBatchLaneSettlementAppliesToServiceConsumers pins the second settlement
+// pricing branch: a service/wholesale account (OpenRouter) is billed with no
+// per-request minimum on every lane, and on registry.LaneBatch it must ALSO
+// get the 0.5 lane multiplier. Without the lane branch at
+// api/provider.go:2262-2268 this request would settle at the full online
+// no-minimum price.
+func TestBatchLaneSettlementAppliesToServiceConsumers(t *testing.T) {
+	const model = "service-batch-lane-model"
+	const platformIn, platformOut int64 = 50_000, 200_000
+
+	for _, tt := range []struct {
+		name     string
+		lane     registry.Lane
+		wantCost int64
+	}{
+		{"service online is billed at the platform price with no minimum", registry.LaneOnline, 250_000},
+		{"service batch is billed at half the platform price", registry.LaneBatch, 125_000},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, st, ledger := billingTestServer(t)
+
+			consumerID := testConsumerID // seeded with $100 by the harness
+			if err := st.CreateUser(&store.User{AccountID: consumerID, PrivyUserID: "did:privy:" + consumerID, Role: store.RoleService}); err != nil {
+				t.Fatalf("CreateUser: %v", err)
+			}
+			if err := st.SetModelPrice("platform", model, platformIn, platformOut); err != nil {
+				t.Fatalf("SetModelPrice: %v", err)
+			}
+
+			provider := srv.registry.Register("service-batch-provider-"+string(tt.lane), nil, &protocol.RegisterMessage{
+				Models: []protocol.ModelInfo{{ID: model, ModelType: "chat", Quantization: "4bit"}},
+			})
+			provider.Mu().Lock()
+			provider.AccountID = "service-batch-provider-account-" + string(tt.lane)
+			provider.Mu().Unlock()
+
+			initial := ledger.Balance(consumerID)
+			const reserve int64 = 1_000_000
+			if err := ledger.Charge(consumerID, reserve, "reserve:"+consumerID); err != nil {
+				t.Fatalf("reserve balance: %v", err)
+			}
+
+			pr := &registry.PendingRequest{
+				RequestID:        "service-batch-lane-" + string(tt.lane),
+				Model:            model,
+				ConsumerKey:      consumerID,
+				ReservedMicroUSD: reserve,
+				ChunkCh:          make(chan registry.ProviderChunk, 1),
+				CompleteCh:       make(chan protocol.UsageInfo, 1),
+				ErrorCh:          make(chan protocol.InferenceErrorMessage, 1),
+			}
+			pr.Traits.Lane = tt.lane
+			provider.AddPending(pr)
+
+			srv.handleComplete(provider.ID, provider, &protocol.InferenceCompleteMessage{
+				Type:      protocol.TypeInferenceComplete,
+				RequestID: pr.RequestID,
+				Usage:     protocol.UsageInfo{PromptTokens: 1_000_000, CompletionTokens: 1_000_000},
+			})
+
+			if got := ledger.Balance(consumerID); got != initial-tt.wantCost {
+				t.Fatalf("consumer balance = %d, want %d (net charge %d)", got, initial-tt.wantCost, tt.wantCost)
+			}
+		})
+	}
+}
