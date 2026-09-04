@@ -1,6 +1,6 @@
 # Tidal batch lane: co-serving online and batch traffic on the idle fleet
 
-> Last updated: 2026-09-04 · commit `fcecc3675`
+> Last updated: 2026-09-04 · commit `676793b51`
 
 **Status: Proposed** — 2026-09-05; evidence: fleet utilization of 12–19% and a
 99.94% free token budget recorded in [`routing-v2.md`](routing-v2.md), and the
@@ -97,13 +97,13 @@ online requests use. The only routing difference is a candidate filter.
 Postgres tables (metadata only; no column may carry content):
 
 ```
-batch_files      id, account_id, purpose, filename, size_bytes, sha256,
-                 created_at, blob_ref, sealed_by ('consumer'|'coordinator'), purged_at
+batch_files      id, account_id, purpose, filename, size_bytes,
+                 created_at, blob_ref, purged_at
 batches          id, account_id, input_file_id, endpoint, status,
                  completion_window, created_at, expires_at, in_progress_at,
                  completed_at, cancelled_at, counts_total, counts_completed,
                  counts_failed, output_file_id, error_file_id,
-                 result_public_key, metadata_json
+                 result_public_key, sealed_to, source ('file'|'inline'), model, metadata_json
 batch_items      id, batch_id, custom_id, line_no, state, attempts, last_error_code,
                  prompt_tokens, completion_tokens, submitted_at, finished_at,
                  request_id, blob_ref, result_blob_ref
@@ -131,21 +131,27 @@ must hold items for hours. Three rules keep the lane inside the accepted model:
    `/mnt/disks/userdata/batch/` (dev: a configurable directory), mode 0600,
    named by item id. The scrub-trigger idiom already used for
    `cache_affinity_key` is attached to any column that could carry content.
-2. Every blob is ciphertext. If the consumer sealed the upload to the
-   coordinator key from `GET /v1/encryption-key` (existing sender-side
-   sealing), the file is stored exactly as received. Otherwise each item is
-   NaCl-boxed with a fresh ephemeral key to a **batch-store** X25519 key derived
-   like the e2e key: HKDF over the coordinator mnemonic with the domain string
-   `eigeninference-coordinator-batchstore-v1`. Results are boxed to
-   `result_public_key` when the consumer supplied one at batch creation, else
-   to the batch-store key. With a consumer key the coordinator cannot read
-   outputs after assembly.
+2. Every blob is ciphertext. Each uploaded file and each item is NaCl-boxed
+   with a fresh ephemeral key to a **batch-store** X25519 key derived like the
+   e2e key: HKDF over the coordinator mnemonic with the domain string
+   `eigeninference-coordinator-batchstore-v1`. A consumer may seal the upload
+   in transit with the existing sender-side sealing (a sealed JSON envelope to
+   the key from `GET /v1/encryption-key`); it is unsealed in memory and
+   re-sealed per item, never stored as received. Results are boxed to
+   `result_public_key` when the consumer supplied one at batch creation (the
+   key is validated as 32 bytes, else the batch is rejected, and the batch
+   object reports `sealed_to: consumer`), otherwise to the batch-store key.
+   With a consumer key the coordinator cannot read outputs after assembly.
 3. Plaintext exists only in Confidential-VM memory for one dispatch: open the
    item, hand it to the existing funnel which boxes it to the provider's
    attested key, zero the buffer.
 
-Retention: blobs are deleted on output retrieval plus a grace window, at
-`expires_at`, or on cancel. `threat-model.yaml` gains an asset (batch inputs
+Retention: item input blobs are deleted as soon as the batch is finalized;
+result blobs and output files are deleted seven days after completion, at
+expiry, or on cancel, never on retrieval, so a failed download is retryable.
+`custom_id` is limited to 64 characters of `[A-Za-z0-9_-]`, `metadata` to 16
+short keys, and neither appears in logs, metrics, or file names. Error-file
+messages are fixed strings per code, never provider text. `threat-model.yaml` gains an asset (batch inputs
 and outputs at rest) and a trust boundary (coordinator local disk) with these
 mitigations. Stated limit: the batch-store key derives from the same mnemonic
 as the e2e key, is not KMS-managed, rotates by redeploy, and is readable by
@@ -163,22 +169,22 @@ coordinator. Each tick:
 1. **Observe.** For every provider·slot in the registry snapshot read
    `NumRunning`, `NumWaiting`, `ActiveTokenBudgetUsed/Max`,
    `ObservedDecodeTPS`; smooth each with an EWMA, α = 0.5. Derive
-   `onlineWaiting = NumWaiting − batchInflight(slot)` (lower bound) and
    `kv = ActiveTokenBudgetUsed / ActiveTokenBudgetMax`.
 2. **AIMD per slot.** With `target` the allowed batch in-flight count:
 
    ```
-   if onlineWaiting > 0 or decodeTps < decodeFloor or kv > 0.85:
+   if waiting > 0 or decodeTps < decodeFloor or kv > 0.85:
        target = max(floor, target / 2)          # multiplicative decrease
    elif kv < 0.70 and target < maxPerSlot:
        target = target + 1                      # additive increase
    ```
 
    `decodeFloor` is the model's quality floor from `registry/concurrency_cap.go`
-   (default 15 tok/s). `maxPerSlot` defaults to the slot's `MaxConcurrency`
-   minus one, never above the quality-concurrency cap for the model. A slot
-   with zero online rows and no online waiting is treated as idle and may
-   fill to `maxPerSlot`.
+   (default 15 tok/s). `maxPerSlot` is the router's own quality-concurrency
+   number for that provider and model minus one, so one row is always
+   reserved for online traffic and batch can never be the request that pushes
+   a slot past the cap. The decrease rule fires on any waiting row, whichever
+   lane it belongs to.
 3. **Laxity and priority.** Per batch:
 
    ```
@@ -193,10 +199,14 @@ coordinator. Each tick:
    expiry. Priority orders claims; it never bypasses the AIMD target.
 4. **Claim and dispatch.** Claim `Σ(target − inflight)` items ordered by
    priority then line number, open each in memory, and call the existing
-   dispatch funnel with `Lane = LaneBatch`. The registry candidate filter for
-   `LaneBatch` admits only providers whose predicted post-admission rate
-   stays above the decode floor and which currently have `NumWaiting == 0`;
-   batch never takes the coordinator wait queue and never triggers hedges.
+   dispatch funnel with `Lane = LaneBatch`. The reservation path's candidate
+   filter for `LaneBatch` admits only providers with `NumWaiting == 0` and
+   `NumRunning` below the batch row allowance; batch never takes the
+   coordinator wait queue, never triggers hedges, and never feeds provider
+   reputation or TTFT calibration, so co-serving cannot distort the router's
+   model of a provider. A claim that finds no capacity is released without
+   counting an attempt. Batch attempts use their own first-content deadline
+   (120 s).
 5. **Settle.** On success store the sealed result, record tokens on the item,
    meter at the batch rate. On provider error retry up to 3 attempts, then
    `failed`. On coordinator restart, in-flight items are requeued.
@@ -218,15 +228,25 @@ cost minus the platform fee. `inference_routes` and `provider_earnings` gain a
 ### 3.6 API contract
 
 ```
-POST /v1/files            multipart, purpose=batch, ≤ 100 MB, ≤ 50 000 lines
+POST /v1/files            multipart, purpose=batch, ≤ 16 MiB, ≤ 50 000 lines
 GET  /v1/files/{id}       file object
 GET  /v1/files/{id}/content
-POST /v1/batches          {input_file_id, endpoint, completion_window:"24h",
-                           metadata?, result_public_key?}
-GET  /v1/batches/{id}
+POST /v1/batches          OpenAI form:     {input_file_id, endpoint, completion_window:"24h", metadata?, result_public_key?}
+                          OpenRouter form: {endpoint, model, requests:[{custom_id, body}], completion_window?, result_public_key?}
+GET  /v1/batches/{id}     batch object; inline batches also carry results[] once completed
 GET  /v1/batches?limit&after
 POST /v1/batches/{id}/cancel
 ```
+
+Two consumer shapes, one implementation. The OpenAI form is what every
+OpenAI SDK sends. The OpenRouter form matches OpenRouter's beta Batch API
+(`POST /api/beta/batches` with an inline `requests` array and inline
+results), so OpenRouter can front Darkbloom's batch tier without a translation
+layer. OpenRouter has no provider-side batch contract and paces batch jobs as
+ordinary synchronous calls; those reach the discounted lane through
+`service_tier: "batch"` on a synchronous request, which routes only to
+headroom slots, never queues or hedges, is metered at the batch rate, and
+returns 429 with `Retry-After` when no slot has headroom.
 
 Accepted `endpoint` values: `/v1/chat/completions`, `/v1/completions`. Each
 JSONL line is `{custom_id, method:"POST", url, body}`; `body.stream` must be
