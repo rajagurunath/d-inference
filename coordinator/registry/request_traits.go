@@ -6,10 +6,39 @@ import (
 	"time"
 )
 
+// Lane names the service class a request is routed on. The zero value is the
+// ordinary online lane, so every existing caller — and every RequestTraits
+// literal in the tree — keeps its current behavior without naming a lane.
+//
+// LaneBatch is the deadline-contract batch lane (docs/design/tidal-batch-lane.md):
+// work that has 24 hours to complete and is only ever placed in slot headroom
+// the online quality cap already leaves empty. A batch attempt therefore
+//
+//   - routes only to providers with an idle waiting queue and a running count
+//     below Registry.BatchRowsAllowed (the reservation filter in
+//     buildCandidateGateLocked),
+//   - never enters the coordinator wait queue and never acquires a hedge, and
+//   - never feeds provider reputation, TTFT calibration, or the TTFT shadow,
+//
+// so co-serving batch traffic cannot distort the router's model of a provider
+// or push an online request past the quality cap.
+type Lane string
+
+const (
+	// LaneOnline is the ordinary interactive lane (the zero value).
+	LaneOnline Lane = ""
+	// LaneBatch is the discounted, headroom-only batch lane.
+	LaneBatch Lane = "batch"
+)
+
 // RequestTraits captures request-shape attributes that affect provider
 // eligibility beyond the model id. Stamped onto PendingRequest by the consumer
 // handler and enforced in the scheduler's candidate filter and final admit.
 type RequestTraits struct {
+	// Lane is the service class this request is routed on. Empty (LaneOnline)
+	// for every ordinary request; LaneBatch opts the request into the
+	// headroom-only batch lane described on the Lane type.
+	Lane Lane
 	// HasTools is true when the request carries an OpenAI tools/functions
 	// schema. Tool schemas are rendered through the model's chat template on
 	// the provider, and old binaries crash on schema shapes they don't

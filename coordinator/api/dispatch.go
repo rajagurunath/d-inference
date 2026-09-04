@@ -122,6 +122,11 @@ type dispatchState struct {
 	profile                *registry.RequestProfile
 	deadline               time.Duration
 	speculativeAt          time.Duration
+	// lane is the service class this request routes on (registry.LaneOnline —
+	// the zero value — for every ordinary request). LaneBatch narrows the
+	// candidate set to headroom slots and disables queueing, hedging, and every
+	// reputation/calibration feedback path.
+	lane registry.Lane
 	// Deterministic test seams for speculative timer/ingress arbitration.
 	// Production requests leave both nil.
 	onSpeculativeDispatch func()
@@ -291,6 +296,7 @@ type dispatchState struct {
 // the most recently failed provider's binary version.
 func (d *dispatchState) traits() registry.RequestTraits {
 	return registry.RequestTraits{
+		Lane:                   d.lane,
 		HasTools:               d.hasTools,
 		RequiresToolConstraint: d.requiresToolConstraint,
 		ToolChoiceMode:         d.toolChoiceMode,
@@ -1386,6 +1392,29 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			}
 			return outcomeFailFast
 		}
+		// Batch lane: never queue. The batch lane only ever fills headroom the
+		// online quality cap leaves empty, so "no headroom right now" is the
+		// normal state, not a failure to wait out: parking the item in the
+		// coordinator queue for up to 120s would hold its balance reservation
+		// and its place in the ladder hostage for work that has 24 hours to
+		// complete, and the drain would hand it a slot an online request is
+		// entitled to first. Answer with a retryable 429 + Retry-After instead;
+		// the caller (the batch dispatcher, or an OpenRouter-style paced client
+		// on service_tier=batch) re-offers the item on its next tick.
+		if d.lane == registry.LaneBatch {
+			s.ddIncr("routing.decisions", []string{
+				"model:" + d.model,
+				"model_type:" + s.registry.ModelType(d.model),
+				"outcome:" + batchNoCapacityCode,
+			})
+			d.refundReservation()
+			info := d.rejectionInfoWithDecision("dispatch", batchNoCapacityCode,
+				http.StatusTooManyRequests, batchNoCapacityRetryAfterSec*1000, decision)
+			d.preContentTerminal(info, batchNoCapacityRetryAfterSec, "rate_limit_exceeded",
+				fmt.Sprintf("no provider for model %q has batch headroom right now", d.publicModel),
+				batchNoCapacityCode)
+			return outcomeResponseWritten
+		}
 		// No idle provider — try queueing.
 		d.requestID = uuid.New().String()
 		queuePR := &registry.PendingRequest{
@@ -2276,6 +2305,12 @@ func (d *dispatchState) runSpeculative() dispatchOutcome {
 	// primary is itself a public provider (the owner owns nothing / fell
 	// back), normal speculative behaviour applies.
 	skipBackup := false
+	// Batch lane: no speculative backup, ever (see tryAcquireBackupHedge). This
+	// falls through the nil-backup branch below — byte-identical to today's
+	// "no backup available" path — so the primary is simply waited on.
+	if d.lane == registry.LaneBatch {
+		skipBackup = true
+	}
 	if d.policy.prefer {
 		provider.Mu().Lock()
 		skipBackup = d.policy.ownerAccountID != "" && provider.AccountID == d.policy.ownerAccountID
@@ -3733,8 +3768,12 @@ func adjustLatencyForPrefill(raw time.Duration, promptTokens int, prefillTPS flo
 	return raw
 }
 
+// A batch attempt never contributes a responsiveness sample: it is dispatched
+// against a 120s first-content budget onto a slot picked for headroom, so its
+// time-to-first-content measures the batch contract, not the provider.
 func shouldRecordReputationLatency(pr *registry.PendingRequest, firstChunk string) bool {
-	return pr != nil && pr.Timing != nil && firstChunk != "" && !pr.CacheRoutingParticipates()
+	return pr != nil && pr.Timing != nil && firstChunk != "" &&
+		pr.Traits.Lane != registry.LaneBatch && !pr.CacheRoutingParticipates()
 }
 
 func (d *dispatchState) writeCommittedResponse() {

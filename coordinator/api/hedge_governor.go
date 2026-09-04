@@ -144,6 +144,10 @@ const (
 	// hedgeSuppressWinRate: this model's hedges persistently lose; back off
 	// to no-hedge.
 	hedgeSuppressWinRate
+	// hedgeSuppressBatchLane: the request is on the batch lane. Insurance buys
+	// nothing for work with a 24-hour contract, and a second in-flight copy
+	// would occupy headroom an online request could have used.
+	hedgeSuppressBatchLane
 )
 
 // String is the bounded verdict vocabulary used as the metric tag and log
@@ -160,6 +164,8 @@ func (v hedgeVerdict) String() string {
 		return "suppress_global_budget"
 	case hedgeSuppressWinRate:
 		return "suppress_win_rate"
+	case hedgeSuppressBatchLane:
+		return "suppress_batch_lane"
 	default:
 		return "unknown"
 	}

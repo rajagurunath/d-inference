@@ -167,6 +167,15 @@ func (r *Registry) evaluateTTFTShadowLocked(
 	if mode == TTFTAdmissionOff || winner == nil || pr == nil {
 		return ttftShadowEval{}
 	}
+	// Batch attempts are invisible to the Phase-0 admission shadow. The shadow
+	// measures whether an ONLINE request would have missed its upstream
+	// first-content SLA and whether an idler was available to spread it to;
+	// a batch attempt carries a 120s deadline and is deliberately placed on
+	// headroom, so folding it in would report shed/spread signals for traffic
+	// the live cutoff does not govern.
+	if pr.Traits.Lane == LaneBatch {
+		return ttftShadowEval{}
+	}
 	reqPrompt := pr.EstimatedPromptTokens
 	if reqPrompt < 0 {
 		reqPrompt = 0

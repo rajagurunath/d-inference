@@ -31,6 +31,18 @@ const (
 	// 9s coordinator) inside Qwen3-VL's 5s upstream SLA.
 	Qwen3VL30BA3BInstructCoordinatorFirstContentBase = Qwen3VL30BA3BInstructUpstreamFirstContentBase - FirstContentResponseHeadroom
 
+	// BatchFirstContentBase is the first-content deadline base for the batch
+	// lane (registry.LaneBatch, docs/design/tidal-batch-lane.md §3.4). Batch
+	// work has a 24-hour completion contract and is placed only on slot
+	// headroom, so it is not held to any online first-content SLA: the online
+	// bases exist to return a retryable answer before an upstream router closes
+	// a still-silent request, and no upstream router is waiting on a batch item.
+	// 120s is the deadline the batch attempt needs for its OWN liveness — long
+	// enough to absorb a cold model load plus a full prefill behind the online
+	// rows sharing the slot, short enough that a wedged provider still releases
+	// the item back to the dispatcher within one dispatch generation.
+	BatchFirstContentBase = 120 * time.Second
+
 	// maxFirstContentBase is the sanity ceiling for an env-supplied exact-model
 	// upstream base (SetFirstContentBasesFromEnv): no first-content SLA is
 	// minutes long, and rejecting anything above it also rules out
@@ -171,6 +183,22 @@ func CoordinatorFirstContentDeadline(model string, estimatedPromptTokens int, de
 		base = exact.coordinator
 	}
 	return addPromptTokenSlope(base, estimatedPromptTokens)
+}
+
+// BatchFirstContentDeadline is the batch-lane counterpart of
+// CoordinatorFirstContentDeadline: BatchFirstContentBase plus the same 1ms
+// per estimated prompt token slope, so a long prompt gets the same proportional
+// prefill allowance the online clock grants it.
+//
+// Deliberately NOT subject to the exact-model tightening table. Those entries
+// (e.g. Qwen3-VL's 5s/4s pair) exist to fit a model inside a shorter UPSTREAM
+// SLA; applying them here would cut a batch attempt's budget to a few seconds
+// for a lane that has no upstream SLA at all, and the item would fail and be
+// re-attempted for no reason. The model id is taken so callers read the same
+// way as the online path and so a future per-model batch policy has a home.
+func BatchFirstContentDeadline(model string, estimatedPromptTokens int) time.Duration {
+	_ = model
+	return addPromptTokenSlope(BatchFirstContentBase, estimatedPromptTokens)
 }
 
 func addPromptTokenSlope(base time.Duration, estimatedPromptTokens int) time.Duration {

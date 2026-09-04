@@ -461,7 +461,8 @@ func (r *Registry) ReserveNextFromPlan(pr *PendingRequest, plan *DispatchPlan, e
 		// Same calibrator-join rule as the primary path: warm text dispatches
 		// only (see reserveProvider).
 		bd := candidate.breakdown
-		if !pr.RequiresVision && bd.RawTTFTMs > 0 && bd.StateMs == 0 {
+		if !pr.RequiresVision && pr.Traits.Lane != LaneBatch &&
+			bd.RawTTFTMs > 0 && bd.StateMs == 0 {
 			ttftCalibration.notePrediction(pr.RequestID, pr.Attempt, model, candidate.snapshot.chipFamily, bd.RawTTFTMs)
 		}
 		// Winner-specific fields only: the scan tallies belong to the plan

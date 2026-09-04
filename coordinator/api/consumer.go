@@ -145,6 +145,20 @@ func (s *Server) FirstContentDeadline(model string, estimatedPromptTokens int) t
 	return modelpolicy.CoordinatorFirstContentDeadline(model, estimatedPromptTokens, base)
 }
 
+// firstContentDeadlineForLane is FirstContentDeadline with the request's
+// service lane applied. The batch lane runs on its own 120s clock
+// (modelpolicy.BatchFirstContentBase): it has a 24-hour completion contract and
+// no upstream router waiting on it, so holding it to the online cutoff would
+// abandon items that are merely queued behind the online rows sharing the slot.
+func (s *Server) firstContentDeadlineForLane(
+	lane registry.Lane, model string, estimatedPromptTokens int,
+) time.Duration {
+	if lane == registry.LaneBatch {
+		return modelpolicy.BatchFirstContentDeadline(model, estimatedPromptTokens)
+	}
+	return s.FirstContentDeadline(model, estimatedPromptTokens)
+}
+
 // shedIfModelRejected answers a public/prefer-owner request with 429 +
 // Retry-After when its requested alias or resolved build is in the operator
 // reject set (EIGENINFERENCE_REJECT_MODELS). This is a deterministic
@@ -1776,6 +1790,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	originalRawBody := prelude.originalRawBody
 	parsed := prelude.parsed
 	model := prelude.model
+	lane := prelude.lane
 	runtimeDefaults := newModelRuntimeDefaults(parsed)
 	_, reasoningProvided := parsed["reasoning"]
 
@@ -1869,6 +1884,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	aliasTraits := registry.RequestTraits{
+		Lane:                   lane,
 		HasTools:               hasTools,
 		RequiresToolConstraint: requiresToolConstraint,
 		ToolChoiceMode:         string(validatedMode),
@@ -1977,7 +1993,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	estimatedPromptTokens := estimatePromptTokens(parsed)
 	billingPromptTokens := estimateBillingPromptTokens(parsed)
 	requestedMaxTokens := estimateRequestedMaxTokens(parsed)
-	deadline := s.FirstContentDeadline(model, estimatedPromptTokens)
+	deadline := s.firstContentDeadlineForLane(lane, model, estimatedPromptTokens)
 	timing.ParsedAt = time.Now()
 	rp.Mark(registry.StampReqParsed)
 	if s.shedIfModelRejected(w, r, parsed, policy, publicModel, model, stream, estimatedPromptTokens, requestedMaxTokens, requiresVision, hasTools) {
@@ -2036,6 +2052,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		candidateBody, bodyErr := providerBodyForModel(candidateModel)
 		if bodyErr != nil {
 			return registry.RequestTraits{
+				Lane:                   lane,
 				HasTools:               hasTools,
 				RequiresToolConstraint: requiresToolConstraint,
 				ToolChoiceMode:         string(validatedMode),
@@ -2045,6 +2062,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		traits, _ := routingTraitsForProviderBody(
 			hasTools, candidateBody, requiresVision)
+		traits.Lane = lane
 		traits.RequiresToolConstraint = requiresToolConstraint
 		traits.ToolChoiceMode = string(validatedMode)
 		traits.ToolChoiceName = toolChoiceName
@@ -2353,6 +2371,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		parallelToolCalls:      parallelToolCalls,
 		isResponsesAPI:         isResponsesAPI,
 		stream:                 stream,
+		lane:                   lane,
 		metadataDetails:        metadataDetailsFromRequest(r),
 		policy:                 policy,
 		allowedProviderSerials: allowedProviderSerials,
@@ -4342,6 +4361,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	originalRawBody := prelude.originalRawBody
 	parsed := prelude.parsed
 	model := prelude.model
+	lane := prelude.lane
 	runtimeDefaults := newModelRuntimeDefaults(parsed)
 	endpointKind := promptcontract.EndpointCompletions
 	if endpoint == "/v1/messages" {
@@ -4389,6 +4409,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	requiresVision := detectMediaRequirement(parsed)
 	hasTools := requestHasTools(parsed)
 	aliasTraits := registry.RequestTraits{
+		Lane:                   lane,
 		HasTools:               hasTools,
 		RequiresToolConstraint: requiresToolConstraint,
 		ToolChoiceMode:         string(validatedMode),
@@ -4467,7 +4488,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	estimatedPromptTokens := estimatePromptTokens(parsed)
 	billingPromptTokens := estimateBillingPromptTokens(parsed)
 	requestedMaxTokens := estimateRequestedMaxTokens(parsed)
-	genericDeadline := s.FirstContentDeadline(model, estimatedPromptTokens)
+	genericDeadline := s.firstContentDeadlineForLane(lane, model, estimatedPromptTokens)
 	timing.ParsedAt = time.Now()
 	rp.Mark(registry.StampReqParsed)
 	if s.shedIfModelRejected(w, r, parsed, policy, publicModel, model, stream, estimatedPromptTokens, requestedMaxTokens, requiresVision, hasTools) {
@@ -4534,6 +4555,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		_, candidateBody, _ := lowerGenericBodyForModel(candidateModel)
 		traits, _ := routingTraitsForProviderBody(
 			hasTools, candidateBody, requiresVision)
+		traits.Lane = lane
 		traits.RequiresToolConstraint = requiresToolConstraint
 		traits.ToolChoiceMode = string(validatedMode)
 		traits.ToolChoiceName = toolChoiceName
@@ -4569,6 +4591,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		endpointBody, inferenceBody, loweringErr = lowerGenericBodyForModel(newModel)
 		routingTraits, _ = routingTraitsForProviderBody(
 			hasTools, inferenceBody, requiresVision)
+		routingTraits.Lane = lane
 		routingTraits.RequiresToolConstraint = requiresToolConstraint
 		routingTraits.ToolChoiceMode = string(validatedMode)
 		routingTraits.ToolChoiceName = toolChoiceName
@@ -4667,6 +4690,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		consumerEndpoint:       consumerEndpoint,
 		requestedStopSequences: requestedStopSequences,
 		stream:                 stream,
+		lane:                   lane,
 		metadataDetails:        metadataDetailsFromRequest(r),
 		policy:                 policy,
 		allowedProviderSerials: allowedProviderSerials,
