@@ -1,6 +1,6 @@
 # Pricing model reference
 
-> Last updated: 2026-09-04 · commit `075d37a91`
+> Last updated: 2026-09-04 · commit `e4a89d264`
 
 Constants, formulas, enums, routes, and environment variables of the
 coordinator's money path, each row cited to the code that defines it. How the
@@ -26,7 +26,8 @@ pieces fit together, and what they guarantee, is explained in
 | `usageHistoryLimit` | `100` | Newest in-process usage entries per consumer, oldest first; capacity grows lazily to the limit. Does not prune durable usage or change balances. | `coordinator/payments/payments.go` (`Ledger.RecordUsage`) |
 | `DefaultInputPricePerMillion` | `50_000` | fallback input price ($0.05 / 1M tokens) | `coordinator/payments/pricing.go` |
 | `DefaultOutputPricePerMillion` | `200_000` | fallback output price ($0.20 / 1M tokens) | `coordinator/payments/pricing.go` |
-| `minimumChargeMicroUSD` | `100` | per-request floor ($0.0001) applied by `CalculateCostWithOverrides`; not applied to service accounts | `coordinator/payments/pricing.go` |
+| `minimumChargeMicroUSD` | `100` | per-request floor ($0.0001) applied by `CalculateCostWithOverrides`; not applied to service accounts or the batch lane | `coordinator/payments/pricing.go` |
+| `BatchDiscount` | `0.5` | batch-lane price multiplier ([Batch lane](#batch-lane)) | `coordinator/payments/pricing.go` |
 | `platformFeePercent` | see [billing.md, invariant 4](../architecture/billing.md#invariants) | global platform fee when no per-user override is set | `coordinator/payments/pricing.go` |
 | `defaultMaxOutputTokens` | `8192` | output bound when the request sets no max-tokens field and the registry has no `max_output_length` | `coordinator/api/consumer.go` |
 | `defaultTerminalSettleGrace` | `30 * time.Second` | how long a consumer-disconnected request waits for the provider terminal before refund | `coordinator/api/settlement.go` |
@@ -73,6 +74,7 @@ updated_at)`, primary key `(account_id, model)`
 | Raw cost | `promptTokens × inPrice / 1_000_000 + completionTokens × outPrice / 1_000_000`, integer arithmetic | `coordinator/payments/pricing.go` (`calculateCost`) |
 | Cost, direct consumers | `max(rawCost, minimumChargeMicroUSD)` | `CalculateCostWithOverrides` |
 | Cost, service accounts | `rawCost`; `1` when the tokens are non-zero but the product rounds to `0` (no per-request minimum) | `CalculateCostWithOverridesNoMinimum` |
+| Cost, batch lane | `promptTokens × inPrice × 0.5 / 1_000_000 + completionTokens × outPrice × 0.5 / 1_000_000`; `1` when the tokens are non-zero but the product rounds to `0` (no per-request minimum) | `CalculateCostForLane` ([Batch lane](#batch-lane)) |
 | Cached tokens | see [billing.md, invariant 5](../architecture/billing.md#invariants) | `calculateCost` |
 | Output bound | explicit `max_tokens` \| `max_completion_tokens` \| `max_output_tokens`, else registry `max_output_length`, else `defaultMaxOutputTokens` | `coordinator/api/consumer.go` (`explicitMaxTokens`, `ensureMaxTokensBound`) |
 | Reservation | `CalculateCostWithOverrides(model, max(billingPromptTokens, estimatedPromptTokens), outputBound, platform price)` | `coordinator/api/inference_admission.go` (`reserveInferenceBalance`); `coordinator/api/consumer.go` (`reservationCost`) |
@@ -145,6 +147,23 @@ rather than "work" earnings on the leaderboard and in `GET /v1/me/summary`
 | Reservation mode | ledger debit, or in-memory hold when `EIGENINFERENCE_SERVICE_RESERVATIONS_ENABLED=true` | `coordinator/api/reservations.go` (`useServiceReservation`) |
 | Rate limiter | `Service` ([Constants](#constants)) | `coordinator/ratelimit/config.go` |
 | Platform fee | same per-user override mechanism as other accounts | `handleCompleteAt` |
+
+## Batch lane
+
+Batch work fills provider headroom, so it is metered at half the list price.
+Design record: [`design/tidal-batch-lane.md`](../design/tidal-batch-lane.md)
+§3.5.
+
+| Property | Value | Citation |
+|---|---|---|
+| Lane value | `registry.LaneOnline` (`""`) or `registry.LaneBatch` (`"batch"`), carried on `RequestTraits.Lane` | `coordinator/registry/request_traits.go` |
+| Selected by | items dispatched from `POST /v1/batches`, and synchronous requests with `service_tier: "batch"` | `coordinator/api/batch_handlers.go`; `coordinator/api/inference_preprocess.go` (`serviceTierBatch`) |
+| Multiplier | `LaneMultiplier(lane)` = `BatchDiscount` (`0.5`) for `LaneBatch`, `1.0` otherwise; applied after price resolution, before rounding | `coordinator/payments/pricing.go` (`LaneMultiplier`, `CalculateCostForLane`) |
+| Minimum charge | none on `LaneBatch`; non-zero usage that rounds to `0` is still charged `1` µUSD | `coordinator/payments/pricing.go` (`CalculateCostForLane`) |
+| Price resolution | unchanged (provider custom → platform → fallback); the multiplier applies to whichever price wins, for direct and service consumers alike | `coordinator/api/provider.go` (`handleCompleteAt`) |
+| Provider payout | `discountedCost − platformFee`, the same formula as online | `coordinator/payments/pricing.go` (`ProviderPayoutWithPercent`) |
+| Recorded on | `inference_routes.lane` and `provider_earnings.lane` (`InferenceRouteRecord.Lane`, `ProviderEarning.Lane`), so earnings can be reported by lane | `coordinator/store/interface.go`; `coordinator/store/postgres.go` |
+| Advertised on | `GET /v1/pricing`: `batch_input_price`, `batch_output_price`, `batch_input_usd`, `batch_output_usd` per model, plus `batch_discount` and the `fallback_batch_*` fields | `coordinator/api/billing_handlers.go` (`handleGetPricing`); `coordinator/payments/pricing.go` (`BatchPricePerMillion`) |
 
 ## Stripe Connect withdrawal states
 
@@ -247,17 +266,25 @@ the financial rate limiter ([Constants](#constants)).
 ```json
 {
   "prices": [
-    {"model": "<model id>", "input_price": 30000, "output_price": 165000, "input_usd": "$0.0300", "output_usd": "$0.1650"}
+    {"model": "<model id>", "input_price": 30000, "output_price": 165000, "input_usd": "$0.0300", "output_usd": "$0.1650",
+     "batch_input_price": 15000, "batch_output_price": 82500, "batch_input_usd": "$0.0150", "batch_output_usd": "$0.0825"}
   ],
   "fallback_input_price": 50000,
   "fallback_output_price": 200000,
   "fallback_input_usd": "$0.0500",
-  "fallback_output_usd": "$0.2000"
+  "fallback_output_usd": "$0.2000",
+  "batch_discount": 0.5,
+  "fallback_batch_input_price": 25000,
+  "fallback_batch_output_price": 100000,
+  "fallback_batch_input_usd": "$0.0250",
+  "fallback_batch_output_usd": "$0.1000"
 }
 ```
 
 `prices` lists every `model_prices` row with `account_id = 'platform'`
-(`handleGetPricing`).
+(`handleGetPricing`). The `batch_*` fields are the same rows scaled by
+`batch_discount` ([Batch lane](#batch-lane)); they are derived, never stored or
+set separately, so they cannot drift from the list price.
 
 ### `GET /v1/payments/balance` and `GET /v1/payments/usage` responses
 
