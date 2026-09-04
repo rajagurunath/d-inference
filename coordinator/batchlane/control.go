@@ -78,7 +78,15 @@ type SlotSignal struct {
 	// registry's quality-concurrency cap. <= 0 disables the trigger.
 	DecodeFloor float64
 	// KV is ActiveTokenBudgetUsed / ActiveTokenBudgetMax, smoothed, in [0, 1].
+	// Meaningful only when KVKnown.
 	KV float64
+	// KVKnown reports whether the provider published a token budget at all. A
+	// slot that publishes none has no KV signal: the controller must drop the
+	// KV terms for it rather than substitute a number. Substituting 0 reads as
+	// "idle" and grows the target forever; substituting a hold-band value pins
+	// the target wherever it happens to be, which for a fresh slot is 0 — the
+	// lane would never start on a fleet that reports no budget.
+	KVKnown bool
 	// Running is the slot's NumRunning. Reported for logging and for the
 	// dispatcher's budget arithmetic; the control law does not read it.
 	Running int
@@ -118,6 +126,12 @@ func NewAIMD(cfg AIMDConfig) *AIMD { return &AIMD{cfg: cfg} }
 
 // Update runs one control step against a fresh signal and returns the new
 // target. It is a pure function of (state, sig) — no clock, no I/O.
+//
+// A slot with no KV signal (KVKnown false) is driven by the remaining terms
+// alone: it decreases on a waiting row or a decode rate under the floor, and
+// increases otherwise. Those two are enough backpressure on their own — a slot
+// running out of KV starts queueing, and NumWaiting is not smoothed — so the
+// lane still starts and still backs off on a fleet that publishes no budget.
 func (a *AIMD) Update(sig SlotSignal) int {
 	kvHigh, kvLow := a.watermarks()
 
@@ -127,9 +141,9 @@ func (a *AIMD) Update(sig SlotSignal) int {
 		// Reading 0 as "below the floor" would pin every fresh provider's
 		// target at the floor and the lane would never start.
 		(sig.DecodeFloor > 0 && sig.DecodeTPS > 0 && sig.DecodeTPS < sig.DecodeFloor) ||
-		sig.KV > kvHigh:
+		(sig.KVKnown && sig.KV > kvHigh):
 		a.Target /= 2 // multiplicative decrease
-	case sig.KV < kvLow:
+	case !sig.KVKnown || sig.KV < kvLow:
 		a.Target++ // additive increase
 	}
 	a.Target = a.clamp(a.Target, sig.MaxPerSlot)

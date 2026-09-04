@@ -776,6 +776,44 @@ func TestAttachOutputFilesFirstWriterWins(t *testing.T) {
 	}
 }
 
+// GetBatchByID is the unscoped read the dispatcher and the assembler need: it
+// resolves a batch from an id alone, in any status, and it is the only batch
+// read that ignores the account.
+func TestGetBatchByID(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			acct := uniqueID("acct")
+			b, _ := startBatch(t, s, acct, 2)
+
+			got, ok := s.GetBatchByID(b.ID)
+			if !ok {
+				t.Fatalf("GetBatchByID(%q) not found", b.ID)
+			}
+			if got.ID != b.ID || got.AccountID != acct {
+				t.Fatalf("GetBatchByID = %q/%q, want %q/%q", got.ID, got.AccountID, b.ID, acct)
+			}
+			// The scoped read of another account's batch still refuses.
+			if _, ok := s.GetBatch(uniqueID("acct"), b.ID); ok {
+				t.Fatal("GetBatch resolved a batch for the wrong account")
+			}
+
+			// A terminal batch resolves too — settle and finalize both run after
+			// the batch has left the open list.
+			if ok, err := s.SetBatchStatus(b.ID, BatchInProgress, BatchCompleted, time.Now().UTC()); err != nil || !ok {
+				t.Fatalf("SetBatchStatus(completed) = %v, %v", ok, err)
+			}
+			got, ok = s.GetBatchByID(b.ID)
+			if !ok || got.Status != BatchCompleted {
+				t.Fatalf("GetBatchByID after completion: ok=%v status=%v", ok, got)
+			}
+
+			if _, ok := s.GetBatchByID(uniqueID("batch")); ok {
+				t.Fatal("GetBatchByID resolved an id that does not exist")
+			}
+		})
+	}
+}
+
 func TestListOpenBatches(t *testing.T) {
 	for name, s := range storeBackends(t) {
 		t.Run(name, func(t *testing.T) {

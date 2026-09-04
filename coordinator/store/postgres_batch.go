@@ -258,6 +258,19 @@ func (s *PostgresStore) GetBatch(accountID, id string) (*Batch, bool) {
 	return b, true
 }
 
+// GetBatchByID returns the batch whatever account owns it.
+func (s *PostgresStore) GetBatchByID(id string) (*Batch, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	b, err := scanBatch(s.pool.QueryRow(ctx,
+		`SELECT `+batchColumns+` FROM batches WHERE id = $1`, id))
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
 // ListBatches returns an account's batches newest first. The cursor is
 // (created_at, id) of the batch named by after, so a page boundary is stable
 // even when two batches share a timestamp. after is resolved scoped to

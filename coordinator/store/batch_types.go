@@ -185,6 +185,13 @@ type BatchStore interface {
 	// GetBatch returns the batch if it belongs to accountID.
 	GetBatch(accountID, id string) (*Batch, bool)
 
+	// GetBatchByID returns the batch whatever account owns it. It is the
+	// unscoped counterpart of GetBatch, for the two background paths that have
+	// only a batch id and no authenticated account: the dispatcher's settle and
+	// the assembler's finalize. Every request handler passes the authenticated
+	// account to GetBatch instead — this method must never be reached from one.
+	GetBatchByID(id string) (*Batch, bool)
+
 	// ListBatches returns an account's batches newest first, at most limit rows,
 	// starting strictly after the batch id in after (empty for the first page).
 	ListBatches(accountID string, limit int, after string) ([]*Batch, error)

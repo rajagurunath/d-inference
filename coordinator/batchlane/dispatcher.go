@@ -36,6 +36,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/saferun"
 	"github.com/eigeninference/d-inference/coordinator/store"
 	"github.com/eigeninference/d-inference/coordinator/store/sealedblob"
 )
@@ -125,10 +126,16 @@ const (
 	// crash between sealing an item body and committing its rows, so hourly is
 	// far more often than it can occur.
 	DefaultOrphanInterval = time.Hour
-	// maxOrphanDeletes bounds one orphan pass, so a directory that somehow
-	// filled with stale blobs is drained over several passes instead of
-	// blocking a tick on tens of thousands of unlinks.
+	// maxOrphanDeletes bounds the unlinks one orphan pass performs, so a
+	// directory that somehow filled with stale blobs is drained over several
+	// passes instead of blocking on tens of thousands of unlinks.
 	maxOrphanDeletes = 1000
+	// maxOrphanScan bounds the store probes one orphan pass performs. The
+	// delete bound alone does not bound the pass: a directory full of blobs
+	// that all still have rows produces one BatchItemExists per blob and no
+	// deletes at all, so a large store would issue a query per blob per hour
+	// forever. A pass that hits either bound stops and the next one continues.
+	maxOrphanScan = 2000
 	// itemBlobPrefix is the id prefix every batch-item blob ref carries. File
 	// blobs use "file-" and are owned by the file retention pass, so the orphan
 	// sweep never looks at one.
@@ -179,6 +186,9 @@ type Dispatcher struct {
 	inflight   int
 	lastPurge  time.Time
 	lastOrphan time.Time
+	// orphanRunning guards the off-tick orphan pass, so a pass that outlives its
+	// own interval is never joined by a second one.
+	orphanRunning bool
 }
 
 // slotState is one provider·slot's controller plus the smoothing that feeds it.
@@ -204,11 +214,22 @@ type batchState struct {
 
 // itemOutcome is what a dispatch goroutine reports back.
 type itemOutcome struct {
+	// batch is the row the tick claimed this item from, carried through
+	// claim → dispatch → settle so settle never has to resolve it again. That
+	// re-read is what used to downgrade a consumer-sealed result: a batch that
+	// had just left the open list resolved to nothing, and the result was
+	// written under the coordinator's own key instead of the consumer's.
+	batch   *store.Batch
 	batchID string
 	itemID  string
 	outcome Outcome
 	err     error
 }
+
+// errDispatchPanicked is the error a recovered dispatch goroutine settles with.
+// Paired with ErrCodeRequestFailed it reads as permanent, so the claim is
+// failed rather than stranded inflight until the batch expires.
+var errDispatchPanicked = errors.New("batch item dispatch panicked")
 
 // New builds a dispatcher and performs restart recovery: every item some
 // previous process left inflight is returned to pending, keeping its attempt
@@ -368,7 +389,12 @@ func (d *Dispatcher) updateTargets(now time.Time) int {
 		} else if st.decode.Initialized() {
 			sig.DecodeTPS = st.decode.Value
 		}
-		sig.KV = st.kv.Observe(sig.KV)
+		// A slot with no published token budget has no KV sample to fold in;
+		// folding a placeholder would poison the average for the ticks after the
+		// provider does start reporting one.
+		if sig.KVKnown {
+			sig.KV = st.kv.Observe(sig.KV)
+		}
 		// Waiting is deliberately NOT smoothed: it is the backpressure signal,
 		// and an EWMA of it would both delay the backoff and never fully decay,
 		// leaving the target halved long after the online burst passed.
@@ -437,13 +463,20 @@ func (d *Dispatcher) claimAndDispatch(ctx context.Context, batches []*store.Batc
 		return plans[i].batch.ID < plans[j].batch.ID
 	})
 
+	// The floor is granted at most once per tick FLEET-WIDE, not once per urgent
+	// batch: a hundred batches crossing FloorUrgency together must not put a
+	// hundred rows on a fleet whose AIMD target is zero. The plans are already
+	// ordered by priority, so the grant goes to the batch closest to missing its
+	// window; a batch whose own bucket is empty passes the grant on rather than
+	// consuming it.
+	floorGranted := false
 	for _, p := range plans {
 		want := p.pending
 		if want > budget {
 			want = budget
 		}
-		if want == 0 && p.urgency >= FloorUrgency {
-			// The deadline progress floor: one item, rate limited to
+		if want == 0 && !floorGranted && p.urgency >= FloorUrgency {
+			// The deadline progress floor: one item, rate limited per batch to
 			// FloorItemsPerSec, so an urgent batch is never starved to expiry
 			// however busy the online lane is. It does NOT raise the AIMD
 			// target — the reservation path still refuses a slot with no
@@ -454,6 +487,7 @@ func (d *Dispatcher) claimAndDispatch(ctx context.Context, batches []*store.Batc
 			d.mu.Unlock()
 			if granted {
 				want = 1
+				floorGranted = true
 			}
 		}
 		if want == 0 {
@@ -505,19 +539,40 @@ func (d *Dispatcher) start(ctx context.Context, b *store.Batch, it *store.BatchI
 	itemCtx := bs.ctx
 	d.mu.Unlock()
 
-	batchID, itemID, blobRef := b.ID, it.ID, it.BlobRef
+	itemID, blobRef := it.ID, it.BlobRef
+	// The key id travels on the batch row (PR3c), so batch work is attributed to
+	// the key that submitted it and its AllowedModels and spend cap apply.
 	accountID, apiKeyID, batchModel := b.AccountID, b.APIKeyID, b.Model
+
+	// res is primed with the permanent failure a panicking dispatch would leave
+	// behind, so a recovered goroutine still settles its claim. The batch row is
+	// carried along: settle must never re-resolve it (a consumer-sealed result
+	// would silently fall back to the coordinator's key).
+	res := itemOutcome{
+		batch:   b,
+		batchID: b.ID,
+		itemID:  itemID,
+		outcome: Outcome{ErrCode: ErrCodeRequestFailed},
+		err:     errDispatchPanicked,
+	}
 
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
-		out, err := d.runItem(itemCtx, accountID, apiKeyID, batchModel, blobRef)
-		select {
-		case d.results <- itemOutcome{batchID: batchID, itemID: itemID, outcome: out, err: err}:
-		case <-d.stop:
-			// Shutting down. The item stays inflight in the store and the next
-			// process's restart recovery returns it to pending.
-		}
+		// Defers run LIFO, so the report below runs AFTER saferun.Recover has
+		// swallowed a panic — which is what turns a panicking dispatch into a
+		// settled item instead of an item stranded inflight until expiry.
+		defer func() {
+			select {
+			case d.results <- res:
+			case <-d.stop:
+				// Shutting down. The item stays inflight in the store and the
+				// next process's restart recovery returns it to pending.
+			}
+		}()
+		defer saferun.Recover(d.logger, "batch_dispatch_item")
+
+		res.outcome, res.err = d.runItem(itemCtx, accountID, apiKeyID, batchModel, blobRef)
 	}()
 }
 
@@ -594,12 +649,16 @@ func (d *Dispatcher) settle(res itemOutcome, now time.Time) {
 
 	switch {
 	case res.err == nil && res.outcome.ErrCode == "":
-		d.settleSuccess(res, now)
+		d.settleSuccess(res, claimable, now)
 	case res.outcome.ErrCode == ErrCodeNoCapacity || res.outcome.ErrCode == ErrCodeCancelled:
 		// Neither is the item's fault, so no attempt is charged. If the batch
 		// is no longer claimable its items belong to the sweep, which has
 		// already moved them to expired or cancelled.
 		if !claimable {
+			// The item is terminal now, so its retry tally goes with it —
+			// leaving the entry behind leaks one map slot per item for the life
+			// of the process.
+			d.forgetAttempts(res.itemID)
 			return
 		}
 		if _, err := d.st.ReleaseItem(res.itemID); err != nil {
@@ -617,9 +676,33 @@ func (d *Dispatcher) settle(res itemOutcome, now time.Time) {
 }
 
 // settleSuccess seals the response and moves the item to succeeded.
-func (d *Dispatcher) settleSuccess(res itemOutcome, now time.Time) {
+//
+// Two guards come before the blob is written, because a result blob written
+// under the wrong key — or written at all for an item that is already
+// terminal — is worse than no result:
+//
+//   - a settle with no batch row cannot know which key the consumer asked for,
+//     so it fails the item permanently rather than sealing to the coordinator's
+//     own key. Downgrading would hand the coordinator plaintext the consumer
+//     paid to keep from it;
+//   - a settle for a batch the sweep has already closed writes nothing at all.
+//     FinishItem would refuse the item anyway and the blob would be deleted on
+//     the next line; skipping the write is the same outcome without the round
+//     trip, and it leaves an expired batch with nothing on disk.
+func (d *Dispatcher) settleSuccess(res itemOutcome, claimable bool, now time.Time) {
+	if res.batch == nil {
+		d.logger.Error("batch lane: a settle arrived with no batch row",
+			"batch_id", res.batchID, "item_id", res.itemID)
+		d.settleFailure(res, claimable, true, now)
+		return
+	}
+	if !claimable {
+		d.forgetAttempts(res.itemID)
+		return
+	}
+
 	ref := ResultBlobRef(res.itemID)
-	if err := d.putResult(res.batchID, ref, res.outcome.ResponseBody); err != nil {
+	if err := d.putResult(res.batch, ref, res.outcome.ResponseBody); err != nil {
 		d.logger.Error("batch lane: could not seal a result",
 			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
 		// The response cannot be stored, so it can never be assembled: retrying
@@ -638,8 +721,21 @@ func (d *Dispatcher) settleSuccess(res itemOutcome, now time.Time) {
 		ResultBlobRef:    ref,
 	}, now)
 	if err != nil {
+		// The item is still inflight in the store and the result blob it points
+		// at is already on disk. Release the claim and drop the blob so the next
+		// tick re-claims the item instead of leaving it stranded until the batch
+		// expires. The dispatch is repeated, which costs one provider call; the
+		// alternative costs the consumer the whole item.
 		d.logger.Error("batch lane: could not finish an item",
 			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
+		if _, rerr := d.st.ReleaseItem(res.itemID); rerr != nil {
+			d.logger.Error("batch lane: could not re-offer an unfinishable item",
+				"batch_id", res.batchID, "item_id", res.itemID, "error", rerr)
+		}
+		if derr := d.blob.Delete(ref); derr != nil && !errors.Is(derr, sealedblob.ErrNotFound) {
+			d.logger.Error("batch lane: could not drop an unfinished result blob",
+				"batch_id", res.batchID, "item_id", res.itemID, "error", derr)
+		}
 		return
 	}
 	if !ok {
@@ -649,6 +745,7 @@ func (d *Dispatcher) settleSuccess(res itemOutcome, now time.Time) {
 			d.logger.Error("batch lane: could not drop a late result blob",
 				"batch_id", res.batchID, "item_id", res.itemID, "error", err)
 		}
+		d.forgetAttempts(res.itemID)
 		return
 	}
 
@@ -662,11 +759,19 @@ func (d *Dispatcher) settleSuccess(res itemOutcome, now time.Time) {
 	d.runFinalize(res.batchID, now)
 }
 
+// forgetAttempts drops one item's in-memory retry tally.
+func (d *Dispatcher) forgetAttempts(itemID string) {
+	d.mu.Lock()
+	delete(d.attempts, itemID)
+	d.mu.Unlock()
+}
+
 // putResult seals the response body to the consumer's key when the batch
-// carries one, and to the coordinator's own key otherwise.
-func (d *Dispatcher) putResult(batchID, ref string, body []byte) error {
-	b, ok := d.batchByID(batchID)
-	if ok && b.ResultPublicKey != "" {
+// carries one, and to the coordinator's own key otherwise. b is the row the
+// tick claimed the item from — never a re-read, so a batch that left the open
+// list mid-dispatch cannot silently downgrade a consumer-sealed result.
+func (d *Dispatcher) putResult(b *store.Batch, ref string, body []byte) error {
+	if b.ResultPublicKey != "" {
 		key, err := decodePublicKey(b.ResultPublicKey)
 		if err != nil {
 			return err
@@ -751,6 +856,12 @@ func (d *Dispatcher) sweep(batches []*store.Batch, now time.Time) {
 
 // expire closes a batch that ran out of window. Expired items move neither
 // counts_completed nor counts_failed, so completed + failed stays ≤ total.
+//
+// The terminal transition belongs to finalize, not here: finalize assembles the
+// output and error files (an expired item becomes an error line carrying
+// batch_expired) and only then CASes in_progress → expired. Closing the batch
+// first would hand finalize a batch that is no longer open, and the consumer
+// would get an expired batch with no files at all.
 func (d *Dispatcher) expire(b *store.Batch, now time.Time) {
 	d.cancelBatch(b.ID)
 	n, err := d.st.ExpireOpenItems(b.ID, now)
@@ -758,37 +869,45 @@ func (d *Dispatcher) expire(b *store.Batch, now time.Time) {
 		d.logger.Error("batch lane: could not expire open items", "batch_id", b.ID, "error", err)
 		return
 	}
-	ok, err := d.st.SetBatchStatus(b.ID, store.BatchInProgress, store.BatchExpired, now)
-	if err != nil {
-		d.logger.Error("batch lane: could not expire batch", "batch_id", b.ID, "error", err)
-		return
-	}
-	if !ok {
-		return
-	}
-	d.logger.Info("batch lane: batch expired", "batch_id", b.ID, "expired_items", n)
-	d.runFinalize(b.ID, now)
+	d.logger.Info("batch lane: batch window closed", "batch_id", b.ID, "expired_items", n)
+	d.closeBatch(b, store.BatchInProgress, store.BatchExpired, now)
 }
 
 // drainCancelled stops a cancelling batch's in-flight work and closes it once
 // nothing is outstanding. Items are cancelled immediately so a result that
-// lands after this point is ignored by FinishItem.
+// lands after this point is ignored by FinishItem; as in expire, finalize
+// performs the cancelling → cancelled transition once the files are attached.
 func (d *Dispatcher) drainCancelled(b *store.Batch, now time.Time) {
 	d.cancelBatch(b.ID)
 	if _, err := d.st.CancelOpenItems(b.ID, now); err != nil {
 		d.logger.Error("batch lane: could not cancel open items", "batch_id", b.ID, "error", err)
 		return
 	}
-	ok, err := d.st.SetBatchStatus(b.ID, store.BatchCancelling, store.BatchCancelled, now)
+	d.closeBatch(b, store.BatchCancelling, store.BatchCancelled, now)
+}
+
+// closeBatch hands the terminal transition to finalize, which performs it after
+// attaching the assembled files. A crash before that leaves the batch open with
+// its items already terminal, and the next tick retries the whole pass.
+//
+// With no finalize hook wired there is no assembler and so nothing to order
+// against, and the batch would otherwise sit open forever: the dispatcher
+// performs the CAS itself in that case.
+func (d *Dispatcher) closeBatch(b *store.Batch, from, to store.BatchStatus, now time.Time) {
+	if d.finalize != nil {
+		d.runFinalize(b.ID, now)
+		return
+	}
+	ok, err := d.st.SetBatchStatus(b.ID, from, to, now)
 	if err != nil {
-		d.logger.Error("batch lane: could not cancel batch", "batch_id", b.ID, "error", err)
+		d.logger.Error("batch lane: could not close a batch",
+			"batch_id", b.ID, "status", string(to), "error", err)
 		return
 	}
-	if !ok {
-		return
+	if ok {
+		d.logger.Info("batch lane: batch closed without an assembler",
+			"batch_id", b.ID, "status", string(to))
 	}
-	d.logger.Info("batch lane: batch cancelled", "batch_id", b.ID)
-	d.runFinalize(b.ID, now)
 }
 
 // cancelBatch cancels every dispatch the batch has in flight.
@@ -876,9 +995,20 @@ func (d *Dispatcher) retention(now time.Time) {
 	if runPurge {
 		d.lastPurge = now
 	}
-	runOrphan := d.lastOrphan.IsZero() || !now.Before(d.lastOrphan.Add(d.cfg.OrphanInterval))
-	if runOrphan {
+	// The orphan pass never runs on the very first tick: a coordinator that has
+	// just started has a cold store, a cold page cache and restart recovery
+	// still settling, and the condition the pass repairs (a crash between
+	// sealing an item body and committing its rows) has waited hours already. It
+	// can wait one OrphanInterval more. lastOrphan is therefore seeded with the
+	// first `now` the dispatcher sees rather than left zero.
+	runOrphan := false
+	switch {
+	case d.lastOrphan.IsZero():
 		d.lastOrphan = now
+	case !now.Before(d.lastOrphan.Add(d.cfg.OrphanInterval)) && !d.orphanRunning:
+		d.lastOrphan = now
+		d.orphanRunning = true
+		runOrphan = true
 	}
 	d.mu.Unlock()
 
@@ -892,7 +1022,21 @@ func (d *Dispatcher) retention(now time.Time) {
 		}
 	}
 	if runOrphan {
-		d.sweepOrphanItemBlobs(now)
+		// A full directory listing plus a store probe per candidate is the most
+		// expensive thing the dispatcher does, and Tick is the 1 Hz control
+		// loop: run it off the tick so a slow disk or a slow store cannot delay
+		// a claim. It joins d.wg, so shutdown still waits for it.
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			defer func() {
+				d.mu.Lock()
+				d.orphanRunning = false
+				d.mu.Unlock()
+			}()
+			defer saferun.Recover(d.logger, "batch_orphan_sweep")
+			d.sweepOrphanItemBlobs(now)
+		}()
 	}
 }
 
@@ -907,7 +1051,9 @@ func (d *Dispatcher) retention(now time.Time) {
 // each ref's item id, so anything a row still references is kept whatever its
 // age; and it ignores blobs younger than the retention window, so a batch being
 // created right now — its blobs written, its rows not yet committed — is never
-// raced. Each pass is bounded; a backlog drains over several.
+// raced. Each pass is bounded on BOTH the probes it makes and the blobs it
+// unlinks; a backlog drains over several. It runs off the tick, so neither
+// bound is load bearing for the control loop's period.
 func (d *Dispatcher) sweepOrphanItemBlobs(now time.Time) {
 	blobs, err := d.blob.List()
 	if err != nil {
@@ -918,7 +1064,7 @@ func (d *Dispatcher) sweepOrphanItemBlobs(now time.Time) {
 
 	scanned, deleted := 0, 0
 	for _, info := range blobs {
-		if deleted >= maxOrphanDeletes {
+		if deleted >= maxOrphanDeletes || scanned >= maxOrphanScan {
 			d.logger.Info("batch lane: orphan sweep hit its per-pass bound",
 				"deleted", deleted, "scanned", scanned)
 			break
@@ -973,21 +1119,6 @@ func (d *Dispatcher) purgeItemResults(batchID string) {
 	}
 }
 
-// batchByID reads one batch without an account scope. Only the dispatcher may
-// do this; every request handler passes the authenticated account instead.
-func (d *Dispatcher) batchByID(batchID string) (*store.Batch, bool) {
-	open, err := d.st.ListOpenBatches()
-	if err != nil {
-		return nil, false
-	}
-	for _, b := range open {
-		if b.ID == batchID {
-			return b, true
-		}
-	}
-	return nil, false
-}
-
 // SlotTarget reports one slot's current AIMD target. For tests and operational
 // introspection.
 func (d *Dispatcher) SlotTarget(key SlotKey) int {
@@ -1005,7 +1136,3 @@ func (d *Dispatcher) InflightItems() int {
 	defer d.mu.Unlock()
 	return d.inflight
 }
-
-// awaitDispatch waits for the dispatch goroutines started so far. Tests use it
-// to make a tick's asynchronous half deterministic.
-func (d *Dispatcher) awaitDispatch() { d.wg.Wait() }
