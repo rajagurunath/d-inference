@@ -9,12 +9,14 @@ package api
 // downstream — blob sealing, dispatch, output assembly — sees only []parsedItem.
 //
 // Privacy: no error produced here quotes a custom_id, a metadata key or value,
-// a filename, or any body bytes. Failures identify a line number and a field
-// name, which is enough for a consumer to fix the input and carries nothing a
-// log line could not already hold.
+// a filename, a requested model, an endpoint, a content part type, or any body
+// bytes. Failures identify a line number and a field name, which is enough for
+// a consumer to fix the input and carries nothing a log line could not already
+// hold.
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -145,7 +147,7 @@ func parseBatchJSONL(r io.Reader, endpoint string, maxLines int, resolveModel mo
 	inferEndpoint := endpoint == ""
 	if !inferEndpoint && !batchEndpoints[endpoint] {
 		return nil, batchErr("invalid_endpoint", "endpoint",
-			"endpoint %q is not available for batch — use /v1/chat/completions or /v1/completions", endpoint)
+			"endpoint is not available for batch — use /v1/chat/completions or /v1/completions")
 	}
 
 	scanner := bufio.NewScanner(r)
@@ -184,7 +186,7 @@ func parseBatchJSONL(r io.Reader, endpoint string, maxLines int, resolveModel mo
 		}
 		if line.URL != endpoint {
 			return nil, batchErr("invalid_line", "url",
-				"line %d: url must equal the batch endpoint %q", lineNo, endpoint)
+				"line %d: url must equal the batch endpoint", lineNo)
 		}
 		if err := validateCustomID(line.CustomID, lineNo); err != nil {
 			return nil, err
@@ -225,7 +227,7 @@ func parseBatchJSONL(r io.Reader, endpoint string, maxLines int, resolveModel mo
 func parseInlineRequests(reqs []inlineRequest, endpoint, model string, max int, resolveModel modelResolver) ([]parsedItem, error) {
 	if !batchEndpoints[endpoint] {
 		return nil, batchErr("invalid_endpoint", "endpoint",
-			"endpoint %q is not available for batch — use /v1/chat/completions or /v1/completions", endpoint)
+			"endpoint is not available for batch — use /v1/chat/completions or /v1/completions")
 	}
 	if strings.TrimSpace(model) == "" {
 		return nil, batchErr("invalid_request", "model",
@@ -289,8 +291,14 @@ func validateBatchBody(body json.RawMessage, defaultModel string, lineNo int, re
 	if len(body) == 0 {
 		return "", nil, batchErr("invalid_line", "body", "line %d: body is required", lineNo)
 	}
+	// Decode with UseNumber so an integer like "seed" is kept as its exact
+	// json.Number text rather than round-tripped through float64, which loses
+	// precision above 2^53 and would silently mangle the value the dispatcher
+	// later sends on.
 	var parsed map[string]any
-	if err := json.Unmarshal(body, &parsed); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err != nil {
 		return "", nil, batchErr("invalid_line", "body", "line %d: body is not a JSON object", lineNo)
 	}
 
@@ -299,8 +307,12 @@ func validateBatchBody(body json.RawMessage, defaultModel string, lineNo int, re
 			"line %d: stream must be false — batch results are delivered as files", lineNo)
 	}
 	if n, ok := parsed["n"]; ok && n != nil {
-		count, ok := n.(float64)
+		num, ok := n.(json.Number)
 		if !ok {
+			return "", nil, batchErr("invalid_line", "n", "line %d: n must be a number", lineNo)
+		}
+		count, err := num.Float64()
+		if err != nil {
 			return "", nil, batchErr("invalid_line", "n", "line %d: n must be a number", lineNo)
 		}
 		if count > 1 {
@@ -321,7 +333,7 @@ func validateBatchBody(body json.RawMessage, defaultModel string, lineNo int, re
 	resolved, ok := resolveModel(requested)
 	if !ok {
 		return "", nil, batchErr("model_not_found", "model",
-			"line %d: model %q is not available for batch", lineNo, requested)
+			"line %d: model is not available for batch", lineNo)
 	}
 
 	if current, _ := parsed["model"].(string); current == resolved {
@@ -338,7 +350,8 @@ func validateBatchBody(body json.RawMessage, defaultModel string, lineNo int, re
 // validateTextOnlyContent rejects image, audio, video, and file content parts.
 // A batch item may wait hours before it is dispatched; a media reference that
 // was live at submission time is not guaranteed to be live at dispatch, and the
-// batch lane deliberately does not run the media resolver.
+// batch lane deliberately does not run the media resolver. The offending part
+// type is a consumer string and is never echoed into the error.
 func validateTextOnlyContent(parsed map[string]any, lineNo int) error {
 	messages, ok := parsed["messages"].([]any)
 	if !ok {
@@ -361,7 +374,7 @@ func validateTextOnlyContent(parsed map[string]any, lineNo int) error {
 			kind, _ := part["type"].(string)
 			if !textContentPartTypes[kind] {
 				return batchErr("unsupported_content", "messages",
-					"line %d: content part type %q is not supported in batch — text only", lineNo, kind)
+					"line %d: only text content parts are supported in batch", lineNo)
 			}
 		}
 	}

@@ -220,6 +220,74 @@ func TestFinalizeReportsExpiredItemsWithTheirOwnCode(t *testing.T) {
 	}
 }
 
+// TestFinalizeRetriesALostStatusCAS reproduces the wedge where one finalize
+// pass's AttachOutputFiles lands but its own status CAS is lost or errored
+// (e.g. racing a cancel between the two calls). The next finalize pass must
+// not treat AttachOutputFiles losing the race as "someone else already
+// finished the job" — it must re-read the batch's current status and files
+// and retry the CAS, or the batch would stay wedged open forever with output
+// files already attached.
+func TestFinalizeRetriesALostStatusCAS(t *testing.T) {
+	env := newBatchEnv(t)
+	batchID := env.createFileBatch(1)
+	items := env.claimAll(batchID)
+	env.settleSucceeded(items[0], []byte(`{"id":"a"}`))
+
+	now := time.Now().UTC()
+
+	// Simulate a prior finalize pass whose attach won but whose status CAS
+	// never landed: attach a real output file directly, without moving the
+	// batch out of in_progress.
+	outputID, err := newBatchID("file-")
+	if err != nil {
+		t.Fatalf("mint id: %v", err)
+	}
+	content := []byte(`{"id":"x","custom_id":"req-0","response":{"status_code":200,"body":{"id":"a"}},"error":null}` + "\n")
+	if err := env.srv.BatchBlobs().PutPlain(outputID, content); err != nil {
+		t.Fatalf("seal output: %v", err)
+	}
+	if err := env.st.CreateBatchFile(&store.BatchFile{
+		ID: outputID, AccountID: env.account, Purpose: batchFilePurposeOutput,
+		Filename: batchID + "_batch_output.jsonl", SizeBytes: int64(len(content)), CreatedAt: now,
+		BlobRef: outputID, SealedBy: "coordinator",
+	}); err != nil {
+		t.Fatalf("record output file: %v", err)
+	}
+	if attached, err := env.st.AttachOutputFiles(batchID, &outputID, nil); err != nil || !attached {
+		t.Fatalf("attach = %v, %v", attached, err)
+	}
+
+	// Precondition: the batch is wedged — files attached, status still open.
+	if b, ok := env.st.GetBatch(env.account, batchID); !ok || b.Status != store.BatchInProgress {
+		t.Fatalf("precondition: batch = %+v, ok=%v", b, ok)
+	}
+
+	res, err := env.srv.FinalizeBatchIfDone(batchID, now)
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if res == nil || res.Status != store.BatchCompleted {
+		t.Fatalf("finalize = %+v, want completed", res)
+	}
+	if res.OutputFileID == nil || *res.OutputFileID != outputID {
+		t.Fatalf("finalize must report the already-attached output file, got %+v", res)
+	}
+
+	status, got := env.getJSON("/v1/batches/"+batchID, env.key)
+	if status != http.StatusOK || got["status"] != "completed" {
+		t.Fatalf("get = %d %v", status, got)
+	}
+	if got["output_file_id"] != outputID {
+		t.Fatalf("batch does not carry the already-attached output file: %v", got)
+	}
+
+	// The item input blob is still cleaned up even though this pass never
+	// built the output file it reports.
+	if names := blobFiles(t, env.blobDir); len(names) != 2 { // the result blob + the output file
+		t.Fatalf("unexpected blobs left after finalize: %v", names)
+	}
+}
+
 func TestPurgeExpiredBatchFiles(t *testing.T) {
 	env := newBatchEnv(t)
 	batchID := env.createFileBatch(1)
