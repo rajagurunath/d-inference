@@ -4,7 +4,7 @@
         prompt-sidecar-format prompt-sidecar-check prompt-sidecar-test prompt-sidecar-build prompt-sidecar \
         provider-build provider-test provider benchmark-gemma-contbatch benchmark-wrapper-test \
         ui-install ui-build ui-lint ui-test ui \
-        e2e-integration e2e-benchmark e2e dev-stack \
+        e2e-integration e2e-benchmark e2e-coserve e2e dev-stack \
         docs-check docs-stamp \
         test build all clean
 
@@ -106,6 +106,13 @@ e2e-integration: ## go test ./e2e/... -run TestIntegration
 
 e2e-benchmark: ## go test ./e2e/... -run TestBenchmark (load benchmarks)
 	go test ./e2e/... -run TestBenchmark -v
+
+# The batch lane is opt-in: without a key the coordinator never wires it and
+# every batch route answers 503. The test defaults the dev escape hatch on when
+# neither variable is exported, so this target needs only the provider binary
+# and a local checkpoint. COSERVE_REPORT_PATH writes the rendered markdown.
+e2e-coserve: ## go test ./e2e/ -run TestBenchmarkBatchCoServe (batch co-serving benchmark, ~12 min)
+	GOTOOLCHAIN=auto go test ./e2e/ -run TestBenchmarkBatchCoServe -v -timeout 30m -count=1
 
 e2e: e2e-integration ## Run the integration suite
 
