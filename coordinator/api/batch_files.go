@@ -9,7 +9,19 @@ package api
 //   - multipart/form-data with purpose=batch and a JSONL file part (what every
 //     OpenAI SDK sends), plaintext over TLS;
 //   - a sealed JSON envelope carrying {purpose, filename, content_base64},
-//     unsealed in memory by sealedTransport, so the plaintext never reaches disk.
+//     unsealed in memory by sealedTransport, so the plaintext never reaches
+//     disk. sealedTransport's own fixed 16 MiB cap on the outer sealed body,
+//     once the ciphertext and content_base64 base64 layers both eat into it,
+//     leaves room for only about 9 MiB of actual file content; this path
+//     enforces an explicit 8 MiB file cap of its own (maxSealedEnvelopeFileBytes)
+//     so an oversized sealed upload gets one clear 413 instead of failing
+//     confusingly upstream.
+//
+// The multipart path is read with mime/multipart's low-level Reader, not
+// r.ParseMultipartForm: ParseMultipartForm spills any part over its memory
+// threshold to an unencrypted os.CreateTemp file, which would put a batch
+// prompt on disk in the clear before it is ever sealed. Streaming each part by
+// hand keeps the plaintext in this process's memory only.
 //
 // Privacy: filenames, custom_ids, and body bytes never reach a log line. Only
 // ids, byte counts, and line counts do.
@@ -135,12 +147,11 @@ func (s *Server) handleBatchFileUpload(w http.ResponseWriter, r *http.Request) {
 
 	fileID, err := newBatchID("file-")
 	if err != nil {
-		s.writeBatchError(w, internalBatchError(err))
+		s.writeBatchError(w, s.internalBatchError(err))
 		return
 	}
 	if err := blobs.PutPlain(fileID, content); err != nil {
-		s.logger.Error("batch: sealing an uploaded input file failed", "file_id", fileID, "error", err)
-		s.writeBatchError(w, internalBatchError(err))
+		s.writeBatchError(w, s.internalBatchError(err, "file_id", fileID))
 		return
 	}
 	rec := &store.BatchFile{
@@ -159,8 +170,7 @@ func (s *Server) handleBatchFileUpload(w http.ResponseWriter, r *http.Request) {
 		if delErr := blobs.Delete(fileID); delErr != nil {
 			s.logger.Error("batch: removing an orphaned input blob failed", "file_id", fileID, "error", delErr)
 		}
-		s.logger.Error("batch: recording an uploaded input file failed", "file_id", fileID, "error", err)
-		s.writeBatchError(w, internalBatchError(err))
+		s.writeBatchError(w, s.internalBatchError(err, "file_id", fileID))
 		return
 	}
 
@@ -182,38 +192,81 @@ func (s *Server) readBatchUpload(w http.ResponseWriter, r *http.Request) (purpos
 	return s.readEnvelopeUpload(w, r)
 }
 
+// maxMultipartFieldBytes bounds a non-file form field (only "purpose" is
+// expected). It has nothing to do with the file cap; it just keeps a
+// misbehaving client from streaming an unbounded field value into memory
+// under the guise of a form field.
+const maxMultipartFieldBytes = 1 << 10
+
+// readMultipartUpload streams the request through mime/multipart's low-level
+// Reader instead of r.ParseMultipartForm: ParseMultipartForm buffers each part
+// past its memory threshold to a plaintext temp file via os.CreateTemp, which
+// would put an uploaded prompt on disk in the clear before this handler ever
+// seals it. Reading each part directly means the file's bytes exist only in
+// this function's own memory, in an io.LimitReader-bounded read, and never
+// touch $TMPDIR.
 func (s *Server) readMultipartUpload(w http.ResponseWriter, r *http.Request) (string, string, []byte, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxFileBytes+multipartSlackBytes)
-	if err := r.ParseMultipartForm(1 << 20); err != nil {
-		if tooLarge(err) {
-			return "", "", nil, oversizeBatchUpload()
-		}
+	mr, err := r.MultipartReader()
+	if err != nil {
 		return "", "", nil, batchErr("invalid_request", "file", "multipart form could not be read")
 	}
-	defer func() {
-		if r.MultipartForm != nil {
-			_ = r.MultipartForm.RemoveAll()
-		}
-	}()
 
-	part, header, err := r.FormFile("file")
-	if err != nil {
+	var (
+		purpose  string
+		filename string
+		content  []byte
+		haveFile bool
+	)
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			if tooLarge(err) {
+				return "", "", nil, oversizeBatchUpload()
+			}
+			return "", "", nil, batchErr("invalid_request", "file", "multipart form could not be read")
+		}
+
+		switch part.FormName() {
+		case "purpose":
+			raw, err := io.ReadAll(io.LimitReader(part, maxMultipartFieldBytes))
+			part.Close()
+			if err != nil {
+				if tooLarge(err) {
+					return "", "", nil, oversizeBatchUpload()
+				}
+				return "", "", nil, batchErr("invalid_request", "purpose", "the purpose field could not be read")
+			}
+			purpose = strings.TrimSpace(string(raw))
+		case "file":
+			if haveFile {
+				// A second file part is ignored; the first one wins.
+				part.Close()
+				continue
+			}
+			body, err := io.ReadAll(io.LimitReader(part, maxFileBytes+1))
+			partFilename := part.FileName()
+			part.Close()
+			if err != nil {
+				if tooLarge(err) {
+					return "", "", nil, oversizeBatchUpload()
+				}
+				return "", "", nil, batchErr("invalid_request", "file", "the uploaded file could not be read")
+			}
+			filename = sanitizeBatchFilename(partFilename)
+			content = body
+			haveFile = true
+		default:
+			part.Close()
+		}
+	}
+	if !haveFile {
 		return "", "", nil, batchErr("invalid_request", "file", "a JSONL file part named \"file\" is required")
 	}
-	defer part.Close()
-
-	content, err := io.ReadAll(io.LimitReader(part, maxFileBytes+1))
-	if err != nil {
-		if tooLarge(err) {
-			return "", "", nil, oversizeBatchUpload()
-		}
-		return "", "", nil, batchErr("invalid_request", "file", "the uploaded file could not be read")
-	}
-	filename := ""
-	if header != nil {
-		filename = header.Filename
-	}
-	return strings.TrimSpace(r.FormValue("purpose")), sanitizeBatchFilename(filename), content, nil
+	return purpose, filename, content, nil
 }
 
 // sealedFileEnvelope is the JSON body shape POST /v1/files accepts, either as
@@ -222,6 +275,26 @@ type sealedFileEnvelope struct {
 	Purpose       string `json:"purpose"`
 	Filename      string `json:"filename"`
 	ContentBase64 string `json:"content_base64"`
+}
+
+// maxSealedEnvelopeFileBytes is the file-content cap on this path when it is
+// reached through sealedTransport. sealedTransport caps the whole outer sealed
+// request at a fixed 16 MiB (sender_encryption.go); that budget also has to
+// pay for the outer envelope's own JSON, the NaCl-Box nonce and MAC, one layer
+// of base64 for the ciphertext, and — inside the plaintext it decrypts to —
+// the content_base64 field's own base64 inflation. Working that through
+// leaves roughly 9 MiB of actual file content, so 8 MiB is enforced here
+// explicitly, with its own precise 413, rather than letting an oversized
+// sealed upload fail confusingly upstream (a generic body-too-large 400 from
+// sealedTransport, or a truncated envelope that never parses as JSON).
+const maxSealedEnvelopeFileBytes = 8 << 20
+
+func oversizeSealedBatchUpload() *batchError {
+	return &batchError{
+		Status: http.StatusRequestEntityTooLarge, Type: "invalid_request_error",
+		Code: "file_too_large", Param: "content_base64",
+		Message: fmt.Sprintf("a batch file sent through the sealed envelope path is limited to %d bytes", maxSealedEnvelopeFileBytes),
+	}
 }
 
 func (s *Server) readEnvelopeUpload(w http.ResponseWriter, r *http.Request) (string, string, []byte, error) {
@@ -240,9 +313,17 @@ func (s *Server) readEnvelopeUpload(w http.ResponseWriter, r *http.Request) (str
 		return "", "", nil, batchErr("invalid_request", "",
 			"body must be multipart/form-data or a JSON object with purpose, filename, and content_base64")
 	}
+	// Reject an oversized sealed upload on the encoded length, before paying
+	// for a base64 decode of something that can never fit.
+	if isSealedRequest(r) && len(env.ContentBase64) > base64.StdEncoding.EncodedLen(maxSealedEnvelopeFileBytes) {
+		return "", "", nil, oversizeSealedBatchUpload()
+	}
 	content, err := base64.StdEncoding.DecodeString(env.ContentBase64)
 	if err != nil {
 		return "", "", nil, batchErr("invalid_request", "content_base64", "content_base64 is not valid base64")
+	}
+	if isSealedRequest(r) && int64(len(content)) > maxSealedEnvelopeFileBytes {
+		return "", "", nil, oversizeSealedBatchUpload()
 	}
 	return strings.TrimSpace(env.Purpose), sanitizeBatchFilename(env.Filename), content, nil
 }
@@ -283,9 +364,12 @@ func oversizeBatchUpload() *batchError {
 	}
 }
 
-// internalBatchError wraps a coordinator-side failure so writeBatchError
-// renders a 500 without leaking the cause to the consumer.
-func internalBatchError(cause error) *batchError {
+// internalBatchError logs cause at error level — together with only the ids
+// the caller passes in kv, never a consumer string — and returns a batchError
+// so writeBatchError renders a 500 without leaking the cause to the consumer.
+func (s *Server) internalBatchError(cause error, kv ...any) *batchError {
+	args := append([]any{"error", cause}, kv...)
+	s.logger.Error("batch: internal error", args...)
 	return &batchError{
 		Status: http.StatusInternalServerError, Type: "internal_error", Code: "internal_error",
 		Message: "internal server error",
@@ -338,8 +422,7 @@ func (s *Server) handleBatchFileContent(w http.ResponseWriter, r *http.Request) 
 			})
 			return
 		}
-		s.logger.Error("batch: opening a file blob failed", "file_id", f.ID, "error", err)
-		s.writeBatchError(w, internalBatchError(err))
+		s.writeBatchError(w, s.internalBatchError(err, "file_id", f.ID))
 		return
 	}
 	w.Header().Set("Content-Type", "application/jsonl")

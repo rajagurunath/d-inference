@@ -126,13 +126,12 @@ func (s *Server) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 
 	batchID, err := newBatchID("batch_")
 	if err != nil {
-		s.writeBatchError(w, internalBatchError(err))
+		s.writeBatchError(w, s.internalBatchError(err))
 		return
 	}
+	// parseCreateBatch always leaves req.Endpoint set to the validated,
+	// non-empty endpoint before it returns without error.
 	endpoint := req.Endpoint
-	if endpoint == "" && len(items) > 0 {
-		endpoint = items[0].Line.URL
-	}
 
 	records := make([]*store.BatchItem, 0, len(items))
 	written := make([]string, 0, len(items))
@@ -140,13 +139,12 @@ func (s *Server) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 		itemID, err := newBatchID("bitem_")
 		if err != nil {
 			s.rollbackItemBlobs(blobs, written)
-			s.writeBatchError(w, internalBatchError(err))
+			s.writeBatchError(w, s.internalBatchError(err, "batch_id", batchID))
 			return
 		}
 		if err := blobs.PutPlain(BatchItemInputRef(itemID), it.Raw); err != nil {
-			s.logger.Error("batch: sealing an item body failed", "batch_id", batchID, "item_id", itemID, "error", err)
 			s.rollbackItemBlobs(blobs, written)
-			s.writeBatchError(w, internalBatchError(err))
+			s.writeBatchError(w, s.internalBatchError(err, "batch_id", batchID, "item_id", itemID))
 			return
 		}
 		written = append(written, BatchItemInputRef(itemID))
@@ -185,8 +183,7 @@ func (s *Server) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 				"two requests in this batch share a custom_id"))
 			return
 		}
-		s.logger.Error("batch: create failed", "batch_id", batchID, "error", err)
-		s.writeBatchError(w, internalBatchError(err))
+		s.writeBatchError(w, s.internalBatchError(err, "batch_id", batchID))
 		return
 	}
 
@@ -248,7 +245,7 @@ func (s *Server) parseCreateBatch(accountID string, blobs *sealedblob.Store, req
 	}
 	if !batchEndpoints[endpoint] {
 		return nil, "", "", batchErr("invalid_endpoint", "endpoint",
-			"endpoint %q is not available for batch — use /v1/chat/completions or /v1/completions", endpoint)
+			"endpoint is not available for batch — use /v1/chat/completions or /v1/completions")
 	}
 	req.Endpoint = endpoint
 
@@ -359,8 +356,7 @@ func (s *Server) handleBatchList(w http.ResponseWriter, r *http.Request) {
 	// Ask for one extra row so has_more is exact without a second query.
 	batches, err := s.store.ListBatches(accountID, limit+1, strings.TrimSpace(r.URL.Query().Get("after")))
 	if err != nil {
-		s.logger.Error("batch: list failed", "account_id", accountID, "error", err)
-		s.writeBatchError(w, internalBatchError(err))
+		s.writeBatchError(w, s.internalBatchError(err, "account_id", accountID))
 		return
 	}
 	hasMore := len(batches) > limit
@@ -396,8 +392,7 @@ func (s *Server) handleBatchGet(w http.ResponseWriter, r *http.Request) {
 	if b.Source == batchSourceInline && batchIsTerminal(b.Status) {
 		var err error
 		if results, err = s.inlineBatchResults(b); err != nil {
-			s.logger.Error("batch: assembling inline results failed", "batch_id", b.ID, "error", err)
-			s.writeBatchError(w, internalBatchError(err))
+			s.writeBatchError(w, s.internalBatchError(err, "batch_id", b.ID))
 			return
 		}
 	}
@@ -426,8 +421,7 @@ func (s *Server) handleBatchCancel(w http.ResponseWriter, r *http.Request) {
 	case store.BatchValidating, store.BatchInProgress:
 		now := time.Now().UTC()
 		if ok, err := s.store.SetBatchStatus(batchID, b.Status, store.BatchCancelling, now); err != nil {
-			s.logger.Error("batch: cancel CAS failed", "batch_id", batchID, "error", err)
-			s.writeBatchError(w, internalBatchError(err))
+			s.writeBatchError(w, s.internalBatchError(err, "batch_id", batchID))
 			return
 		} else if !ok {
 			// Someone else moved it first; re-read and report that.
@@ -435,6 +429,12 @@ func (s *Server) handleBatchCancel(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, err := s.store.CancelOpenItems(batchID, now); err != nil {
 			s.logger.Error("batch: cancelling open items failed", "batch_id", batchID, "error", err)
+		}
+		// Nothing else will ever call finalize for a batch with no items left
+		// in flight, so a cancel with nothing inflight must reach "cancelled"
+		// in this same request rather than waiting for the dispatcher's sweep.
+		if _, err := s.FinalizeBatchIfDone(batchID, now); err != nil {
+			s.logger.Error("batch: finalize after cancel failed", "batch_id", batchID, "error", err)
 		}
 		s.logger.Info("batch: cancellation requested", "batch_id", batchID, "account_id", accountID)
 	default:

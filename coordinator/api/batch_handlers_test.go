@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -318,11 +319,17 @@ func TestBatchLifecycleOverHTTP(t *testing.T) {
 		t.Fatalf("another account's list = %d %v", status, otherList)
 	}
 
-	// 5. Cancel moves the batch to cancelling; finalize settles it as cancelled
-	//    with no result files.
+	// 5. Cancel moves the batch to cancelling and, since nothing is inflight,
+	//    finalizes it as cancelled with no result files in the same request.
 	status, cancelled := env.postJSON("/v1/batches/"+batchID+"/cancel", map[string]any{}, env.key)
-	if status != http.StatusOK || cancelled["status"] != "cancelling" {
+	if status != http.StatusOK || cancelled["status"] != "cancelled" {
 		t.Fatalf("cancel = %d %v", status, cancelled)
+	}
+	if cancelled["cancelled_at"] == nil {
+		t.Fatalf("cancel response missing cancelled_at: %v", cancelled)
+	}
+	if cancelled["output_file_id"] != nil || cancelled["error_file_id"] != nil {
+		t.Fatalf("a cancelled batch produces no result files: %v", cancelled)
 	}
 	items, err := env.st.ListItems(batchID)
 	if err != nil {
@@ -333,15 +340,10 @@ func TestBatchLifecycleOverHTTP(t *testing.T) {
 			t.Fatalf("item %s state = %s, want cancelled", it.ID, it.State)
 		}
 	}
-	res, err := env.srv.FinalizeBatchIfDone(batchID, time.Now().UTC())
-	if err != nil {
-		t.Fatalf("finalize: %v", err)
-	}
-	if res == nil || res.Status != store.BatchCancelled {
-		t.Fatalf("finalize = %+v, want cancelled", res)
-	}
-	if res.OutputFileID != nil || res.ErrorFileID != nil {
-		t.Fatalf("a cancelled batch produces no result files: %+v", res)
+	// Finalize already ran inside the cancel request, so calling it again is a
+	// no-op on an already-terminal batch.
+	if res, err := env.srv.FinalizeBatchIfDone(batchID, time.Now().UTC()); err != nil || res != nil {
+		t.Fatalf("re-finalizing an already-terminal batch = %+v, %v", res, err)
 	}
 	status, final := env.getJSON("/v1/batches/"+batchID, env.key)
 	if status != http.StatusOK || final["status"] != "cancelled" || final["cancelled_at"] == nil {
@@ -364,6 +366,31 @@ func TestBatchLifecycleOverHTTP(t *testing.T) {
 	}
 	if strings.Contains(logs, "nightly") {
 		t.Fatalf("a log line carries batch metadata:\n%s", logs)
+	}
+}
+
+// TestCancelFinalizesWhenNothingInflight: a batch with no pending or in-flight
+// items (nothing was ever claimed by a dispatcher) must reach "cancelled" in
+// the cancel response itself, not sit at "cancelling" waiting for a dispatcher
+// sweep that will never run in this test.
+func TestCancelFinalizesWhenNothingInflight(t *testing.T) {
+	env := newBatchEnv(t)
+	batchID := env.createFileBatch(2)
+
+	status, cancelled := env.postJSON("/v1/batches/"+batchID+"/cancel", map[string]any{}, env.key)
+	if status != http.StatusOK {
+		t.Fatalf("cancel status = %d, body %v", status, cancelled)
+	}
+	if cancelled["status"] != "cancelled" {
+		t.Fatalf("cancel response status = %v, want cancelled", cancelled["status"])
+	}
+	if cancelled["cancelled_at"] == nil {
+		t.Fatalf("cancel response missing cancelled_at: %v", cancelled)
+	}
+
+	status, got := env.getJSON("/v1/batches/"+batchID, env.key)
+	if status != http.StatusOK || got["status"] != "cancelled" {
+		t.Fatalf("get after cancel = %d %v, want status cancelled", status, got)
 	}
 }
 
@@ -641,6 +668,79 @@ func TestFilesRejectsOversize(t *testing.T) {
 	}
 }
 
+// TestMultipartUploadNeverSpillsToDisk pins the fix for reading /v1/files
+// uploads through mime/multipart's low-level Reader instead of
+// r.ParseMultipartForm. ParseMultipartForm spills any part over its in-memory
+// threshold (1 MiB) to an unencrypted os.CreateTemp file; a batch prompt is
+// exactly the kind of content that must never touch disk before it is sealed.
+// A background goroutine polls the redirected TMPDIR for the length of the
+// request — not just after it — because the old code's own cleanup
+// (MultipartForm.RemoveAll) ran and deleted the temp file before the handler
+// ever wrote its response, so a post-hoc check alone would not have caught it.
+func TestMultipartUploadNeverSpillsToDisk(t *testing.T) {
+	env := newBatchEnv(t)
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	// 2 MiB of filler, comfortably over ParseMultipartForm's 1 MiB in-memory
+	// threshold and comfortably under the 16 MiB batch file cap.
+	big := strings.Repeat("y", 2<<20)
+	line := fmt.Sprintf(`{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":%q,"messages":[{"role":"user","content":%q}]}}`,
+		batchTestModel, big)
+
+	var (
+		mu      sync.Mutex
+		spilled []string
+	)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				entries, err := os.ReadDir(tmp)
+				if err != nil {
+					continue
+				}
+				if len(entries) == 0 {
+					continue
+				}
+				mu.Lock()
+				for _, e := range entries {
+					spilled = append(spilled, e.Name())
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	status, body := env.uploadMultipart(line, "batch", "big.jsonl", env.key)
+	close(stop)
+	<-done
+
+	if status != http.StatusOK {
+		t.Fatalf("upload status = %d, body %v", status, body)
+	}
+	mu.Lock()
+	got := append([]string(nil), spilled...)
+	mu.Unlock()
+	if len(got) != 0 {
+		t.Fatalf("multipart upload put a file on disk under TMPDIR at some point during the request: %v", got)
+	}
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatalf("read TMPDIR: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("TMPDIR is not empty after the upload: %v", entries)
+	}
+}
+
 func TestFilesRejectsWrongPurposeAndInvalidLines(t *testing.T) {
 	env := newBatchEnv(t)
 
@@ -706,6 +806,46 @@ func TestSealedEnvelopeUploadUnsealsInTransitThenSealsPerItem(t *testing.T) {
 	}
 	if string(opened) != content {
 		t.Fatal("the sealed upload did not round-trip through the batch store key")
+	}
+}
+
+// TestSealedEnvelopeUploadEnforcesItsOwnFileCap pins the explicit 8 MiB file
+// cap on the sealed envelope path (maxSealedEnvelopeFileBytes). Without it, a
+// file that base64-inflates past what sealedTransport's fixed 16 MiB outer
+// cap can actually hold fails confusingly upstream instead of with a precise
+// 413 file_too_large from this handler.
+func TestSealedEnvelopeUploadEnforcesItsOwnFileCap(t *testing.T) {
+	env := newBatchEnv(t)
+	coordKey, err := e2e.DeriveCoordinatorKey(senderTestMnemonic)
+	if err != nil {
+		t.Fatalf("derive coordinator key: %v", err)
+	}
+	env.srv.SetCoordinatorKey(coordKey)
+
+	// Just over the sealed path's 8 MiB cap, but comfortably under the outer
+	// sealed request's 16 MiB cap even after both layers of base64 inflation —
+	// this exercises the explicit check here, not sealedTransport's own cap.
+	oversize := strings.Repeat("z", maxSealedEnvelopeFileBytes+10*1024)
+	envelope, err := json.Marshal(sealedFileEnvelope{
+		Purpose:       "batch",
+		Filename:      "big.jsonl",
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte(oversize)),
+	})
+	if err != nil {
+		t.Fatalf("encode envelope: %v", err)
+	}
+	sealed, _, ephemPriv := sealRequest(t, envelope, coordKey.PublicKey, coordKey.KID)
+
+	status, raw := env.request(http.MethodPost, "/v1/files", SealedContentType, bytes.NewReader(sealed), env.key)
+	if status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body %s", status, raw)
+	}
+	body := decodeObject(t, unsealResponse(t, raw, coordKey.PublicKey, ephemPriv))
+	if errorCode(t, body) != "file_too_large" {
+		t.Fatalf("error = %v, want file_too_large", body["error"])
+	}
+	if names := blobFiles(t, env.blobDir); len(names) != 0 {
+		t.Fatalf("a rejected sealed upload must store nothing, got %v", names)
 	}
 }
 

@@ -66,6 +66,27 @@ func TestParseBatchJSONLRewritesModelToBuildID(t *testing.T) {
 	}
 }
 
+// TestParseBatchJSONLPreservesLargeIntegersOnRewrite pins the fix for decoding
+// a batch line's body with json.Decoder.UseNumber(): rewriting "model" to the
+// resolved build id re-marshals the body, and without UseNumber the default
+// float64 decode of a large integer like "seed" loses precision above 2^53 and
+// silently mangles it on the way back out.
+func TestParseBatchJSONLPreservesLargeIntegersOnRewrite(t *testing.T) {
+	const bigSeed = "9007199254740993" // 2^53 + 1 — not exactly representable as float64
+	input := `{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"alias","seed":` + bigSeed + `,"messages":[]}}`
+	items, err := parseBatchJSONL(strings.NewReader(input), "/v1/chat/completions", maxFileLines,
+		func(string) (string, bool) { return "concrete-build", true })
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !strings.Contains(string(items[0].Raw), `"concrete-build"`) {
+		t.Fatalf("body was not rewritten to the build id: %s", items[0].Raw)
+	}
+	if !strings.Contains(string(items[0].Raw), `"seed":`+bigSeed) {
+		t.Fatalf("seed was not preserved byte-exact across the rewrite: %s", items[0].Raw)
+	}
+}
+
 func TestParseBatchJSONLRejectsDuplicateCustomID(t *testing.T) {
 	input := `{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"m"}}
 {"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"m"}}`
