@@ -13,6 +13,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,6 +79,20 @@ type inferencePrelude struct {
 	originalRawBody []byte
 	parsed          map[string]any
 	model           string
+	// lane is the service class the request routes on: registry.LaneOnline for
+	// ordinary traffic, registry.LaneBatch for a coordinator-stamped batch item
+	// (DispatchBatchItem). Resolved once here so both inference handlers stamp
+	// the same value onto every RequestTraits they build.
+	lane registry.Lane
+}
+
+// resolveRequestLane decides which lane a parsed inference request routes on.
+// A coordinator-stamped context lane (DispatchBatchItem) is authoritative.
+func resolveRequestLane(ctx context.Context, parsed map[string]any) registry.Lane {
+	if lane := laneFromContext(ctx); lane != registry.LaneOnline {
+		return lane
+	}
+	return registry.LaneOnline
 }
 
 // parseInferencePrelude runs the request prelude shared verbatim by
@@ -140,6 +155,7 @@ func (s *Server) parseInferencePrelude(w http.ResponseWriter, r *http.Request) (
 	return inferencePrelude{
 		rawBody: rawBody, originalRawBody: originalRawBody,
 		parsed: parsed, model: model,
+		lane: resolveRequestLane(r.Context(), parsed),
 	}, true
 }
 
