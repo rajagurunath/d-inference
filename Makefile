@@ -4,7 +4,7 @@
         prompt-sidecar-format prompt-sidecar-check prompt-sidecar-test prompt-sidecar-build prompt-sidecar \
         provider-build provider-test provider benchmark-gemma-contbatch benchmark-wrapper-test \
         ui-install ui-build ui-lint ui-test ui \
-        e2e-integration e2e-benchmark e2e \
+        e2e-integration e2e-benchmark e2e dev-stack \
         docs-check docs-stamp \
         test build all clean
 
@@ -108,6 +108,9 @@ e2e-benchmark: ## go test ./e2e/... -run TestBenchmark (load benchmarks)
 	go test ./e2e/... -run TestBenchmark -v
 
 e2e: e2e-integration ## Run the integration suite
+
+dev-stack: ## Coordinator + one provider on 127.0.0.1:18080 for manual testing (Ctrl-C stops)
+	cd e2e && GOTOOLCHAIN=auto go run ./cmd/devstack $(DEVSTACK_ARGS)
 
 # ---- Docs -------------------------------------------------------------------
 
