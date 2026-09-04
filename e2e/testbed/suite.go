@@ -18,10 +18,12 @@ import (
 	"time"
 
 	"github.com/eigeninference/d-inference/coordinator/api"
+	"github.com/eigeninference/d-inference/coordinator/batchlane"
 	"github.com/eigeninference/d-inference/coordinator/billing"
 	"github.com/eigeninference/d-inference/coordinator/payments"
 	"github.com/eigeninference/d-inference/coordinator/protocol"
 	"github.com/eigeninference/d-inference/coordinator/registry"
+	"github.com/eigeninference/d-inference/coordinator/saferun"
 	"github.com/eigeninference/d-inference/coordinator/store"
 	"github.com/eigeninference/d-inference/e2e/testbed/deps"
 )
@@ -302,8 +304,28 @@ func (s *Suite) startCoordinator() error {
 	srv.SetAllowDuplicateProviderSerialsForTesting(true)
 
 	ledger := payments.NewLedger(s.PgStore)
-	billingSvc := billing.NewService(s.PgStore, ledger, s.Logger, billing.Config{MockMode: true})
+	billingCfg := billing.Config{MockMode: true}
+	billingSvc := billing.NewService(s.PgStore, ledger, s.Logger, billingCfg)
 	srv.SetBilling(billingSvc)
+
+	// Batch lane (docs/design/tidal-batch-lane.md): wired the same way
+	// coordinator/cmd/coordinator/main.go wires the production coordinator,
+	// reading the same EIGENINFERENCE_BATCH_BLOB_DIR /
+	// EIGENINFERENCE_BATCH_DEV_INSECURE_KEY environment variables. The testbed
+	// builds api.NewServer directly rather than running the coordinator
+	// binary, so nothing wired this before: every batch route 503'd
+	// batch_unavailable under `make dev-stack` and in every existing e2e
+	// suite regardless of environment. Opt-in only — NewBatchBlobStore
+	// returns (nil, nil) unless a mnemonic or the dev-insecure-key escape
+	// hatch is configured, so a suite that never sets these env vars behaves
+	// exactly as before.
+	if blobs, err := api.NewBatchBlobStore(api.ReadBatchConfig(), billingCfg.EncryptionMnemonic, s.Logger); err != nil {
+		return fmt.Errorf("batch blob store: %w", err)
+	} else if blobs != nil {
+		srv.SetBatchBlobStore(blobs)
+		s.Logger.Info("batch lane enabled", "blob_dir", blobs.Dir())
+		startTestbedBatchDispatcher(s.Ctx, s.Logger, srv, reg, s.PgStore)
+	}
 
 	reg.SetQueue(registry.NewRequestQueue(s.Config.QueueCapacity, s.Config.QueueTimeout))
 
@@ -314,6 +336,54 @@ func (s *Suite) startCoordinator() error {
 	}
 
 	return s.Coordinator.Start(s.Ctx, s.Logger)
+}
+
+// startTestbedBatchDispatcher wires the Tidal batch dispatcher into the
+// testbed's in-process coordinator the same way
+// coordinator/cmd/coordinator/batch_lane.go wires it into the production
+// binary. It lives here (not in coordinator/cmd/coordinator) for the same
+// reason that file gives: batchlane must never import api (api imports
+// batchlane), so the api.BatchOutcome -> batchlane.Outcome adapter has to
+// live in a package that imports both — main for the real coordinator,
+// e2e/testbed for the dev stack and e2e suites.
+func startTestbedBatchDispatcher(
+	ctx context.Context,
+	logger *slog.Logger,
+	srv *api.Server,
+	reg *registry.Registry,
+	st store.Store,
+) {
+	blobs := srv.BatchBlobs()
+	if blobs == nil {
+		return
+	}
+	d := batchlane.New(
+		st,
+		blobs,
+		batchlane.NewRegistryView(reg),
+		func(ctx context.Context, accountID, apiKeyID, model string, body []byte) (batchlane.Outcome, error) {
+			out, err := srv.DispatchBatchItem(ctx, accountID, apiKeyID, model, body)
+			return batchlane.Outcome{
+				RequestID:        out.RequestID,
+				PromptTokens:     out.PromptTokens,
+				CompletionTokens: out.CompletionTokens,
+				ResponseBody:     out.ResponseBody,
+				ErrCode:          out.ErrCode,
+			}, err
+		},
+		func(batchID string, now time.Time) error {
+			_, err := srv.FinalizeBatchIfDone(batchID, now)
+			return err
+		},
+		batchlane.Config{
+			Tick:            batchlane.DefaultTick,
+			MaxAttempts:     batchlane.DefaultMaxAttempts,
+			OutputRetention: api.BatchOutputRetention,
+			Purge:           srv.PurgeExpiredBatchFiles,
+		},
+		logger,
+	)
+	saferun.Go(logger, "batch_dispatcher", func() { d.Run(ctx) })
 }
 
 func (s *Suite) startProviders() error {

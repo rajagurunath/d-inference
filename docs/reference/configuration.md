@@ -1,6 +1,6 @@
 # Configuration reference
 
-> Last updated: 2026-09-04 · commit `075d37a91`
+> Last updated: 2026-09-04 · commit `a0a03dca8`
 
 Every environment variable read by the coordinator, the provider CLI
 (`darkbloom`), console-ui and admin-ui: accepted values, the compiled default,
@@ -49,6 +49,16 @@ read once at process start and a restart applies a change.
 | `EIGENINFERENCE_STATE_EXPORT_ALLOW_PLAINTEXT` | `true` | `false` | `coordinator/api/admin_state_export.go` (`handleAdminStateExport`) | Allows an unencrypted zip when no recipient is configured. |
 | `EIGENINFERENCE_STATE_EXPORT_ROOT` | directory | `USER_PERSISTENT_DATA_PATH`, else `/mnt/disks/userdata` | `coordinator/api/admin_state_export.go` (`resolveStateExportRoot`) | Overrides the directory that is archived (tests). |
 
+### Batch lane
+
+The 24-hour batch lane ([`../architecture/batch-lane.md`](../architecture/batch-lane.md)). It is the one place prompt bytes sit on coordinator disk, so it does not start without a key to seal them with: `NewBatchBlobStore` returns nil when there is neither a mnemonic nor the dev escape hatch, every `/v1/files` and `/v1/batches` route then answers 503 `batch_unavailable`, and `startBatchDispatcher` does not start. The sealing key is derived from the same `MNEMONIC` as the sender-encryption key, under its own HKDF domain `eigeninference-coordinator-batchstore-v1` (`coordinator/store/sealedblob/blob.go`, `DeriveKey`).
+
+| Variable | Values / type | Default | Read in | Effect |
+|---|---|---|---|---|
+| `EIGENINFERENCE_BATCH_BLOB_DIR` | directory | `/mnt/disks/userdata/batch` (`DefaultBatchBlobDir`) | `coordinator/api/batch_config.go` (`ReadBatchConfig`, `NewBatchBlobStore`) | Where sealed batch inputs, results and assembled output files are written (directory 0700, files 0600). Startup fails when a key exists but the directory cannot be prepared. Keep it on the persistent disk: a redeploy that loses it orphans every in-flight batch. |
+| `EIGENINFERENCE_BATCH_DEV_INSECURE_KEY` | `true` | `false` | `coordinator/api/batch_config.go` (`ReadBatchConfig`, `NewBatchBlobStore`) | **Local development only.** Runs the lane on a process-local random key when no mnemonic is set, logged as a WARN. Every blob written under it is unreadable after the process exits. |
+| `EIGENINFERENCE_BATCH_LANE_ENABLED` | `true`, `false` | `true` | `coordinator/cmd/coordinator/batch_lane.go` (`startBatchDispatcher`) | Operator kill switch for the batch **dispatcher**. `false` leaves the API routes serving — batches can still be created and cancelled — but nothing claims or dispatches items, so they sit at `in_progress` until they expire. |
+
 ### Auth: admin key, Privy, release key, sender encryption
 
 | Variable | Values / type | Default | Read in | Effect |
@@ -60,7 +70,7 @@ read once at process start and a restart applies a change.
 | `EIGENINFERENCE_PRIVY_APP_SECRET` | secret | unset | `coordinator/auth/config.go` (`ReadConfig`) | Basic-auth credential for Privy REST calls. |
 | `EIGENINFERENCE_PRIVY_VERIFICATION_KEY` | PEM ES256 public key | unset; required when the app id is set (`Check`) | `coordinator/auth/config.go` (`ReadConfig`) | Key that Privy access tokens are verified against. |
 | `EIGENINFERENCE_PRIVY_VERIFICATION_KEY_FILE` | file path | unset | `coordinator/auth/config.go` (`ReadConfig`) | Reads the PEM from a file, overriding the inline value. |
-| `MNEMONIC`, `EIGENINFERENCE_MNEMONIC` | BIP39 phrase (secret) | unset (sender→coordinator encryption disabled) | `coordinator/billing/config.go` (`ReadConfig`); `coordinator/cmd/coordinator/main.go` (`e2e.DeriveCoordinatorKey`) | Derives the X25519 key served at `GET /v1/encryption-key`; `MNEMONIC` wins when both are set. See [`../architecture/security/encryption.md`](../architecture/security/encryption.md). |
+| `MNEMONIC`, `EIGENINFERENCE_MNEMONIC` | BIP39 phrase (secret) | unset (sender→coordinator encryption disabled) | `coordinator/billing/config.go` (`ReadConfig`); `coordinator/cmd/coordinator/main.go` (`e2e.DeriveCoordinatorKey`) | Derives the X25519 key served at `GET /v1/encryption-key`; `MNEMONIC` wins when both are set. Also the root of the batch-store sealing key, under a separate HKDF domain — without it the [batch lane](#batch-lane) is off. See [`../architecture/security/encryption.md`](../architecture/security/encryption.md). |
 
 ### MDM, attestation and APNs
 

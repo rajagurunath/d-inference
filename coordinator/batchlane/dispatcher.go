@@ -540,7 +540,9 @@ func (d *Dispatcher) start(ctx context.Context, b *store.Batch, it *store.BatchI
 	d.mu.Unlock()
 
 	itemID, blobRef := it.ID, it.BlobRef
-	accountID, batchModel := b.AccountID, b.Model
+	// The key id travels on the batch row (PR3c), so batch work is attributed to
+	// the key that submitted it and its AllowedModels and spend cap apply.
+	accountID, apiKeyID, batchModel := b.AccountID, b.APIKeyID, b.Model
 
 	// res is primed with the permanent failure a panicking dispatch would leave
 	// behind, so a recovered goroutine still settles its claim. The batch row is
@@ -570,14 +572,14 @@ func (d *Dispatcher) start(ctx context.Context, b *store.Batch, it *store.BatchI
 		}()
 		defer saferun.Recover(d.logger, "batch_dispatch_item")
 
-		res.outcome, res.err = d.runItem(itemCtx, accountID, batchModel, blobRef)
+		res.outcome, res.err = d.runItem(itemCtx, accountID, apiKeyID, batchModel, blobRef)
 	}()
 }
 
 // runItem opens the sealed request body and runs it through the funnel. The
 // plaintext lives only for the duration of this call: it is never stored on the
 // Dispatcher, never logged, and never copied into an outcome.
-func (d *Dispatcher) runItem(ctx context.Context, accountID, batchModel, blobRef string) (Outcome, error) {
+func (d *Dispatcher) runItem(ctx context.Context, accountID, apiKeyID, batchModel, blobRef string) (Outcome, error) {
 	// A body that cannot be opened or parsed is a permanent failure for the
 	// item: the pairing of a non-nil error with ErrCodeRequestFailed is what
 	// tells settle not to spend the retry budget on it.
@@ -592,7 +594,11 @@ func (d *Dispatcher) runItem(ctx context.Context, accountID, batchModel, blobRef
 			return Outcome{ErrCode: ErrCodeRequestFailed}, err
 		}
 	}
-	return d.dispatch(ctx, accountID, "", model, body)
+	// The batch's submitting API key rides with every one of its items, so the
+	// key's AllowedModels and spend cap are enforced on batch work. "" means the
+	// batch was created without one (Privy JWT, admin key) and runs under
+	// account-level limits only.
+	return d.dispatch(ctx, accountID, apiKeyID, model, body)
 }
 
 // modelOf reads the model field out of an item's request body. The inline batch

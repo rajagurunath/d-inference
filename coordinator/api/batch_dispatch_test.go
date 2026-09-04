@@ -343,3 +343,95 @@ func TestDispatchBatchItemReportsCallerCancellation(t *testing.T) {
 		t.Fatalf("err=%v, want a wrapped context.Canceled", err)
 	}
 }
+
+// TestBatchWithARestrictedKeyFailsItsItems closes the loop PR3c opened: a batch
+// row stamped with a key whose AllowedModels excludes the batch's model has its
+// items settled as request_failed rather than served. Before the key id was
+// carried on the batch, the dispatcher passed "" and the same batch would have
+// run to completion with the key's allow-list ignored.
+func TestBatchWithARestrictedKeyFailsItsItems(t *testing.T) {
+	const model = "test-model"
+	srv, _, st, ctx, _ := batchFakeProviderWithStore(t, model,
+		protocol.UsageInfo{PromptTokens: 1, CompletionTokens: 1}, "unused")
+
+	_, key, err := st.CreateAPIKey("admin", store.APIKeyCreate{
+		Name:          "batch-restricted",
+		AllowedModels: []string{"some-other-model"},
+	})
+	if err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+
+	// The batch row as handleBatchCreate now writes it: stamped with the key
+	// that submitted it.
+	now := time.Now().UTC()
+	batch := &store.Batch{
+		ID:               "batch_restricted",
+		AccountID:        "admin",
+		APIKeyID:         key.ID,
+		Endpoint:         "/v1/chat/completions",
+		CompletionWindow: "24h",
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(24 * time.Hour),
+		CountsTotal:      1,
+		SealedTo:         "coordinator",
+		Source:           "inline",
+		Model:            model,
+	}
+	items := []*store.BatchItem{{
+		ID: "bitem_restricted", BatchID: batch.ID, CustomID: "a",
+		LineNo: 1, State: store.ItemPending, BlobRef: "bitem_restricted-in",
+	}}
+	if err := st.CreateBatch(batch, items); err != nil {
+		t.Fatalf("CreateBatch: %v", err)
+	}
+	if ok, err := st.SetBatchStatus(batch.ID, store.BatchValidating, store.BatchInProgress, now); err != nil || !ok {
+		t.Fatalf("SetBatchStatus: ok=%v err=%v", ok, err)
+	}
+
+	// What the dispatcher does each tick: read the batch back, claim an item,
+	// run it through the funnel with the batch's key, settle the outcome.
+	open, ok := st.GetBatch("admin", batch.ID)
+	if !ok {
+		t.Fatal("GetBatch: batch not found")
+	}
+	if open.APIKeyID != key.ID {
+		t.Fatalf("batch APIKeyID = %q, want %q", open.APIKeyID, key.ID)
+	}
+	claimed, err := st.ClaimPendingItems(open.ID, 8, now)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimPendingItems: %d items, err=%v", len(claimed), err)
+	}
+
+	body := []byte(`{"model":"ignored","messages":[{"role":"user","content":"hi"}]}`)
+	outcome, err := srv.DispatchBatchItem(ctx, open.AccountID, open.APIKeyID, model, body)
+	if err != nil {
+		t.Fatalf("DispatchBatchItem: %v", err)
+	}
+	if outcome.ErrCode != batchRequestFailedCode {
+		t.Fatalf("ErrCode=%q body=%s, want %q — the key's allow-list was bypassed",
+			outcome.ErrCode, outcome.ResponseBody, batchRequestFailedCode)
+	}
+	if code := responseErrorCode(outcome.ResponseBody); code != "model_not_allowed" {
+		t.Fatalf("error.code=%q body=%s, want model_not_allowed", code, outcome.ResponseBody)
+	}
+
+	settled, err := st.FinishItem(store.ItemResult{
+		ItemID: claimed[0].ID, Succeeded: false, ErrorCode: outcome.ErrCode,
+	}, now)
+	if err != nil || !settled {
+		t.Fatalf("FinishItem: ok=%v err=%v", settled, err)
+	}
+	listed, err := st.ListItems(open.ID)
+	if err != nil {
+		t.Fatalf("ListItems: %v", err)
+	}
+	if listed[0].State != store.ItemFailed || listed[0].LastErrorCode != batchRequestFailedCode {
+		t.Fatalf("item settled as state=%s code=%q, want failed/%s",
+			listed[0].State, listed[0].LastErrorCode, batchRequestFailedCode)
+	}
+	final, _ := st.GetBatch("admin", open.ID)
+	if final.CountsFailed != 1 || final.CountsCompleted != 0 {
+		t.Fatalf("counts completed=%d failed=%d, want 0/1", final.CountsCompleted, final.CountsFailed)
+	}
+}

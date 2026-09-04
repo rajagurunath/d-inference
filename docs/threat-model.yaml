@@ -19,6 +19,7 @@ scope:
   in_scope:
     - Consumer → Coordinator API (HTTPS / OpenAI-compatible)
     - Coordinator → Provider WebSocket
+    - Coordinator local disk (batch inputs and outputs at rest)
     - Provider process vs provider operator (local Mac access)
     - Console UI browser surface
     - Coordinator → Apple MDM / MDA trust services
@@ -182,6 +183,27 @@ assets:
     notes: >
       Dormant unless the operator explicitly runs sudo darkbloom fan enable.
       Misuse can reduce cooling or interfere with macOS thermal management.
+
+  - id: A-015
+    name: batch_inputs_outputs_at_rest
+    description: >
+      Consumer prompt bodies and generated responses belonging to a 24-hour batch,
+      waiting on coordinator local disk between submission and download: uploaded
+      JSONL input files, per-item request bodies, per-item results, and the
+      assembled output/error files.
+    sensitivity: critical
+    notes: >
+      The same content class as A-001, but with a lifetime measured in hours or
+      days rather than the milliseconds of a synchronous request — the batch lane
+      is the only place consumer prompt content is stored at all. Every object is
+      NaCl-Box ciphertext under an X25519 key derived from the coordinator
+      mnemonic with HKDF info eigeninference-coordinator-batchstore-v1
+      (coordinator/store/sealedblob/blob.go); files 0600, directory 0700, written
+      temp-file + fsync + rename. Postgres holds metadata only: the three batch
+      tables carry no body, hash or prefix column. A consumer may supply
+      result_public_key, after which results are sealed to that key and the
+      coordinator cannot read them back. Canonical description:
+      docs/architecture/batch-lane.md.
 
 # ─────────────────────────────────────────────────────────────
 # TRUST BOUNDARIES
@@ -808,6 +830,75 @@ trust_boundaries:
       - "The root-installed helper is not replaced by the unprivileged self-updater.
         Protocol mismatch intentionally leaves it dormant until the operator reruns
         sudo darkbloom fan enable."
+
+  - id: TB-011
+    name: coordinator_local_disk
+    description: >
+      The batch lane stores consumer prompt bodies and generated responses on the
+      coordinator's own filesystem for the life of a batch, and its output files
+      for seven days after that. Every other coordinator surface holds prompt
+      content only in memory for the duration of one request. The boundary is
+      between the coordinator process (trusted) and anything that can read that
+      filesystem without going through the process: a disk image, a snapshot, a
+      backup, a misconfigured volume mount, or root on the CVM host.
+    how_it_works: >
+      Blob store: coordinator/store/sealedblob/blob.go. Every object is sealed
+      with NaCl Box to a long-lived X25519 key using a fresh ephemeral key pair,
+      and stored as the JSON encoding of e2e.EncryptedPayload
+      (ephemeral_public_key, ciphertext). Files are written 0600 into a 0700
+      directory (EIGENINFERENCE_BATCH_BLOB_DIR, default
+      /mnt/disks/userdata/batch) via temp file + fsync + rename, so a crash
+      mid-write leaves no truncated blob. Blob refs are validated against
+      [A-Za-z0-9_-]{1,128} and are always coordinator-minted row ids, never a
+      consumer custom_id or filename, so consumer text can never become a path.
+
+      Key: sealedblob.DeriveKey(mnemonic) with HKDF info
+      eigeninference-coordinator-batchstore-v1 — the same construction and the
+      same root secret as internal/e2e's sender-encryption key, under a separate
+      domain, so the two keys are distinct and neither opens the other's
+      ciphertext. With no mnemonic the lane refuses to start
+      (api.NewBatchBlobStore returns nil, every /v1/files and /v1/batches route
+      answers 503 batch_unavailable, and cmd/coordinator's startBatchDispatcher
+      does not run), unless EIGENINFERENCE_BATCH_DEV_INSECURE_KEY=true selects a
+      process-local random key for local development, logged as a WARN.
+
+      Database: the three batch tables (batch_files, batches, batch_items) are
+      metadata only — ids, states, counts, token counts, timestamps, blob refs.
+      No column carries a body, a hash of one, or a prefix of one;
+      TestNoContentColumnsInBatchTables pins that against
+      information_schema.columns. Duplicate custom_ids are rejected in Go before
+      any insert so a unique-index violation cannot print one into the Postgres
+      server log.
+
+      Plaintext lifetime: an uploaded file's blob is deleted the moment
+      POST /v1/batches has fanned it out into per-item blobs; item input blobs
+      are deleted when the batch finalizes; item results and the assembled
+      output/error files are deleted seven days later (api.BatchOutputRetention,
+      swept by coordinator/batchlane's retention pass and
+      api.PurgeExpiredBatchFiles). An hourly orphan pass deletes item blobs no
+      row references. Plaintext exists only inside batchlane's runItem, for the
+      duration of one dispatch.
+
+      Consumer-held key: a create carrying result_public_key (base64, exactly 32
+      bytes, strictly validated) makes every result blob a PutTo seal to that
+      key. The coordinator can then only Raw the blob for download, never Open
+      it, and the output file's response.body is an e2e.EncryptedPayload object.
+    current_limitations:
+      - "The batch-store key is derived from the same mnemonic as the
+        sender-encryption key. One root secret compromises both."
+      - "The key is in coordinator process memory and the blobs are on the
+        coordinator's own disk, so root on the CVM host can read both. The seal
+        defends against disk images, snapshots and backups, not against the host."
+      - "There is no key rotation mechanism. Rotating means redeploying with a new
+        mnemonic, after which every existing blob is unreadable and every open
+        batch is lost."
+      - "EIGENINFERENCE_BATCH_DEV_INSECURE_KEY=true runs the lane on a
+        process-local random key. It is logged loudly and is for local
+        development only; set in production it would leave every batch
+        unreadable after a restart while still accepting uploads."
+      - "Batch metadata (Batch.Metadata), the uploaded filename and custom_id are
+        consumer strings stored in Postgres by design. They are excluded from
+        every log line and error message, but they are not sealed."
 
 # ─────────────────────────────────────────────────────────────
 # THREATS
@@ -2837,3 +2928,69 @@ threats:
       Any new column on request_profiles/fleet_snapshots, any new field on the
       provider profile wire object, or any new admin export must be reviewed
       against the closed-enum / no-identity rules in docs/architecture/system-profiler.md.
+
+  # ── TB-011: Coordinator local disk ──────────────────────────
+
+  - id: T-052
+    trust_boundary: TB-011
+    stride: Information_Disclosure
+    title: Batch prompts and results sitting on coordinator disk are read outside the process
+    description: >
+      The batch lane is the only surface that stores consumer prompt content at
+      all. An uploaded JSONL file, one sealed body per item, one sealed result per
+      item, and the assembled output/error files sit on the coordinator's own
+      filesystem for the life of a 24-hour batch and for seven days after it
+      completes. Anything that can read that filesystem without going through the
+      coordinator process — a disk image, a VM snapshot, a backup, a stray volume
+      mount, an operator with root on the CVM host, or a Postgres dump if content
+      ever leaked into a column — would obtain plaintext prompts and completions
+      in bulk rather than one request at a time.
+    adversaries: [ADV-002, ADV-003]
+    affected_assets: [A-015, A-001]
+    affected_files:
+      - coordinator/store/sealedblob/blob.go
+      - coordinator/api/batch_files.go
+      - coordinator/api/batch_handlers.go
+      - coordinator/api/batch_assembler.go
+      - coordinator/api/batch_config.go
+      - coordinator/batchlane/dispatcher.go
+      - coordinator/store/batch_types.go
+      - coordinator/store/postgres_batch.go
+    mitigations:
+      - description: Every stored object is NaCl-Box ciphertext under an X25519 key derived from the coordinator mnemonic with its own HKDF domain (eigeninference-coordinator-batchstore-v1), sealed with a fresh ephemeral key pair per write. A disk image alone yields no plaintext.
+        status: implemented
+      - description: Files are 0600 inside a 0700 directory and written temp-file + fsync + rename, so no truncated or world-readable blob is ever observable.
+        status: implemented
+      - description: Postgres is metadata only. batch_files, batches and batch_items carry no body, hash or prefix column; TestNoContentColumnsInBatchTables asserts that against information_schema.columns, and duplicate custom_ids are rejected in Go so a unique-index violation cannot print one into the server log.
+        status: implemented
+      - description: No log line, error string, metric or blob name carries a prompt, a result, a custom_id, a filename or a metadata value. Validation errors name a line number and a field; the offending value, the requested model, the endpoint and the content-part type are all withheld. Blob refs are coordinator-minted ids validated against [A-Za-z0-9_-]{1,128}, so consumer text can never become a path.
+        status: implemented
+      - description: Multipart uploads are streamed through mime/multipart's low-level Reader rather than ParseMultipartForm, which would spill an oversized part to a plaintext os.CreateTemp file before the handler could seal it.
+        status: implemented
+      - description: Plaintext exists only inside batchlane's runItem for the duration of one dispatch. It is never stored on the Dispatcher, never copied into an Outcome, and TestPlaintextIsNotRetained pins that the only on-disk copies are the two sealed blobs.
+        status: implemented
+      - description: Purge is bounded and layered. The uploaded file's blob is deleted as soon as POST /v1/batches has fanned it out; item input blobs are deleted at finalize; item results and assembled files are deleted at BatchOutputRetention (7 days) by the dispatcher's retention pass and PurgeExpiredBatchFiles; an hourly orphan pass removes item blobs no row references.
+        status: implemented
+      - description: A consumer may supply result_public_key (base64, exactly 32 bytes, strictly validated — a malformed key is a 400, never a silent fallback), after which results are sealed to that key and the coordinator can Raw but not Open them.
+        status: implemented
+      - description: The lane fails closed. Without a mnemonic, NewBatchBlobStore returns nil, every /v1/files and /v1/batches route answers 503 batch_unavailable, and startBatchDispatcher does not run, so prompts are never written unsealed.
+        status: implemented
+      - description: "Residual: the batch-store key is derived from the same mnemonic as the sender-encryption key, so one root secret compromises both."
+        status: accepted
+      - description: "Residual: the key is in coordinator memory and the blobs are on the coordinator's own disk, so root on the CVM host reads both. The seal defends against images, snapshots and backups, not against the host."
+        status: accepted
+      - description: "Residual: there is no key rotation. Rotating means redeploying with a new mnemonic, after which existing blobs are unreadable and open batches are lost."
+        status: accepted
+      - description: "Residual: EIGENINFERENCE_BATCH_DEV_INSECURE_KEY=true substitutes a process-local random key. It is logged as a WARN and is local-development only; set in production it would accept uploads that become unreadable at the next restart."
+        status: accepted
+      - description: "Residual: batch metadata, the uploaded filename and custom_id are consumer strings stored in Postgres by design. They are kept out of every log line and error message, but they are not sealed."
+        status: accepted
+    open_findings: []
+    severity: high
+    detection_hint: >
+      Any new column on batch_files/batches/batch_items, any new log or error
+      string in coordinator/api/batch_*.go or coordinator/batchlane/, any change
+      to sealedblob's key derivation, file modes or ref validation, any change to
+      the purge schedule or BatchOutputRetention, and any new consumer surface
+      that reads a blob must be reviewed against this threat and against
+      docs/architecture/batch-lane.md.

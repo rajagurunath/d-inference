@@ -1,8 +1,8 @@
 # HTTP API contracts
 
-> Last updated: 2026-09-04 · commit `1fd7457ab`
+> Last updated: 2026-09-04 · commit `a0a03dca8`
 
-The complete public HTTP surface of the coordinator, derived from the 105 `HandleFunc` registrations in `routes()` (`coordinator/api/server.go`), including the `/v1/` catch-all. Every route is listed once below with its handler symbol, authentication requirement, and rate-limit bucket; the second half of the page gives the wire shapes, headers, error table, SSE framing, limits, timeouts, and version-gate semantics that those routes share. For *why* the pipeline is built this way see [`../architecture/components/consumer.md`](../architecture/components/consumer.md); for the crypto model behind sealed transport see [`../architecture/security/encryption.md`](../architecture/security/encryption.md).
+The complete public HTTP surface of the coordinator, derived from the 112 `HandleFunc` registrations in `routes()` (`coordinator/api/server.go`), including the `/v1/` catch-all. Every route is listed once below with its handler symbol, authentication requirement, and rate-limit bucket; the second half of the page gives the wire shapes, headers, error table, SSE framing, limits, timeouts, and version-gate semantics that those routes share. For *why* the pipeline is built this way see [`../architecture/components/consumer.md`](../architecture/components/consumer.md); for the crypto model behind sealed transport see [`../architecture/security/encryption.md`](../architecture/security/encryption.md).
 
 Production base URL: `https://api.darkbloom.dev`. Unless a file is named, handler symbols below live in `coordinator/api/server.go`.
 
@@ -45,6 +45,20 @@ All four share the chain `drainGate → requireAuth → rateLimitConsumer → se
 | POST | `/v1/responses` | `handleChatCompletions` — the same handler; it detects `input` (Responses) versus `messages` (Chat) | `key` | same | OpenAI Responses; lowered by `coordinator/promptcontract/endpoint_lower_responses.go`, streamed by `newResponsesStreamEmitter` (`coordinator/api/responses_stream.go`) |
 | POST | `/v1/completions` | `handleCompletions` (`coordinator/api/consumer.go`) | `key` | same | Legacy text completions; response built by `coordinator/api/generic_endpoint_response.go`, streamed by `newGenericEndpointStreamEmitter` (`coordinator/api/generic_endpoint_stream.go`) |
 | POST | `/v1/messages` | `handleAnthropicMessages` (`coordinator/api/consumer.go`) | `key` | same | Anthropic Messages; lowered by `coordinator/promptcontract/endpoint_lower_messages.go`, streamed by `newMessagesStreamEmitter` |
+
+### Batch and files (7)
+
+The 24-hour batch lane (`coordinator/api/batch_files.go`, `batch_handlers.go`). Every handler resolves the account from the auth context and 404s before it touches an unscoped mutator, so an id belonging to another account is indistinguishable from one that does not exist. All seven answer **503** `batch_unavailable` when the coordinator has no key to seal batch inputs with ([`configuration.md`](configuration.md#batch-lane)). Shapes: [Batch shapes](#batch-shapes). How-to: [`../consumer/batch-api.md`](../consumer/batch-api.md); mechanism: [`../architecture/batch-lane.md`](../architecture/batch-lane.md).
+
+| Method | Path | Handler | Auth | Limiter | Notes |
+|---|---|---|---|---|---|
+| POST | `/v1/files` | `handleBatchFileUpload` | `key` | `drain`, `rpm`, `sealedTransport` | `multipart/form-data` with `purpose=batch` and a file part named `file`, **or** a JSON/sealed envelope `{purpose, filename, content_base64}`. Every line is validated before anything is stored; the accepted file becomes one sealed blob. 16 MiB multipart, 8 MiB through the sealed envelope → 413 `file_too_large`. Multipart parts are streamed by hand, never through `ParseMultipartForm`, so a prompt never spills to a plaintext temp file |
+| GET | `/v1/files/{id}` | `handleBatchFileGet` | `key` | — | The file object. Answers after the content is purged; `bytes` and `filename` remain |
+| GET | `/v1/files/{id}/content` | `handleBatchFileContent` | `key` | — | `Content-Type: application/jsonl`, the plaintext bytes over TLS. 404 `file_content_purged` once the blob is gone |
+| POST | `/v1/batches` | `handleBatchCreate` | `key` | `drain`, `rpm`, `sealedTransport` | File form (`input_file_id`) → **200**; inline form (`model` + `requests[]`) → **202**. Exactly one of the two |
+| GET | `/v1/batches` | `handleBatchList` | `key` | — | `{object:"list", data:[…], has_more, first_id, last_id}`, newest first. `?limit=` defaults to 20, caps at 100; `?after=` is an account-scoped cursor |
+| GET | `/v1/batches/{id}` | `handleBatchGet` | `key` | — | The batch object; an inline batch in any terminal state also carries `results[]` |
+| POST | `/v1/batches/{id}/cancel` | `handleBatchCancel` | `key` | `drain`, `rpm` | `validating`/`in_progress` → `cancelling` and every open item cancelled; idempotent on `cancelling`/`cancelled`; 409 `batch_not_cancellable` on any other status |
 
 ### Models and catalog (9)
 
@@ -334,7 +348,7 @@ Retry-After: 5
 
 Retry after the advertised interval; the slot reopens as soon as online traffic drains. Everything else about the request and response is identical to an online call.
 
-Pricing: batch traffic is metered at the batch rate — see the design record [`../design/tidal-batch-lane.md`](../design/tidal-batch-lane.md).
+Pricing: see [`../consumer/batch-api.md#pricing`](../consumer/batch-api.md#pricing). The asynchronous Batch API is at [Batch and files](#batch-and-files-7); the lane's mechanism is [`../architecture/batch-lane.md`](../architecture/batch-lane.md).
 
 ### Chat Completions response (`ChatCompletionResponse`, `coordinator/api/types/types.go`)
 
@@ -384,6 +398,117 @@ Bodies are lowered into the chat pipeline (`coordinator/promptcontract/endpoint_
 
 `/v1/completions` and `/v1/messages` are lowered to the chat contract (`coordinator/promptcontract/endpoint_lower.go`, `coordinator/promptcontract/endpoint_lower_messages.go`); responses are re-shaped by `coordinator/api/generic_endpoint_response.go` and streams by `coordinator/api/generic_endpoint_stream.go`, which terminates with `data: [DONE]`.
 
+## Batch shapes
+
+Routes: [Batch and files](#batch-and-files-7). Ids are a prefix plus 24 hex characters (`newBatchID`, `coordinator/api/batch_files.go`): `file-…`, `batch_…`, `bitem_…`.
+
+### File object
+
+Built by `batchFileObject` (`coordinator/api/batch_files.go`).
+
+```json
+{"object":"file","id":"file-…","purpose":"batch","filename":"requests.jsonl","bytes":412,"created_at":1757000000,"status":"processed"}
+```
+
+`purpose` is `batch` on upload; `batch_output` and `batch_error` are minted by the assembler and cannot be uploaded. `status` is always the literal `"processed"`.
+
+### Create request
+
+Decoded into `createBatchRequest` (`coordinator/api/batch_handlers.go`).
+
+| Field | Type | Handling |
+|---|---|---|
+| `input_file_id` | string | OpenAI form. Exactly one of this and `requests` |
+| `requests` | `[{custom_id, body}]` | OpenRouter inline form; ≤ 10 000 (`maxInlineRequests`) |
+| `model` | string | Inline form only; required there. A body's own `model` wins for that item |
+| `endpoint` | string | `/v1/chat/completions` or `/v1/completions`; empty defaults to `/v1/chat/completions` |
+| `completion_window` | string | Must be `"24h"` (`batchCompletionWindow`); empty defaults to it |
+| `metadata` | `{string: string}` | ≤ 16 keys, key ≤ 64 chars, value ≤ 512 chars (`validateBatchMetadata`) |
+| `result_public_key` | string | base64 of exactly 32 bytes (X25519). Anything else → 400, never a silent fallback |
+
+Input-file lines are `{custom_id, method, url, body}` (`batchLine`, `coordinator/api/batch_jsonl.go`): `method` must be `POST` or absent, `url` must equal the batch `endpoint`, `custom_id` must match `^[A-Za-z0-9_-]{1,64}$` and be unique in the batch, and `body` must have `stream` absent or false, `n` absent or 1, text-only content parts, and a `model` that resolves through the alias table and is in the catalog. `model` is rewritten to the concrete build id before the item is stored, so an alias that moves later does not change what runs.
+
+### Batch object
+
+Rendered by `batchObject` (`coordinator/api/batch_handlers.go`).
+
+```json
+{
+  "object": "batch",
+  "id": "batch_…",
+  "endpoint": "/v1/chat/completions",
+  "input_file_id": "file-…",
+  "completion_window": "24h",
+  "status": "in_progress",
+  "created_at": 1757000000,
+  "expires_at": 1757086400,
+  "in_progress_at": 1757000001,
+  "completed_at": null,
+  "cancelled_at": null,
+  "request_counts": {"total": 2, "completed": 0, "failed": 0},
+  "output_file_id": null,
+  "error_file_id": null,
+  "metadata": {"job": "nightly"},
+  "source": "file",
+  "sealed_to": "coordinator"
+}
+```
+
+| Field | Values | Notes |
+|---|---|---|
+| `status` | `validating`, `in_progress`, `completed`, `failed`, `expired`, `cancelling`, `cancelled` | `validating` is only ever seen on the create response; the admission to `in_progress` happens in the same handler |
+| `request_counts` | `{total, completed, failed}` | Expired and cancelled items move neither counter, so `completed + failed ≤ total` |
+| `source` | `file`, `inline` | Darkbloom field; which create form was used |
+| `sealed_to` | `coordinator`, `consumer` | Darkbloom field; `consumer` when `result_public_key` was supplied |
+| `model` | string | Present only when `source` is `inline` |
+| `results` | `[{id, custom_id, response, error}]` | Present only when `source` is `inline` **and** the batch is terminal (`batchIsTerminal`) |
+| `in_progress_at`, `completed_at`, `cancelled_at` | unix seconds or `null` | |
+
+### Output and error file lines
+
+Assembled by `assembleBatchFiles` (`coordinator/api/batch_assembler.go`).
+
+One JSON object per line, succeeded items in `line_no` order in the output file, failed and expired items in the error file. Either file is absent (`null` on the batch) when it would be empty. Cancelled items appear in neither.
+
+```json
+{"id":"bitem_…","custom_id":"a1","response":{"status_code":200,"request_id":"…","body":{ … }},"error":null}
+{"id":"bitem_…","custom_id":"a2","response":null,"error":{"code":"request_failed","message":"The request could not be completed by any provider."}}
+```
+
+`response.body` is the plain OpenAI response JSON when `sealed_to` is `coordinator`, and an `{"ephemeral_public_key":…,"ciphertext":…}` object sealed to the consumer's key when it is `consumer`. The item error `message` is a fixed string per `code` and never carries provider text:
+
+| `code` | `message` |
+|---|---|
+| `request_failed` | The request could not be completed by any provider. |
+| `batch_expired` | The batch expired before this request was processed. |
+| `batch_cancelled` | The batch was cancelled before this request was processed. |
+
+### Batch error codes
+
+All use the standard [error envelope](#error-envelope-and-status-codes); `param` names the offending field and the offending **value** is never echoed back.
+
+| Status | `code` | Cause |
+|---|---|---|
+| 400 | `invalid_request` | Both or neither of `input_file_id`/`requests`; unreadable body; unusable input file |
+| 400 | `invalid_line` | A line failed structural validation (method, url, body, `stream`, `n`); the message names the line number |
+| 400 | `invalid_endpoint` | `endpoint` or a line's `url` is not a batch endpoint |
+| 400 | `invalid_completion_window` | Not `"24h"` |
+| 400 | `invalid_custom_id` | Missing, or not `^[A-Za-z0-9_-]{1,64}$` |
+| 400 | `duplicate_custom_id` | Reused within one batch (parser, with `store.ErrDuplicateCustomID` as the backstop) |
+| 400 | `invalid_metadata` | Over the key count, key length or value length limit |
+| 400 | `invalid_result_public_key` | Not base64 of exactly 32 bytes |
+| 400 | `invalid_purpose` | `purpose` is not `batch` |
+| 400 | `model_not_found` | Unknown model, or not in the routable catalog |
+| 400 | `unsupported_content` | A non-text content part (image, audio, video, file) |
+| 400 | `batch_too_large` | Over 50 000 file lines or 10 000 inline requests |
+| 400 | `empty_input` | No requests at all |
+| 400 | `batch_infeasible` | `items / CompletionRate(1h)` exceeds `24h × 0.8` (`checkBatchFeasible`). An unknown rate admits |
+| 404 | `not_found` | No such batch or file **for this account** |
+| 404 | `file_content_purged` | The blob is gone; only metadata remains |
+| 409 | `batch_not_cancellable` | The batch is already terminal |
+| 413 | `file_too_large` | Over `maxFileBytes` (16 MiB), or over `maxSealedEnvelopeFileBytes` (8 MiB) on the sealed-envelope path, where `param` is `content_base64` |
+| 503 | `batch_unavailable` | The coordinator has no batch-store key |
+
 ## SSE framing
 
 Built by `handleStreamingResponseWithFirstChunk` (`coordinator/api/consumer.go`), `coordinator/api/sse_response.go`, and `coordinator/api/chat_metadata_stream.go`; ordering guarantees come from the dispatch state machine in `coordinator/api/dispatch.go`.
@@ -403,6 +528,8 @@ Built by `handleStreamingResponseWithFirstChunk` (`coordinator/api/consumer.go`)
 |---|---|---|
 | Global request body | 64 MiB ceiling on every request (`maxRequestBodyBytes`, `bodyLimitMiddleware`) | `coordinator/api/server.go` |
 | Inference body | 16 MiB (`maxInferenceBodyBytes`) → 413 `invalid_request_error`; sealed bodies are read with the same cap (400 `invalid_request_error` when exceeded) | `parseInferencePrelude` (`coordinator/api/inference_preprocess.go`), `sealedTransport` (`coordinator/api/sender_encryption.go`) |
+| Batch input file | 16 MiB (`maxFileBytes`), or 8 MiB (`maxSealedEnvelopeFileBytes`) through the sealed envelope → 413 `file_too_large`; 50 000 lines (`maxFileLines`) and 10 000 inline requests (`maxInlineRequests`) → 400 `batch_too_large` | `coordinator/api/batch_jsonl.go`, `coordinator/api/batch_files.go` |
+| Batch `custom_id` / `metadata` | `^[A-Za-z0-9_-]{1,64}$`, unique per batch; ≤ 16 metadata keys, key ≤ 64 chars, value ≤ 512 chars | `validateCustomID`, `validateBatchMetadata` |
 | Control-plane bodies | 64 KiB (`maxControlPlaneBodyBytes`) for enroll, device token, admin auth | `coordinator/api/server.go` |
 | MDM webhook body | 1 MiB (`maxMDMWebhookBodyBytes`) | `HandleMDMWebhook` (`coordinator/api/server.go`) |
 | `n` | Must be 1 | `handleChatCompletions` |
@@ -481,6 +608,7 @@ See the [Device-code flow](#device-code-flow-3) table for the three bodies. `ver
 | SSE, timing and provider metadata | `coordinator/api/sse_response.go`, `coordinator/api/chat_metadata_stream.go`, `coordinator/api/response_metadata.go`, `coordinator/api/profiler_dispatch.go` |
 | Tools, media, constraints | `coordinator/api/toolschema.go`, `coordinator/api/tool_constraints.go`, `coordinator/api/media_resolve.go` |
 | Sealed transport | `coordinator/api/sender_encryption.go` |
+| Batch API, validation, assembly, blob config | `coordinator/api/batch_files.go`, `coordinator/api/batch_handlers.go`, `coordinator/api/batch_jsonl.go`, `coordinator/api/batch_assembler.go`, `coordinator/api/batch_config.go`, `coordinator/api/batch_dispatch.go`, `coordinator/store/sealedblob/`, `coordinator/batchlane/` |
 | Models and catalog | `coordinator/api/models_endpoints.go`, `coordinator/api/concrete_model_entries.go`, `coordinator/api/openrouter_endpoint.go`, `coordinator/api/model_registry_handlers.go`, `coordinator/api/model_alias_handlers.go`, `coordinator/api/openrouter_alias_handlers.go`, `coordinator/api/capacity.go`, `coordinator/api/exact_cache_status.go` |
 | Keys, device code, accounts | `coordinator/api/apikey_handlers.go`, `coordinator/store/apikey.go`, `coordinator/api/device_auth.go`, `coordinator/api/me_handlers.go` |
 | Billing, Stripe, referral, invites | `coordinator/api/billing_handlers.go`, `coordinator/api/stripe_payouts.go`, `coordinator/api/stripe_withdraw.go`, `coordinator/api/stripe_payouts_webhooks.go`, `coordinator/api/invite_handlers.go`, `coordinator/api/base_rewards_handlers.go` |
