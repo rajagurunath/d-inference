@@ -1,0 +1,14 @@
+graph TD
+  C["consumer"] -->|"1. POST /v1/files purpose=batch"| F["file-... sealed at rest"]
+  F -->|"2. POST /v1/batches with input_file_id"| V["batch_... validating"]
+  C -->|"2b. POST /v1/batches with model + requests[]"| V
+  V --> P["in_progress"]
+  P -->|"3. GET /v1/batches/{id} until terminal"| D{"terminal status"}
+  D -->|"all items settled"| OK["completed"]
+  D -->|"24h window elapsed"| EX["expired"]
+  D -->|"POST /v1/batches/{id}/cancel"| CA["cancelled"]
+  OK --> OUT["output_file_id: one JSONL line per succeeded custom_id"]
+  OK --> ERR["error_file_id: failed and expired items"]
+  OK -->|"inline form only"| INL["results[] on the batch object"]
+  OUT -->|"4. GET /v1/files/{id}/content"| DL["JSONL download, 7-day retention"]
+  ERR --> DL
