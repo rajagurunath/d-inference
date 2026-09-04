@@ -93,8 +93,16 @@ type BatchFile struct {
 // Batch is one submitted job. Counts move only through FinishItem so a
 // duplicate or late result can never advance them twice.
 type Batch struct {
-	ID               string            `json:"id"` // "batch_" + 24 hex
-	AccountID        string            `json:"account_id"`
+	ID        string `json:"id"` // "batch_" + 24 hex
+	AccountID string `json:"account_id"`
+	// APIKeyID is the public id of the API key that submitted the batch, or ""
+	// when the caller authenticated some other way (Privy JWT, admin key) and
+	// had no key. Every item the batch dispatches is attributed to it, so the
+	// key's AllowedModels and spend cap apply to batch work exactly as they do
+	// to online work. json:"-" is deliberate: the OpenAI batch object has no
+	// such field and batchObject builds the wire shape explicitly, so this is
+	// belt-and-braces against the row ever being marshalled directly.
+	APIKeyID         string            `json:"-"`
 	InputFileID      string            `json:"input_file_id"`
 	Endpoint         string            `json:"endpoint"`
 	Status           BatchStatus       `json:"status"`

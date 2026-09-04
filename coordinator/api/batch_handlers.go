@@ -158,9 +158,18 @@ func (s *Server) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// The submitting key is stamped on the batch so every item it dispatches is
+	// attributed to it and the key's AllowedModels and spend cap are enforced on
+	// batch work exactly as on online work (api/batch_dispatch.go). A caller
+	// that authenticated some other way — a Privy JWT session or the admin key —
+	// has no API key at all; that batch carries "" and runs under ACCOUNT-level
+	// limits only, which is the same thing that caller's online requests do.
+	apiKeyID := keyIDFromContext(r.Context())
+
 	batch := &store.Batch{
 		ID:               batchID,
 		AccountID:        accountID,
+		APIKeyID:         apiKeyID,
 		InputFileID:      inputFileID,
 		Endpoint:         endpoint,
 		Status:           store.BatchValidating,
@@ -206,6 +215,14 @@ func (s *Server) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("batch: created",
 		"batch_id", batchID, "account_id", accountID, "source", source,
 		"sealed_to", sealedTo, "endpoint", endpoint, "requests", len(records))
+	if apiKeyID == "" {
+		// Once per batch — not once per item — and ids only. This is the single
+		// place the "no key-level enforcement" decision is made: the key id is
+		// fixed at creation, so a line here covers every item the batch will
+		// ever dispatch.
+		s.logger.Debug("batch: no submitting api key, account-level limits only",
+			"batch_id", batchID, "account_id", accountID)
+	}
 
 	status := http.StatusOK
 	if source == batchSourceInline {

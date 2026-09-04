@@ -1225,6 +1225,11 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		// IF EXISTS drops the FK on a database that already has it and is a
 		// no-op on one that was created after input_file_id lost the REFERENCES.
 		`ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_input_file_id_fkey`,
+		// The submitting API key, so the dispatcher can attribute every item of
+		// the batch to it and the key's AllowedModels and spend cap apply to
+		// batch work. '' means the batch was created by a caller with no API
+		// key (Privy JWT, admin key); those run under account-level limits only.
+		`DO $$ BEGIN ALTER TABLE batches ADD COLUMN IF NOT EXISTS api_key_id TEXT NOT NULL DEFAULT ''; EXCEPTION WHEN others THEN NULL; END $$`,
 		`CREATE TABLE IF NOT EXISTS batch_items (
 			id TEXT PRIMARY KEY,
 			batch_id TEXT NOT NULL REFERENCES batches(id),

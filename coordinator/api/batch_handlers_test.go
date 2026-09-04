@@ -454,6 +454,72 @@ func TestInternalBatchErrorLogsItsCause(t *testing.T) {
 	}
 }
 
+// inlineBatchBody is a one-request inline create body.
+func inlineBatchBody(customID string) map[string]any {
+	return map[string]any{
+		"endpoint": "/v1/chat/completions",
+		"model":    batchTestModel,
+		"requests": []map[string]any{
+			{"custom_id": customID, "body": map[string]any{
+				"messages": []map[string]any{{"role": "user", "content": batchTestPrompt}},
+			}},
+		},
+	}
+}
+
+// TestBatchCreateStampsTheSubmittingKey: the batch row carries the id of the
+// API key that created it, so the dispatcher can attribute every item to that
+// key and its AllowedModels and spend cap are enforced on batch work exactly as
+// on online work. A caller that authenticated without an API key — a Privy JWT
+// session or the admin key — leaves it empty, and that batch runs under
+// ACCOUNT-level limits only. The id is never on the wire either way: the OpenAI
+// batch object has no such field.
+func TestBatchCreateStampsTheSubmittingKey(t *testing.T) {
+	env := newBatchEnv(t)
+
+	raw, rec, err := env.st.CreateAPIKey("acct-submitter", store.APIKeyCreate{Name: "batch-submitter"})
+	if err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+	if rec.ID == "" {
+		t.Fatal("fixture: key record carries no id")
+	}
+
+	status, created := env.postJSON("/v1/batches", inlineBatchBody("keyed"), raw)
+	if status != http.StatusAccepted {
+		t.Fatalf("create status = %d, body %v", status, created)
+	}
+	batchID, _ := created["id"].(string)
+	if _, onWire := created["api_key_id"]; onWire {
+		t.Fatalf("batch object exposes api_key_id: %v", created)
+	}
+
+	stored, ok := env.st.GetBatch("acct-submitter", batchID)
+	if !ok {
+		t.Fatalf("GetBatch(%s): not found", batchID)
+	}
+	if stored.APIKeyID != rec.ID {
+		t.Fatalf("stored APIKeyID = %q, want %q", stored.APIKeyID, rec.ID)
+	}
+
+	// The admin key authenticates without an API key record, so the batch is
+	// stamped with "" and dispatches under account-level limits only.
+	const adminKey = "admin-key-for-batch-stamping"
+	env.srv.SetAdminKey(adminKey)
+	status, adminCreated := env.postJSON("/v1/batches", inlineBatchBody("keyless"), adminKey)
+	if status != http.StatusAccepted {
+		t.Fatalf("admin create status = %d, body %v", status, adminCreated)
+	}
+	adminBatchID, _ := adminCreated["id"].(string)
+	adminStored, ok := env.st.GetBatch("admin", adminBatchID)
+	if !ok {
+		t.Fatalf("GetBatch(%s): not found", adminBatchID)
+	}
+	if adminStored.APIKeyID != "" {
+		t.Fatalf("admin-created batch APIKeyID = %q, want \"\"", adminStored.APIKeyID)
+	}
+}
+
 func TestInlineBatchOpenRouterForm(t *testing.T) {
 	env := newBatchEnv(t)
 
