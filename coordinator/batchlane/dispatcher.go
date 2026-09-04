@@ -506,12 +506,12 @@ func (d *Dispatcher) start(ctx context.Context, b *store.Batch, it *store.BatchI
 	d.mu.Unlock()
 
 	batchID, itemID, blobRef := b.ID, it.ID, it.BlobRef
-	accountID, batchModel := b.AccountID, b.Model
+	accountID, apiKeyID, batchModel := b.AccountID, b.APIKeyID, b.Model
 
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
-		out, err := d.runItem(itemCtx, accountID, batchModel, blobRef)
+		out, err := d.runItem(itemCtx, accountID, apiKeyID, batchModel, blobRef)
 		select {
 		case d.results <- itemOutcome{batchID: batchID, itemID: itemID, outcome: out, err: err}:
 		case <-d.stop:
@@ -524,7 +524,7 @@ func (d *Dispatcher) start(ctx context.Context, b *store.Batch, it *store.BatchI
 // runItem opens the sealed request body and runs it through the funnel. The
 // plaintext lives only for the duration of this call: it is never stored on the
 // Dispatcher, never logged, and never copied into an outcome.
-func (d *Dispatcher) runItem(ctx context.Context, accountID, batchModel, blobRef string) (Outcome, error) {
+func (d *Dispatcher) runItem(ctx context.Context, accountID, apiKeyID, batchModel, blobRef string) (Outcome, error) {
 	// A body that cannot be opened or parsed is a permanent failure for the
 	// item: the pairing of a non-nil error with ErrCodeRequestFailed is what
 	// tells settle not to spend the retry budget on it.
@@ -539,7 +539,11 @@ func (d *Dispatcher) runItem(ctx context.Context, accountID, batchModel, blobRef
 			return Outcome{ErrCode: ErrCodeRequestFailed}, err
 		}
 	}
-	return d.dispatch(ctx, accountID, "", model, body)
+	// The batch's submitting API key rides with every one of its items, so the
+	// key's AllowedModels and spend cap are enforced on batch work. "" means the
+	// batch was created without one (Privy JWT, admin key) and runs under
+	// account-level limits only.
+	return d.dispatch(ctx, accountID, apiKeyID, model, body)
 }
 
 // modelOf reads the model field out of an item's request body. The inline batch
