@@ -1024,3 +1024,37 @@ func TestNoContentColumnsInBatchTables(t *testing.T) {
 		}
 	}
 }
+
+// BatchItemExists is the dispatcher's orphan-sweep probe: it must answer for an
+// item in any state, and answer false for an id no row carries, without
+// depending on the batch or the account.
+func TestBatchItemExists(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			b, items := startBatch(t, s, uniqueID("acct"), 3)
+
+			for _, it := range items {
+				ok, err := s.BatchItemExists(it.ID)
+				if err != nil || !ok {
+					t.Fatalf("BatchItemExists(%s pending) = %v, %v", it.ID, ok, err)
+				}
+			}
+
+			// Still true once the item has moved on from pending.
+			claimed, err := s.ClaimPendingItems(b.ID, 1, time.Now().UTC())
+			if err != nil || len(claimed) != 1 {
+				t.Fatalf("ClaimPendingItems = %d, %v", len(claimed), err)
+			}
+			if ok, err := s.FinishItem(ItemResult{ItemID: claimed[0].ID, Succeeded: true}, time.Now().UTC()); err != nil || !ok {
+				t.Fatalf("FinishItem = %v, %v", ok, err)
+			}
+			if ok, err := s.BatchItemExists(claimed[0].ID); err != nil || !ok {
+				t.Fatalf("BatchItemExists(succeeded) = %v, %v", ok, err)
+			}
+
+			if ok, err := s.BatchItemExists("bitem_000000000000000000000000"); err != nil || ok {
+				t.Fatalf("BatchItemExists(unknown) = %v, %v, want false", ok, err)
+			}
+		})
+	}
+}

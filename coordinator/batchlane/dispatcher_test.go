@@ -78,7 +78,8 @@ func seedBatchKeyed(t *testing.T, st store.Store, blobs *sealedblob.Store, id st
 	items := make([]*store.BatchItem, 0, n)
 	for i := 0; i < n; i++ {
 		itemID := fmt.Sprintf("bitem_%s_%02d", id, i)
-		if err := blobs.PutPlain(itemID, itemBody(i)); err != nil {
+		inputRef := itemID + "-in" // api.BatchItemInputRef
+		if err := blobs.PutPlain(inputRef, itemBody(i)); err != nil {
 			t.Fatalf("seal item body: %v", err)
 		}
 		items = append(items, &store.BatchItem{
@@ -87,7 +88,7 @@ func seedBatchKeyed(t *testing.T, st store.Store, blobs *sealedblob.Store, id st
 			CustomID: fmt.Sprintf("cid-%02d", i),
 			LineNo:   i + 1,
 			State:    store.ItemPending,
-			BlobRef:  itemID,
+			BlobRef:  inputRef,
 		})
 	}
 	if err := st.CreateBatch(b, items); err != nil {
@@ -243,8 +244,8 @@ func TestTickFinishesItemsAndFinalizes(t *testing.T) {
 	if it.RequestID != "req-0" {
 		t.Fatalf("request id = %q, want req-0", it.RequestID)
 	}
-	if it.ResultBlobRef == "" {
-		t.Fatal("result blob ref is empty")
+	if it.ResultBlobRef != ResultBlobRef(it.ID) {
+		t.Fatalf("result blob ref = %q, want %q", it.ResultBlobRef, ResultBlobRef(it.ID))
 	}
 	got, err := h.blobs.Open(it.ResultBlobRef)
 	if err != nil {
@@ -646,4 +647,243 @@ func waitForCalls(t *testing.T, f *FakeDispatch, n int) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %d dispatch calls (have %d)", n, f.Len())
+}
+
+// A non-nil error carrying request_failed is the funnel reporting a permanent
+// condition (an unusable API key, a body that cannot be parsed): the item is
+// failed on the first outcome rather than burning its whole attempt budget.
+func TestPermanentFailureIsNotRetried(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, Config{MaxAttempts: 3})
+	idleSlot(h.view, 4)
+	h.dispatch.Respond = func(int, string, []byte) (Outcome, error) {
+		return Outcome{ErrCode: ErrCodeRequestFailed}, errors.New("api key revoked")
+	}
+	seedBatch(t, h.st, h.blobs, "batch_permanent", 1, testStart.Add(24*time.Hour))
+
+	h.tick(t, ctx, testStart)
+	h.tick(t, ctx, testStart.Add(time.Second))
+
+	if n := h.dispatch.Len(); n != 1 {
+		t.Fatalf("dispatch calls = %d, want 1 — a permanent failure is not retried", n)
+	}
+	items, _ := h.st.ListItems("batch_permanent")
+	if items[0].State != store.ItemFailed {
+		t.Fatalf("state = %s, want failed", items[0].State)
+	}
+	if items[0].LastErrorCode != ErrCodeRequestFailed {
+		t.Fatalf("error code = %q, want %q", items[0].LastErrorCode, ErrCodeRequestFailed)
+	}
+}
+
+// An item whose sealed body is gone can never succeed, so it fails at once
+// rather than being re-offered until its attempts run out.
+func TestMissingItemBodyFailsPermanently(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, Config{MaxAttempts: 3})
+	idleSlot(h.view, 4)
+	seedBatch(t, h.st, h.blobs, "batch_noblob", 1, testStart.Add(24*time.Hour))
+	items, _ := h.st.ListItems("batch_noblob")
+	if err := h.blobs.Delete(items[0].BlobRef); err != nil {
+		t.Fatalf("delete input blob: %v", err)
+	}
+
+	h.tick(t, ctx, testStart)
+	h.tick(t, ctx, testStart.Add(time.Second))
+
+	if n := h.dispatch.Len(); n != 0 {
+		t.Fatalf("dispatch calls = %d, want 0 — the body never opened", n)
+	}
+	items, _ = h.st.ListItems("batch_noblob")
+	if items[0].State != store.ItemFailed {
+		t.Fatalf("state = %s, want failed", items[0].State)
+	}
+}
+
+// Once a batch has left the open list its result blobs start a retention clock;
+// the sweep deletes them when it runs out, and runs the file retention pass on
+// its own cadence.
+func TestRetentionPurgesResultBlobsAndFiles(t *testing.T) {
+	ctx := context.Background()
+	purges := 0
+	h := newHarness(t, Config{
+		MaxAttempts:     3,
+		OutputRetention: time.Hour,
+		PurgeInterval:   10 * time.Minute,
+	})
+	h.d.cfg.Purge = func(time.Time) (int, error) { purges++; return 0, nil }
+	idleSlot(h.view, 4)
+	h.dispatch.Respond = func(int, string, []byte) (Outcome, error) {
+		return Outcome{ResponseBody: []byte(`{"choices":[]}`)}, nil
+	}
+	seedBatch(t, h.st, h.blobs, "batch_retain", 1, testStart.Add(24*time.Hour))
+
+	h.tick(t, ctx, testStart)
+	h.tick(t, ctx, testStart.Add(time.Second))
+
+	items, _ := h.st.ListItems("batch_retain")
+	ref := items[0].ResultBlobRef
+	if _, err := h.blobs.Raw(ref); err != nil {
+		t.Fatalf("result blob missing right after settle: %v", err)
+	}
+
+	// PR2's finalize takes the batch terminal. The fake hook does not, so drive
+	// the same transition the dispatcher would observe.
+	if ok, err := h.st.SetBatchStatus("batch_retain", store.BatchInProgress, store.BatchCompleted, testStart.Add(2*time.Second)); err != nil || !ok {
+		t.Fatalf("complete batch: ok=%v err=%v", ok, err)
+	}
+	h.tick(t, ctx, testStart.Add(2*time.Second)) // schedules retention
+	if _, err := h.blobs.Raw(ref); err != nil {
+		t.Fatal("the result blob was purged before its retention expired")
+	}
+
+	h.tick(t, ctx, testStart.Add(2*time.Hour))
+	if _, err := h.blobs.Raw(ref); !errors.Is(err, sealedblob.ErrNotFound) {
+		t.Fatalf("result blob after retention: err = %v, want ErrNotFound", err)
+	}
+	if purges == 0 {
+		t.Fatal("the file retention pass never ran")
+	}
+}
+
+// The purge hook runs on its interval, not on every tick.
+func TestFileRetentionPassIsRateLimited(t *testing.T) {
+	ctx := context.Background()
+	purges := 0
+	h := newHarness(t, Config{MaxAttempts: 3, PurgeInterval: time.Minute})
+	h.d.cfg.Purge = func(time.Time) (int, error) { purges++; return 0, nil }
+
+	for i := 0; i < 10; i++ {
+		h.tick(t, ctx, testStart.Add(time.Duration(i)*time.Second))
+	}
+	if purges != 1 {
+		t.Fatalf("purge ran %d times in ten seconds, want 1", purges)
+	}
+	h.tick(t, ctx, testStart.Add(2*time.Minute))
+	if purges != 2 {
+		t.Fatalf("purge ran %d times, want 2 after the interval elapsed", purges)
+	}
+}
+
+// A crash between sealing an item body and committing its rows leaves a blob
+// nothing references. The orphan sweep is the only thing that can find one.
+func TestOrphanItemBlobsArePurged(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, Config{
+		MaxAttempts:     3,
+		OutputRetention: time.Hour,
+		OrphanInterval:  10 * time.Minute,
+	})
+	// A live batch, so the sweep has real rows to leave alone.
+	seedBatch(t, h.st, h.blobs, "batch_orphan", 2, testStart.Add(24*time.Hour))
+	live, _ := h.st.ListItems("batch_orphan")
+
+	// Three blobs nothing references: an input, a result, and a file blob the
+	// file retention pass owns.
+	orphanInput := "bitem_deadbeefdeadbeefdeadbeef-in"
+	orphanResult := "bitem_cafebabecafebabecafebabe"
+	fileBlob := "file-000000000000000000000000"
+	for _, ref := range []string{orphanInput, orphanResult, fileBlob} {
+		if err := h.blobs.PutPlain(ref, []byte("x")); err != nil {
+			t.Fatalf("seed %s: %v", ref, err)
+		}
+	}
+	// Age every blob past the retention window; a fresh blob belongs to a batch
+	// that may still be committing.
+	old := testStart.Add(-2 * time.Hour)
+	for _, e := range mustReadDir(t, h.blobs.Dir()) {
+		touch(t, h.blobs.Dir(), e, old)
+	}
+
+	h.tick(t, ctx, testStart)
+
+	for _, ref := range []string{orphanInput, orphanResult} {
+		if _, err := h.blobs.Raw(ref); !errors.Is(err, sealedblob.ErrNotFound) {
+			t.Fatalf("orphan %s survived: err = %v", ref, err)
+		}
+	}
+	if _, err := h.blobs.Raw(fileBlob); err != nil {
+		t.Fatalf("the sweep deleted a file blob it does not own: %v", err)
+	}
+	for _, it := range live {
+		if _, err := h.blobs.Raw(it.BlobRef); err != nil {
+			t.Fatalf("the sweep deleted a referenced item blob %s: %v", it.BlobRef, err)
+		}
+	}
+}
+
+// A blob younger than the retention window belongs to a batch that may still be
+// committing its rows, so the sweep must not race it.
+func TestOrphanSweepLeavesYoungBlobsAlone(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, Config{MaxAttempts: 3, OutputRetention: time.Hour})
+	ref := "bitem_feedfacefeedfacefeedface-in"
+	if err := h.blobs.PutPlain(ref, []byte("x")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Written a minute ago against a one-hour window: still inside it.
+	touch(t, h.blobs.Dir(), ref, testStart.Add(-time.Minute))
+
+	h.tick(t, ctx, testStart)
+
+	if _, err := h.blobs.Raw(ref); err != nil {
+		t.Fatalf("a young orphan candidate was deleted: %v", err)
+	}
+}
+
+// The orphan pass runs on its interval, not on every tick.
+func TestOrphanSweepIsRateLimited(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, Config{MaxAttempts: 3, OutputRetention: time.Hour, OrphanInterval: time.Hour})
+	ref := "bitem_0123456789abcdef01234567-in"
+	if err := h.blobs.PutPlain(ref, []byte("x")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	touch(t, h.blobs.Dir(), ref, testStart.Add(-2*time.Hour))
+	probe := &countingItemStore{Store: h.st}
+	h.d.st = probe
+
+	for i := 0; i < 5; i++ {
+		h.tick(t, ctx, testStart.Add(time.Duration(i)*time.Second))
+	}
+	if probe.listCalls() != 1 {
+		t.Fatalf("orphan pass ran %d times in five ticks, want 1", probe.listCalls())
+	}
+}
+
+// countingItemStore counts the existence probes the orphan sweep makes. It is
+// enough to tell one pass from five; the sweep makes at least one probe per
+// pass because the harness seeds a candidate blob.
+type countingItemStore struct {
+	store.Store
+	passes int
+}
+
+func (c *countingItemStore) BatchItemExists(itemID string) (bool, error) {
+	c.passes++
+	return c.Store.BatchItemExists(itemID)
+}
+
+func (c *countingItemStore) listCalls() int { return c.passes }
+
+// touch backdates a blob so a test can put it on either side of the retention
+// window without waiting.
+func touch(t *testing.T, dir, ref string, at time.Time) {
+	t.Helper()
+	if err := os.Chtimes(filepath.Join(dir, ref), at, at); err != nil {
+		t.Fatalf("chtimes %s: %v", ref, err)
+	}
+}
+
+func mustReadDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
 }

@@ -608,3 +608,20 @@ func (s *PostgresStore) CountItems(batchID string) (total, pending, inflight, su
 	}
 	return total, pending, inflight, succeeded, failed, nil
 }
+
+// BatchItemExists reports whether an item row exists, in any state. The query
+// is a primary-key probe: it reads no column, so an orphan sweep over a large
+// blob directory costs one index lookup per ref and never loads a row.
+func (s *PostgresStore) BatchItemExists(itemID string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM batch_items WHERE id = $1)`, itemID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("store: batch item exists: %w", err)
+	}
+	return exists, nil
+}

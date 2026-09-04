@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/eigeninference/d-inference/coordinator/api"
 	"github.com/eigeninference/d-inference/coordinator/batchlane"
@@ -18,7 +19,6 @@ import (
 	"github.com/eigeninference/d-inference/coordinator/registry"
 	"github.com/eigeninference/d-inference/coordinator/saferun"
 	"github.com/eigeninference/d-inference/coordinator/store"
-	"github.com/eigeninference/d-inference/coordinator/store/sealedblob"
 )
 
 // batchLaneEnabledEnv is the operator kill switch for the batch dispatcher.
@@ -40,11 +40,11 @@ func startBatchDispatcher(
 		return
 	}
 
-	blobs := batchBlobStore(srv)
+	blobs := srv.BatchBlobs()
 	if blobs == nil {
 		// No key, so no sealed-at-rest storage, so no batch lane: prompts must
-		// never sit on coordinator disk in the clear. api.NewBatchBlobStore
-		// (PR2) has already logged why.
+		// never sit on coordinator disk in the clear. api.NewBatchBlobStore has
+		// already logged why, and every batch route answers 503.
 		logger.Info("batch lane dispatcher not started — no sealed batch blob store is configured")
 		return
 	}
@@ -58,29 +58,14 @@ func startBatchDispatcher(
 		batchlane.Config{
 			Tick:        batchlane.DefaultTick,
 			MaxAttempts: batchlane.DefaultMaxAttempts,
+			// One retention boundary for the assembled files and for the
+			// per-item result blobs behind them.
+			OutputRetention: api.BatchOutputRetention,
+			Purge:           srv.PurgeExpiredBatchFiles,
 		},
 		logger,
 	)
 	saferun.Go(logger, "batch_dispatcher", func() { d.Run(ctx) })
-}
-
-// batchBlobStore reads the sealed batch blob store off the server.
-//
-// WIRING POINT (PR2). The accessor is (*api.Server).BatchBlobs, which lands
-// with the Batch API on tidal/pr2-batch-api. The assertion below is what lets
-// this file compile and behave correctly on BOTH sides of that merge: before
-// PR2 the method does not exist, the assertion fails, and the dispatcher stays
-// down (there would be nothing to dispatch — no route can create a batch yet);
-// after PR2 it resolves and the lane comes up with no further change. Replace
-// the assertion with a direct `srv.BatchBlobs()` once PR2 has merged.
-func batchBlobStore(srv *api.Server) *sealedblob.Store {
-	if srv == nil {
-		return nil
-	}
-	if p, ok := any(srv).(interface{ BatchBlobs() *sealedblob.Store }); ok {
-		return p.BatchBlobs()
-	}
-	return nil
 }
 
 // batchDispatchFn adapts the api layer's batch dispatch entry to the
@@ -99,13 +84,13 @@ func batchDispatchFn(srv *api.Server) batchlane.DispatchFn {
 	}
 }
 
-// batchFinalizeFn returns the hook that assembles a finished batch's output and
-// error files.
-//
-// WIRING POINT (PR2). The assembler is api/batch_assembler.go, which does not
-// exist on this branch; until it does the hook is nil (a no-op), which leaves
-// item rows correctly settled and the output file unwritten. Everything else in
-// the loop — claim, dispatch, settle, expire, cancel — is unaffected.
-func batchFinalizeFn(_ *api.Server) batchlane.FinalizeFn {
-	return nil
+// batchFinalizeFn adapts the assembler to the dispatcher's finalize hook. The
+// dispatcher calls it after every settle and from its sweep; FinalizeBatchIfDone
+// is a no-op unless the batch is open and has no pending or in-flight items, so
+// the common tick costs one count query.
+func batchFinalizeFn(srv *api.Server) batchlane.FinalizeFn {
+	return func(batchID string, now time.Time) error {
+		_, err := srv.FinalizeBatchIfDone(batchID, now)
+		return err
+	}
 }

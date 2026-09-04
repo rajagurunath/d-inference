@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
@@ -198,6 +199,47 @@ func (s *Store) Delete(ref string) error {
 		return fmt.Errorf("sealedblob: delete %q: %w", ref, err)
 	}
 	return nil
+}
+
+// BlobInfo is one entry of a directory listing: the ref and the file's
+// modification time. Nothing about the content is exposed — a listing is used
+// by the retention sweep, which decides on age and on whether a row still
+// references the ref, never on bytes.
+type BlobInfo struct {
+	Ref     string
+	ModTime time.Time
+}
+
+// List returns every blob in the store, oldest-looking name first (the order
+// the filesystem reports). It skips anything that is not a plain file with a
+// valid ref, so a stray directory or editor swap file is ignored rather than
+// reported as a blob.
+//
+// It exists for the batch dispatcher's orphan sweep: a crash between sealing an
+// item body and writing its row leaves a blob no row references, and only a
+// directory listing can find one.
+func (s *Store) List() ([]BlobInfo, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("sealedblob: list blobs: %w", err)
+	}
+	out := make([]BlobInfo, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !validRef(e.Name()) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			// The blob was removed between the listing and the stat. Nothing to
+			// report and nothing to clean up.
+			continue
+		}
+		out = append(out, BlobInfo{Ref: e.Name(), ModTime: info.ModTime()})
+	}
+	return out, nil
 }
 
 // write publishes sealed at path via a temp file + rename so a crash mid-write

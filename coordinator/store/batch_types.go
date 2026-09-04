@@ -243,4 +243,12 @@ type BatchItemStore interface {
 	// CountItems returns the item tallies for one batch. total counts every
 	// item; the rest count only their own state.
 	CountItems(batchID string) (total, pending, inflight, succeeded, failed int, err error)
+
+	// BatchItemExists reports whether an item row exists, in any state. It is
+	// the cheap existence probe the dispatcher's orphan sweep needs: a crash
+	// between sealing an item body and committing its rows leaves a blob no row
+	// references, and only a per-ref lookup can tell that apart from a live
+	// item. Deliberately unscoped and index-only — it returns no content, not
+	// even the batch the item belongs to.
+	BatchItemExists(itemID string) (bool, error)
 }

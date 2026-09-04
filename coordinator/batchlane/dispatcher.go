@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,6 +88,22 @@ type Config struct {
 	MaxAttempts int
 	// AIMD are the per-slot controller's watermarks.
 	AIMD AIMDConfig
+	// OutputRetention is how long an item's sealed result blob survives after
+	// its batch finalizes. <= 0 means DefaultOutputRetention. The wiring passes
+	// api.BatchOutputRetention so the item blobs and the assembled files expire
+	// on one boundary.
+	OutputRetention time.Duration
+	// PurgeInterval is how often the sweep runs Purge. <= 0 means
+	// DefaultPurgeInterval.
+	PurgeInterval time.Duration
+	// OrphanInterval is how often the sweep walks the blob directory for item
+	// blobs no row references. <= 0 means DefaultOrphanInterval.
+	OrphanInterval time.Duration
+	// Purge is the file-retention pass — api's PurgeExpiredBatchFiles, which
+	// deletes the assembled output/error blobs and marks their rows purged. It
+	// is a Config field rather than a New parameter to keep New's signature the
+	// one the plan specifies. nil skips the pass.
+	Purge func(now time.Time) (int, error)
 }
 
 const (
@@ -94,20 +111,47 @@ const (
 	DefaultTick = time.Second
 	// DefaultMaxAttempts is the spec's maxAttempts.
 	DefaultMaxAttempts = 3
-	// resultBlobSuffix separates an item's result blob from its request blob.
-	// Both refs are derived from the item id and from nothing the consumer
-	// supplied, so a directory listing carries no content (PR1's blob-ref rule).
-	resultBlobSuffix = "-out"
+	// DefaultOutputRetention is how long an item's sealed result blob survives
+	// after its batch finalizes. It mirrors api.BatchOutputRetention, which the
+	// wiring passes in; batchlane cannot import api to read the constant.
+	DefaultOutputRetention = 7 * 24 * time.Hour
+	// DefaultPurgeInterval is how often the sweep runs the file retention pass.
+	// Retention is a 7-day boundary, so a minute of slack costs nothing and
+	// keeps the query off the hot path of a busy tick.
+	DefaultPurgeInterval = time.Minute
+	// DefaultOrphanInterval is how often the sweep walks the blob directory
+	// looking for item blobs no row references. A full listing is the most
+	// expensive thing the dispatcher does, and the condition it repairs is a
+	// crash between sealing an item body and committing its rows, so hourly is
+	// far more often than it can occur.
+	DefaultOrphanInterval = time.Hour
+	// maxOrphanDeletes bounds one orphan pass, so a directory that somehow
+	// filled with stale blobs is drained over several passes instead of
+	// blocking a tick on tens of thousands of unlinks.
+	maxOrphanDeletes = 1000
+	// itemBlobPrefix is the id prefix every batch-item blob ref carries. File
+	// blobs use "file-" and are owned by the file retention pass, so the orphan
+	// sweep never looks at one.
+	itemBlobPrefix = "bitem_"
+	// itemInputBlobSuffix is what api.BatchItemInputRef appends to an item id.
+	// The result ref is the bare item id, so stripping this suffix (when
+	// present) turns either ref back into the id to probe for.
+	itemInputBlobSuffix = "-in"
 	// resultBuffer bounds the outcomes a tick may have to drain. Dispatch
 	// goroutines are themselves bounded by the AIMD targets, which are bounded
 	// by the fleet's batch row allowance, so this is slack rather than a limit.
 	resultBuffer = 1024
 )
 
-// ResultBlobRef is the sealed blob key one item's result is stored under. PR2's
-// assembler reads it back from the item row; it is exported so the two agree by
-// construction rather than by convention.
-func ResultBlobRef(itemID string) string { return itemID + resultBlobSuffix }
+// ResultBlobRef is the sealed blob key one item's result is written under. It
+// MUST equal api.BatchItemResultRef, which the assembler falls back to when an
+// item row carries no ref; api/batch_ref_agreement_test.go pins the two
+// together, because batchlane cannot import api to share the function.
+//
+// The item's sealed REQUEST body lives under a different ref (api's
+// BatchItemInputRef), which the dispatcher never derives: it reads the ref off
+// the item row, so the input key rule stays entirely PR2's.
+func ResultBlobRef(itemID string) string { return itemID }
 
 // Dispatcher fills idle provider slots with batch work. One instance per
 // coordinator, run under saferun.
@@ -127,11 +171,14 @@ type Dispatcher struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 
-	mu       sync.Mutex
-	slots    map[SlotKey]*slotState
-	batches  map[string]*batchState
-	attempts map[string]int // per item id, in memory (see settleFailure)
-	inflight int
+	mu         sync.Mutex
+	slots      map[SlotKey]*slotState
+	batches    map[string]*batchState
+	attempts   map[string]int       // per item id, in memory (see settleFailure)
+	retire     map[string]time.Time // batch id -> when its result blobs may go
+	inflight   int
+	lastPurge  time.Time
+	lastOrphan time.Time
 }
 
 // slotState is one provider·slot's controller plus the smoothing that feeds it.
@@ -189,6 +236,15 @@ func New(
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = DefaultMaxAttempts
 	}
+	if cfg.OutputRetention <= 0 {
+		cfg.OutputRetention = DefaultOutputRetention
+	}
+	if cfg.PurgeInterval <= 0 {
+		cfg.PurgeInterval = DefaultPurgeInterval
+	}
+	if cfg.OrphanInterval <= 0 {
+		cfg.OrphanInterval = DefaultOrphanInterval
+	}
 	d := &Dispatcher{
 		st:       st,
 		blob:     blob,
@@ -202,6 +258,7 @@ func New(
 		slots:    map[SlotKey]*slotState{},
 		batches:  map[string]*batchState{},
 		attempts: map[string]int{},
+		retire:   map[string]time.Time{},
 	}
 	d.requeueAfterRestart()
 	return d
@@ -283,7 +340,8 @@ func (d *Dispatcher) Tick(ctx context.Context, now time.Time) {
 
 	d.claimAndDispatch(ctx, batches, budget, now)
 	d.sweep(batches, now)
-	d.pruneBatchState(batches)
+	d.pruneBatchState(batches, now)
+	d.retention(now)
 }
 
 // updateTargets folds each slot's fresh signal into its EWMAs, runs its AIMD
@@ -467,6 +525,9 @@ func (d *Dispatcher) start(ctx context.Context, b *store.Batch, it *store.BatchI
 // plaintext lives only for the duration of this call: it is never stored on the
 // Dispatcher, never logged, and never copied into an outcome.
 func (d *Dispatcher) runItem(ctx context.Context, accountID, batchModel, blobRef string) (Outcome, error) {
+	// A body that cannot be opened or parsed is a permanent failure for the
+	// item: the pairing of a non-nil error with ErrCodeRequestFailed is what
+	// tells settle not to spend the retry budget on it.
 	body, err := d.blob.Open(blobRef)
 	if err != nil {
 		return Outcome{ErrCode: ErrCodeRequestFailed}, fmt.Errorf("open item body: %w", err)
@@ -542,7 +603,12 @@ func (d *Dispatcher) settle(res itemOutcome, now time.Time) {
 				"batch_id", res.batchID, "item_id", res.itemID, "code", res.outcome.ErrCode, "error", err)
 		}
 	default:
-		d.settleFailure(res, claimable, now)
+		// A non-nil error carrying ErrCodeRequestFailed is the funnel saying the
+		// failure is PERMANENT for this item — an unusable API key, a body it
+		// cannot parse, a blob it cannot open. Retrying would burn the batch's
+		// whole attempt budget on an outcome that cannot change.
+		permanent := res.err != nil && res.outcome.ErrCode == ErrCodeRequestFailed
+		d.settleFailure(res, claimable, permanent, now)
 	}
 }
 
@@ -552,7 +618,10 @@ func (d *Dispatcher) settleSuccess(res itemOutcome, now time.Time) {
 	if err := d.putResult(res.batchID, ref, res.outcome.ResponseBody); err != nil {
 		d.logger.Error("batch lane: could not seal a result",
 			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
-		d.settleFailure(res, true, now)
+		// The response cannot be stored, so it can never be assembled: retrying
+		// the dispatch would only reproduce the same failure at a provider's
+		// expense.
+		d.settleFailure(res, true, true, now)
 		return
 	}
 
@@ -627,13 +696,13 @@ func decodePublicKey(encoded string) ([32]byte, error) {
 // RequeueInflightItems would yank items that are genuinely still running. A
 // coordinator restart therefore forgets a partial retry budget, which costs at
 // most MaxAttempts-1 extra attempts per item and never loses one.
-func (d *Dispatcher) settleFailure(res itemOutcome, claimable bool, now time.Time) {
+func (d *Dispatcher) settleFailure(res itemOutcome, claimable, permanent bool, now time.Time) {
 	d.mu.Lock()
 	d.attempts[res.itemID]++
 	attempts := d.attempts[res.itemID]
 	d.mu.Unlock()
 
-	if attempts < d.cfg.MaxAttempts && claimable {
+	if !permanent && attempts < d.cfg.MaxAttempts && claimable {
 		if _, err := d.st.ReleaseItem(res.itemID); err != nil {
 			d.logger.Error("batch lane: could not re-offer a failed item",
 				"batch_id", res.batchID, "item_id", res.itemID, "attempts", attempts, "error", err)
@@ -659,7 +728,8 @@ func (d *Dispatcher) settleFailure(res itemOutcome, claimable bool, now time.Tim
 		return // already terminal
 	}
 	d.logger.Info("batch lane: item failed",
-		"batch_id", res.batchID, "item_id", res.itemID, "attempts", attempts, "code", ErrCodeRequestFailed)
+		"batch_id", res.batchID, "item_id", res.itemID,
+		"attempts", attempts, "permanent", permanent, "code", ErrCodeRequestFailed)
 	d.runFinalize(res.batchID, now)
 }
 
@@ -757,8 +827,10 @@ func (d *Dispatcher) batchStateFor(ctx context.Context, batchID string) *batchSt
 
 // pruneBatchState drops the state of batches that are no longer open and have
 // nothing outstanding, so a long-lived coordinator does not accumulate one
-// entry per batch it has ever seen.
-func (d *Dispatcher) pruneBatchState(open []*store.Batch) {
+// entry per batch it has ever seen. A batch leaving the open list is also the
+// dispatcher's signal that finalize took it terminal, which is when its result
+// blobs start their retention clock.
+func (d *Dispatcher) pruneBatchState(open []*store.Batch, now time.Time) {
 	stillOpen := make(map[string]struct{}, len(open))
 	for _, b := range open {
 		stillOpen[b.ID] = struct{}{}
@@ -771,6 +843,129 @@ func (d *Dispatcher) pruneBatchState(open []*store.Batch) {
 		}
 		bs.cancel()
 		delete(d.batches, id)
+		if _, scheduled := d.retire[id]; !scheduled {
+			d.retire[id] = now.Add(d.cfg.OutputRetention)
+		}
+	}
+}
+
+// retention deletes the per-item result blobs of batches that finalized more
+// than OutputRetention ago, and runs the assembled-file retention pass.
+//
+// The results are redundant by then: finalize inlines every one of them into
+// the output file, whose own blob and row the Purge hook removes on the same
+// boundary. Only what the dispatcher itself finalized is on the schedule, so a
+// coordinator restart forgets the pending deletions and leaves those result
+// blobs on disk (the assembled files still expire, because their rows carry the
+// timestamp). Making that restart-safe needs a store read for terminal batches
+// past a cutoff, which is a store change and is tracked as a follow-up.
+func (d *Dispatcher) retention(now time.Time) {
+	d.mu.Lock()
+	due := make([]string, 0, len(d.retire))
+	for id, at := range d.retire {
+		if !now.Before(at) {
+			due = append(due, id)
+			delete(d.retire, id)
+		}
+	}
+	runPurge := d.cfg.Purge != nil && (d.lastPurge.IsZero() || !now.Before(d.lastPurge.Add(d.cfg.PurgeInterval)))
+	if runPurge {
+		d.lastPurge = now
+	}
+	runOrphan := d.lastOrphan.IsZero() || !now.Before(d.lastOrphan.Add(d.cfg.OrphanInterval))
+	if runOrphan {
+		d.lastOrphan = now
+	}
+	d.mu.Unlock()
+
+	sort.Strings(due)
+	for _, batchID := range due {
+		d.purgeItemResults(batchID)
+	}
+	if runPurge {
+		if _, err := d.cfg.Purge(now); err != nil {
+			d.logger.Error("batch lane: file retention pass failed", "error", err)
+		}
+	}
+	if runOrphan {
+		d.sweepOrphanItemBlobs(now)
+	}
+}
+
+// sweepOrphanItemBlobs deletes item blobs no row references.
+//
+// A coordinator that crashes between sealing an item body and committing the
+// batch's rows leaves blobs behind that nothing will ever read or delete: the
+// file retention pass walks file rows, and every other deletion path starts
+// from an item row that does not exist. Only a directory listing can find them.
+//
+// Two guards keep the pass from deleting live data. It probes the store for
+// each ref's item id, so anything a row still references is kept whatever its
+// age; and it ignores blobs younger than the retention window, so a batch being
+// created right now — its blobs written, its rows not yet committed — is never
+// raced. Each pass is bounded; a backlog drains over several.
+func (d *Dispatcher) sweepOrphanItemBlobs(now time.Time) {
+	blobs, err := d.blob.List()
+	if err != nil {
+		d.logger.Error("batch lane: could not list blobs for the orphan sweep", "error", err)
+		return
+	}
+	cutoff := now.Add(-d.cfg.OutputRetention)
+
+	scanned, deleted := 0, 0
+	for _, info := range blobs {
+		if deleted >= maxOrphanDeletes {
+			d.logger.Info("batch lane: orphan sweep hit its per-pass bound",
+				"deleted", deleted, "scanned", scanned)
+			break
+		}
+		if !strings.HasPrefix(info.Ref, itemBlobPrefix) || !info.ModTime.Before(cutoff) {
+			continue
+		}
+		scanned++
+		itemID := strings.TrimSuffix(info.Ref, itemInputBlobSuffix)
+		exists, err := d.st.BatchItemExists(itemID)
+		if err != nil {
+			d.logger.Error("batch lane: orphan sweep could not probe an item", "item_id", itemID, "error", err)
+			return // a failing store read must not be read as "no row exists"
+		}
+		if exists {
+			continue
+		}
+		if err := d.blob.Delete(info.Ref); err != nil && !errors.Is(err, sealedblob.ErrNotFound) {
+			d.logger.Error("batch lane: could not delete an orphan blob", "item_id", itemID, "error", err)
+			continue
+		}
+		deleted++
+	}
+	if deleted > 0 {
+		d.logger.Info("batch lane: orphan sweep removed unreferenced item blobs",
+			"blobs", deleted, "candidates", scanned)
+	}
+}
+
+// purgeItemResults deletes every result blob of one finalized batch.
+func (d *Dispatcher) purgeItemResults(batchID string) {
+	items, err := d.st.ListItems(batchID)
+	if err != nil {
+		d.logger.Error("batch lane: could not list items for retention", "batch_id", batchID, "error", err)
+		return
+	}
+	deleted := 0
+	for _, it := range items {
+		ref := it.ResultBlobRef
+		if ref == "" {
+			continue
+		}
+		if err := d.blob.Delete(ref); err != nil && !errors.Is(err, sealedblob.ErrNotFound) {
+			d.logger.Error("batch lane: could not purge a result blob",
+				"batch_id", batchID, "item_id", it.ID, "error", err)
+			continue
+		}
+		deleted++
+	}
+	if deleted > 0 {
+		d.logger.Info("batch lane: retention purged item results", "batch_id", batchID, "blobs", deleted)
 	}
 }
 
