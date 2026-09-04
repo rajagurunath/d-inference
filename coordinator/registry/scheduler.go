@@ -744,7 +744,11 @@ func (r *Registry) commitProviderReservation(
 	if !slotStateModelLoaded(candidate.snapshot.slotState) {
 		r.RecordWarmPoolColdDispatch(model)
 	}
-	if !pr.RequiresVision && candidate.breakdown.RawTTFTMs > 0 && candidate.breakdown.StateMs == 0 {
+	// Warm text ONLINE dispatches only: a batch attempt runs against a 120s
+	// deadline on a slot chosen for headroom, so its actual/predicted ratio
+	// would teach the calibrator about a lane the live TTFT ceiling never gates.
+	if !pr.RequiresVision && pr.Traits.Lane != LaneBatch &&
+		candidate.breakdown.RawTTFTMs > 0 && candidate.breakdown.StateMs == 0 {
 		ttftCalibration.notePrediction(
 			pr.RequestID, pr.Attempt, model, candidate.snapshot.chipFamily,
 			candidate.breakdown.RawTTFTMs)
