@@ -653,7 +653,8 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			amount_micro_usd BIGINT NOT NULL,
 			prompt_tokens INTEGER NOT NULL DEFAULT 0,
 			completion_tokens INTEGER NOT NULL DEFAULT 0,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			lane TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_provider_earnings_account ON provider_earnings(account_id, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_provider_earnings_provider ON provider_earnings(provider_key, created_at DESC)`,
@@ -882,6 +883,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			used_backup BOOL,
 			backup_won BOOL,
 			error_reason TEXT,
+			lane TEXT NOT NULL DEFAULT '',
 			UNIQUE(request_id, attempt)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_inference_routes_created ON inference_routes(created_at DESC)`,
@@ -927,6 +929,11 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		// DAR-341: normalized provider/coordinator error reason. Nullable and
 		// appended so fresh DBs match upgraded DB column order for SELECT * scans.
 		`ALTER TABLE inference_routes ADD COLUMN IF NOT EXISTS error_reason TEXT`,
+		// Tidal batch lane (docs/design/tidal-batch-lane.md §3.5): the service
+		// class the request routed on ("" online, "batch" batch), stamped at
+		// settlement so earnings can be reported by lane.
+		`ALTER TABLE inference_routes ADD COLUMN IF NOT EXISTS lane TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE provider_earnings ADD COLUMN IF NOT EXISTS lane TEXT NOT NULL DEFAULT ''`,
 		// Route keys are memory-only HMACs. Scrub legacy persisted SHA-256
 		// prompt-cache identifiers once. The trigger also clears writes from an
 		// older coordinator during blue-green overlap or emergency rollback while
@@ -1878,7 +1885,7 @@ const inferenceRouteSelectColumns = `
 			created_at, updated_at,
 			provider_region, consumer_region,
 			parse_ms, reserve_ms, route_ms, encrypt_ms, queue_wait_ms, dispatch_ms, actual_decode_tps,
-			admitted_but_failed, used_backup, backup_won, error_reason`
+			admitted_but_failed, used_backup, backup_won, error_reason, lane`
 
 // RecordInferenceRoute writes the routing decision snapshot for a request
 // attempt. Callers keep this best-effort by logging returned errors off the
@@ -2043,6 +2050,7 @@ func (s *PostgresStore) UpdateInferenceRouteOutcome(requestID string, attempt in
 			admitted_but_failed = COALESCE(admitted_but_failed, FALSE) OR $21,
 			used_backup = COALESCE(used_backup, FALSE) OR $22,
 			backup_won = COALESCE(backup_won, FALSE) OR $23,
+			lane = COALESCE(NULLIF($25, ''), lane),
 			updated_at = NOW()
 		 WHERE request_id = $1 AND attempt = $2`,
 		requestID, attempt,
@@ -2051,6 +2059,7 @@ func (s *PostgresStore) UpdateInferenceRouteOutcome(requestID string, attempt in
 		outcome.ParseMs, outcome.ReserveMs, outcome.RouteMs, outcome.EncryptMs, outcome.QueueWaitMs, outcome.DispatchMs, outcome.ActualDecodeTPS,
 		outcome.AdmittedButFailed, outcome.UsedBackup, outcome.BackupWon,
 		outcome.CompletionTokensSet,
+		outcome.Lane,
 	)
 	if err != nil {
 		return fmt.Errorf("store: update inference route outcome: %w", err)
@@ -2099,6 +2108,7 @@ func (s *PostgresStore) InferenceRouteRecordsSince(since time.Time) []InferenceR
 		var admittedButFailed *bool
 		var usedBackup *bool
 		var backupWon *bool
+		var lane string
 
 		if err := rows.Scan(
 			&id,
@@ -2118,7 +2128,7 @@ func (s *PostgresStore) InferenceRouteRecordsSince(since time.Time) []InferenceR
 			&r.CreatedAt, &r.UpdatedAt,
 			&providerRegion, &consumerRegion,
 			&parseMs, &reserveMs, &routeMs, &encryptMs, &queueWaitMs, &dispatchMs, &actualDecodeTPS,
-			&admittedButFailed, &usedBackup, &backupWon, &errorReason,
+			&admittedButFailed, &usedBackup, &backupWon, &errorReason, &lane,
 		); err != nil {
 			continue
 		}
@@ -2189,6 +2199,7 @@ func (s *PostgresStore) InferenceRouteRecordsSince(since time.Time) []InferenceR
 		if backupWon != nil {
 			outcome.BackupWon = *backupWon
 		}
+		outcome.Lane = lane
 		applyInferenceRouteOutcomeToRecord(&r, outcome)
 		records = append(records, r)
 	}
@@ -4187,12 +4198,12 @@ func (s *PostgresStore) RecordProviderEarning(earning *ProviderEarning) error {
 	}
 
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO provider_earnings (account_id, provider_id, provider_key, job_id, model, amount_micro_usd, prompt_tokens, completion_tokens, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		`INSERT INTO provider_earnings (account_id, provider_id, provider_key, job_id, model, amount_micro_usd, prompt_tokens, completion_tokens, created_at, lane)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 ON CONFLICT (job_id) WHERE job_id <> '' DO NOTHING`,
 		earning.AccountID, earning.ProviderID, earning.ProviderKey, earning.JobID,
 		earning.Model, earning.AmountMicroUSD, earning.PromptTokens, earning.CompletionTokens,
-		createdAt,
+		createdAt, earning.Lane,
 	)
 	if err != nil {
 		return fmt.Errorf("store: insert provider earning: %w", err)
@@ -4206,7 +4217,7 @@ func (s *PostgresStore) GetProviderEarnings(providerKey string, limit int) ([]Pr
 	defer cancel()
 
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, account_id, provider_id, provider_key, job_id, model, amount_micro_usd, prompt_tokens, completion_tokens, created_at
+		`SELECT id, account_id, provider_id, provider_key, job_id, model, amount_micro_usd, prompt_tokens, completion_tokens, created_at, lane
 		 FROM provider_earnings
 		 WHERE provider_key = $1
 		 ORDER BY created_at DESC
@@ -4222,7 +4233,7 @@ func (s *PostgresStore) GetProviderEarnings(providerKey string, limit int) ([]Pr
 	for rows.Next() {
 		var e ProviderEarning
 		if err := rows.Scan(&e.ID, &e.AccountID, &e.ProviderID, &e.ProviderKey, &e.JobID,
-			&e.Model, &e.AmountMicroUSD, &e.PromptTokens, &e.CompletionTokens, &e.CreatedAt); err != nil {
+			&e.Model, &e.AmountMicroUSD, &e.PromptTokens, &e.CompletionTokens, &e.CreatedAt, &e.Lane); err != nil {
 			continue
 		}
 		results = append(results, e)
@@ -4239,7 +4250,7 @@ func (s *PostgresStore) GetAccountEarnings(accountID string, limit int) ([]Provi
 	defer cancel()
 
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, account_id, provider_id, provider_key, job_id, model, amount_micro_usd, prompt_tokens, completion_tokens, created_at
+		`SELECT id, account_id, provider_id, provider_key, job_id, model, amount_micro_usd, prompt_tokens, completion_tokens, created_at, lane
 		 FROM provider_earnings
 		 WHERE account_id = $1
 		 ORDER BY created_at DESC
@@ -4255,7 +4266,7 @@ func (s *PostgresStore) GetAccountEarnings(accountID string, limit int) ([]Provi
 	for rows.Next() {
 		var e ProviderEarning
 		if err := rows.Scan(&e.ID, &e.AccountID, &e.ProviderID, &e.ProviderKey, &e.JobID,
-			&e.Model, &e.AmountMicroUSD, &e.PromptTokens, &e.CompletionTokens, &e.CreatedAt); err != nil {
+			&e.Model, &e.AmountMicroUSD, &e.PromptTokens, &e.CompletionTokens, &e.CreatedAt, &e.Lane); err != nil {
 			continue
 		}
 		results = append(results, e)
@@ -4404,8 +4415,8 @@ func (s *PostgresStore) CreditProviderAccount(earning *ProviderEarning) error {
 	err := s.pool.QueryRow(ctx, `
 		WITH earning AS (
 			INSERT INTO provider_earnings (
-				account_id, provider_id, provider_key, job_id, model, amount_micro_usd, prompt_tokens, completion_tokens, created_at
-			) VALUES ($1, $6, $7, $4, $8, $2, $9, $10, COALESCE($5::timestamptz, NOW()))
+				account_id, provider_id, provider_key, job_id, model, amount_micro_usd, prompt_tokens, completion_tokens, created_at, lane
+			) VALUES ($1, $6, $7, $4, $8, $2, $9, $10, COALESCE($5::timestamptz, NOW()), $11)
 			ON CONFLICT (job_id) WHERE job_id <> '' DO NOTHING
 			RETURNING account_id, provider_key, amount_micro_usd, prompt_tokens, completion_tokens
 		), credit AS (
@@ -4451,6 +4462,7 @@ func (s *PostgresStore) CreditProviderAccount(earning *ProviderEarning) error {
 		earning.Model,                        // $8
 		earning.PromptTokens,                 // $9
 		earning.CompletionTokens,             // $10
+		earning.Lane,                         // $11
 	).Scan(&balanceAfter)
 	if err != nil {
 		return fmt.Errorf("store: credit provider account: %w", err)

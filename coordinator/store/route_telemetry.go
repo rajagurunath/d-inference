@@ -39,6 +39,9 @@ func mergeInferenceRouteOutcome(dst *InferenceRouteOutcome, src *InferenceRouteO
 	if src.CostMicroUSD != 0 {
 		dst.CostMicroUSD = src.CostMicroUSD
 	}
+	if src.Lane != "" {
+		dst.Lane = src.Lane
+	}
 	if src.ActualTTFTMs != 0 {
 		dst.ActualTTFTMs = src.ActualTTFTMs
 	}
@@ -92,6 +95,7 @@ func applyInferenceRouteOutcomeToRecord(rec *InferenceRouteRecord, outcome Infer
 	rec.CompletionTokens = outcome.CompletionTokens
 	rec.ReasoningTokens = outcome.ReasoningTokens
 	rec.CostMicroUSD = outcome.CostMicroUSD
+	rec.Lane = outcome.Lane
 	rec.ActualTTFTMs = outcome.ActualTTFTMs
 	rec.DispatchToFirstChunkMs = outcome.DispatchToFirstChunkMs
 	rec.TotalDurationMs = outcome.TotalDurationMs
