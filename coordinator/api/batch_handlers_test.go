@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -391,6 +392,65 @@ func TestCancelFinalizesWhenNothingInflight(t *testing.T) {
 	status, got := env.getJSON("/v1/batches/"+batchID, env.key)
 	if status != http.StatusOK || got["status"] != "cancelled" {
 		t.Fatalf("get after cancel = %d %v, want status cancelled", status, got)
+	}
+}
+
+// TestBatchCreateDefaultsTheEndpoint pins the invariant that let the dead
+// "fall back to the first line's url" branch be removed from handleBatchCreate:
+// parseCreateBatch defaults an omitted endpoint to /v1/chat/completions and
+// rejects anything else, so req.Endpoint is always a validated, non-empty
+// value by the time the handler reads it.
+func TestBatchCreateDefaultsTheEndpoint(t *testing.T) {
+	env := newBatchEnv(t)
+
+	status, fileObj := env.uploadMultipart(jsonlLines(1), "batch", "input.jsonl", env.key)
+	if status != http.StatusOK {
+		t.Fatalf("upload = %d %v", status, fileObj)
+	}
+	fileID, _ := fileObj["id"].(string)
+
+	status, created := env.postJSON("/v1/batches", map[string]any{
+		"input_file_id":     fileID,
+		"completion_window": "24h",
+	}, env.key)
+	if status != http.StatusOK {
+		t.Fatalf("create without an endpoint = %d %v", status, created)
+	}
+	if created["endpoint"] != "/v1/chat/completions" {
+		t.Fatalf("endpoint = %v, want /v1/chat/completions", created["endpoint"])
+	}
+
+	batchID, _ := created["id"].(string)
+	b, ok := env.st.GetBatch(env.account, batchID)
+	if !ok {
+		t.Fatalf("batch %s was not stored", batchID)
+	}
+	if b.Endpoint != "/v1/chat/completions" {
+		t.Fatalf("stored endpoint = %q, want /v1/chat/completions", b.Endpoint)
+	}
+}
+
+// TestInternalBatchErrorLogsItsCause pins the nit that internalBatchError is a
+// method that logs: the cause has to land in the coordinator's own logs — with
+// only the ids the caller passes, never a consumer string — while the body the
+// consumer sees stays a bare 500 that says nothing about what failed.
+func TestInternalBatchErrorLogsItsCause(t *testing.T) {
+	env := newBatchEnv(t)
+
+	be := env.srv.internalBatchError(errors.New("sealing the blob exploded"), "batch_id", "batch_xyz")
+	if be.Status != http.StatusInternalServerError || be.Code != "internal_error" {
+		t.Fatalf("got %d/%s, want 500/internal_error", be.Status, be.Code)
+	}
+	if strings.Contains(be.Message, "exploded") {
+		t.Fatalf("the consumer-facing message leaks the cause: %q", be.Message)
+	}
+
+	logs := env.logs.String()
+	if !strings.Contains(logs, "sealing the blob exploded") {
+		t.Fatalf("the cause was not logged: %s", logs)
+	}
+	if !strings.Contains(logs, "batch_xyz") {
+		t.Fatalf("the caller's ids were not logged: %s", logs)
 	}
 }
 
