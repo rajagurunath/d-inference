@@ -7,9 +7,43 @@ package store
 // blob store (store/sealedblob) keyed by item or file id, so no column here —
 // and no log line or error string produced by either backend — carries prompt
 // or response content, a hash of it, a filename, a custom_id, or a metadata
-// value.
+// value outside the one column designed to hold it.
 
-import "time"
+import (
+	"errors"
+	"sort"
+	"time"
+)
+
+// ErrDuplicateCustomID is returned by CreateBatch when two items in the same
+// batch share a custom_id. Both backends check this in Go before any insert,
+// so the duplicate never reaches the UNIQUE (batch_id, custom_id) index and
+// its value never reaches a Postgres error log.
+var ErrDuplicateCustomID = errors.New("store: duplicate custom_id in batch")
+
+// checkDuplicateCustomIDs returns ErrDuplicateCustomID if two items share a
+// custom_id. It is the Go-side backstop for the UNIQUE (batch_id, custom_id)
+// index, checked before either backend writes anything.
+func checkDuplicateCustomIDs(items []*BatchItem) error {
+	seen := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		if _, dup := seen[it.CustomID]; dup {
+			return ErrDuplicateCustomID
+		}
+		seen[it.CustomID] = struct{}{}
+	}
+	return nil
+}
+
+// sortBatchItemsByLineNo puts items in dispatch order. The memory backend keeps
+// each batch's slice sorted on write; the Postgres backend re-sorts a claim's
+// RETURNING rows, which carry no ordering guarantee of their own.
+func sortBatchItemsByLineNo(items []*BatchItem) {
+	sort.Slice(items, func(i, j int) bool { return items[i].LineNo < items[j].LineNo })
+}
 
 // BatchStatus is the lifecycle of a batch:
 // validating → in_progress → completed | expired, or → cancelling → cancelled,
@@ -155,7 +189,7 @@ type BatchStore interface {
 	// AttachOutputFiles records the assembled result files. First writer wins:
 	// once either file id is set, a later call returns false and changes
 	// nothing, so a retried finalize cannot orphan the first pair of files.
-	AttachOutputFiles(id string, outputFileID, errorFileID *string, at time.Time) (bool, error)
+	AttachOutputFiles(id string, outputFileID, errorFileID *string) (bool, error)
 
 	// ListOpenBatches returns every in_progress or cancelling batch, for the
 	// dispatcher's tick and for restart recovery.

@@ -1198,7 +1198,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS batches (
 			id TEXT PRIMARY KEY,
 			account_id TEXT NOT NULL,
-			input_file_id TEXT NOT NULL REFERENCES batch_files(id),
+			input_file_id TEXT NOT NULL DEFAULT '',
 			endpoint TEXT NOT NULL,
 			status TEXT NOT NULL,
 			completion_window TEXT NOT NULL,
@@ -1220,6 +1220,11 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS batches_account_created ON batches(account_id, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS batches_open ON batches(created_at) WHERE status IN ('in_progress', 'cancelling')`,
+		// Inline batches (source = 'inline') have no uploaded file, so
+		// input_file_id can no longer reference batch_files. DROP CONSTRAINT
+		// IF EXISTS drops the FK on a database that already has it and is a
+		// no-op on one that was created after input_file_id lost the REFERENCES.
+		`ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_input_file_id_fkey`,
 		`CREATE TABLE IF NOT EXISTS batch_items (
 			id TEXT PRIMARY KEY,
 			batch_id TEXT NOT NULL REFERENCES batches(id),

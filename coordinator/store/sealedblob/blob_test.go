@@ -193,3 +193,30 @@ func TestPutPlainOverwritesInPlace(t *testing.T) {
 		t.Fatalf("dir has %d entries, want 1 (no temp files left behind)", len(entries))
 	}
 }
+
+// TestPutPlainSyncsBlobAndDirectory exercises the fsync-then-rename-then-fsync-
+// directory path in write: the temp file and the directory entry it publishes
+// into must both survive the call and nothing but the published blob is left
+// behind.
+func TestPutPlainSyncsBlobAndDirectory(t *testing.T) {
+	k, _ := RandomKey()
+	dir := t.TempDir()
+	s, err := New(dir, k)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.PutPlain("a", []byte("payload")); err != nil {
+		t.Fatalf("PutPlain: %v", err)
+	}
+	got, err := s.Open("a")
+	if err != nil || string(got) != "payload" {
+		t.Fatalf("Open = %q, err %v; want %q", got, err, "payload")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "a" {
+		t.Fatalf("dir entries = %v, want only the published blob", entries)
+	}
+}

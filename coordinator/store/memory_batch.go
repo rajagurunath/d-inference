@@ -14,13 +14,6 @@ import (
 	"time"
 )
 
-// sortBatchItemsByLineNo puts items in dispatch order. The memory backend keeps
-// each batch's slice sorted on write; the Postgres backend re-sorts a claim's
-// RETURNING rows, which carry no ordering guarantee of their own.
-func sortBatchItemsByLineNo(items []*BatchItem) {
-	sort.Slice(items, func(i, j int) bool { return items[i].LineNo < items[j].LineNo })
-}
-
 // cloneBatchFile returns a detached copy so callers cannot mutate stored state.
 func cloneBatchFile(f *BatchFile) *BatchFile {
 	cp := *f
@@ -167,6 +160,9 @@ func (s *MemoryStore) CreateBatch(b *Batch, items []*BatchItem) error {
 	if _, exists := s.batches[b.ID]; exists {
 		return fmt.Errorf("store: batch %q already exists", b.ID)
 	}
+	if err := checkDuplicateCustomIDs(items); err != nil {
+		return err
+	}
 
 	cp := cloneBatch(b)
 	cp.Status = BatchValidating
@@ -215,6 +211,10 @@ func (s *MemoryStore) ListBatches(accountID string, limit int, after string) ([]
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if limit <= 0 {
+		limit = 20
+	}
+
 	scoped := make([]*Batch, 0, len(s.batches))
 	for _, b := range s.batches {
 		if b.AccountID == accountID {
@@ -239,7 +239,7 @@ func (s *MemoryStore) ListBatches(accountID string, limit int, after string) ([]
 	}
 	out := []*Batch{}
 	for _, b := range scoped[start:] {
-		if limit > 0 && len(out) >= limit {
+		if len(out) >= limit {
 			break
 		}
 		out = append(out, cloneBatch(b))
@@ -270,7 +270,7 @@ func (s *MemoryStore) SetBatchStatus(id string, from, to BatchStatus, at time.Ti
 }
 
 // AttachOutputFiles records the assembled result files, first writer wins.
-func (s *MemoryStore) AttachOutputFiles(id string, outputFileID, errorFileID *string, at time.Time) (bool, error) {
+func (s *MemoryStore) AttachOutputFiles(id string, outputFileID, errorFileID *string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -322,6 +322,9 @@ func (s *MemoryStore) CompletionRate(window time.Duration, now time.Time) (float
 	since := now.Add(-window)
 	finished := 0
 	for _, it := range s.batchItems {
+		if it.State != ItemSucceeded && it.State != ItemFailed {
+			continue
+		}
 		if it.FinishedAt == nil {
 			continue
 		}

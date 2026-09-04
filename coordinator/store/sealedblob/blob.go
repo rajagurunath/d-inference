@@ -218,11 +218,23 @@ func (s *Store) write(path string, sealed []byte) error {
 		tmp.Close()
 		return fmt.Errorf("sealedblob: write blob: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sealedblob: sync blob: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("sealedblob: close blob: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("sealedblob: publish blob: %w", err)
+	}
+	dir, err := os.Open(s.dir)
+	if err != nil {
+		return fmt.Errorf("sealedblob: open blob directory: %w", err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("sealedblob: sync blob directory: %w", err)
 	}
 	return nil
 }
