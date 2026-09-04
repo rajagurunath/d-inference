@@ -11,6 +11,7 @@ package api
 import (
 	"errors"
 	"log/slog"
+	"net/http"
 
 	"github.com/eigeninference/d-inference/coordinator/env"
 	"github.com/eigeninference/d-inference/coordinator/internal/e2e"
@@ -101,7 +102,7 @@ func BatchItemResultRef(itemID string) string { return itemID }
 func (s *Server) batchStore() (*sealedblob.Store, error) {
 	if s.batchBlobs == nil {
 		return nil, &batchError{
-			Status:  503,
+			Status:  http.StatusServiceUnavailable,
 			Type:    "batch_unavailable",
 			Code:    "batch_unavailable",
 			Message: "the batch lane is not configured on this coordinator",
