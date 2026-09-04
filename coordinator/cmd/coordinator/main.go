@@ -55,6 +55,7 @@ import (
 	"github.com/eigeninference/d-inference/coordinator/registry"
 	"github.com/eigeninference/d-inference/coordinator/saferun"
 	"github.com/eigeninference/d-inference/coordinator/store"
+	"github.com/eigeninference/d-inference/coordinator/store/sealedblob"
 	"github.com/eigeninference/d-inference/coordinator/telemetry"
 
 	ddtracer "gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
@@ -735,6 +736,16 @@ func main() {
 		logger.Error("failed to derive coordinator encryption key", "error", err)
 	} else {
 		logger.Warn("sender→coordinator encryption disabled — no mnemonic configured")
+	}
+
+	// Sealed-at-rest storage for the batch lane. Disabled (503 on every batch
+	// route) unless a key can be derived, so prompts never land on disk in the
+	// clear.
+	if blobs, err := api.NewBatchBlobStore(cfg.ServerConfig.Batch, billingCfg.EncryptionMnemonic, logger); err != nil {
+		logger.Error("failed to open the batch blob store — batch lane disabled", "error", err)
+	} else if blobs != nil {
+		srv.SetBatchBlobStore(blobs)
+		logger.Info("batch lane enabled", "blob_dir", blobs.Dir(), "hkdf_info", sealedblob.HKDFInfo)
 	}
 
 	// Configure admin accounts.

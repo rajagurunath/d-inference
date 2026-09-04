@@ -52,6 +52,7 @@ import (
 	"github.com/eigeninference/d-inference/coordinator/registry"
 	"github.com/eigeninference/d-inference/coordinator/saferun"
 	"github.com/eigeninference/d-inference/coordinator/store"
+	"github.com/eigeninference/d-inference/coordinator/store/sealedblob"
 	"github.com/eigeninference/d-inference/coordinator/telemetry"
 	"golang.org/x/mod/semver"
 	"golang.org/x/sync/singleflight"
@@ -402,6 +403,11 @@ type Server struct {
 	// requests from senders. Set via SetCoordinatorKey. nil disables the
 	// /v1/encryption-key endpoint and the sealed-request middleware.
 	coordinatorKey *e2e.CoordinatorKey
+
+	// batchBlobs is the sealed-at-rest blob store the batch lane keeps request
+	// bodies and results in. Set once at start-up via SetBatchBlobStore; nil
+	// makes every /v1/files and /v1/batches route answer 503 batch_unavailable.
+	batchBlobs *sealedblob.Store
 
 	// chunkKeys memoizes the per-request NaCl shared key so streaming chunk
 	// decryption skips the X25519 scalar multiplication per token. Zero value

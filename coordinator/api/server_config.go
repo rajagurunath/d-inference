@@ -32,6 +32,9 @@ type ServerConfig struct {
 	// zero keeps the ordinary coordinator default.
 	FirstContentDeadlineBase time.Duration
 	BaseRewards              BaseRewardsConfig
+	// Batch is the batch-lane blob storage config. The lane stays disabled
+	// unless NewBatchBlobStore can build a store from it (design §3.3).
+	Batch BatchConfig
 	// MediaFetch is the remote media resolution config (mediafetch package).
 	// nil means "read it from the environment in NewServer", which keeps the
 	// bare ServerConfig{} literals used by tests working unchanged. main.go
@@ -82,6 +85,7 @@ func ReadServerConfig() ServerConfig {
 		ServiceReservations:   env.EnvBool(env.EnvPrefix+"_SERVICE_RESERVATIONS_ENABLED", false),
 		TrustReuseJournalPath: resolveTrustReuseRevocationJournalPath(),
 		MDMScheduler:          readMDMSchedulerConfig(),
+		Batch:                 ReadBatchConfig(),
 		BaseRewards: BaseRewardsConfig{
 			Enabled:        env.EnvBool(env.EnvPrefix+"_BASE_REWARDS", false),
 			ReductionK:     env.EnvFloat(env.EnvPrefix+"_BASE_REWARDS_K", 0), // 0 = additive base income (full floor on top of earnings)
