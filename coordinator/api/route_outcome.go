@@ -412,6 +412,7 @@ func completeRouteOutcome(pr *registry.PendingRequest, usage protocol.UsageInfo,
 		CompletionTokensSet: true,
 		ReasoningTokens:     usage.ReasoningTokens,
 		CostMicroUSD:        costMicroUSD,
+		Lane:                string(pr.Traits.Lane),
 	}
 	if errorClass != "" {
 		out.ErrorReason = inferenceErrorReason("", status, errorClass, 0, "")

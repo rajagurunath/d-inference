@@ -119,18 +119,36 @@ func (s *Server) FinalizeBatchIfDone(batchID string, now time.Time) (*FinalizeRe
 			// batch never points at one pair while another sits on disk.
 			s.discardAssembledFile(blobs, outputFileID, now)
 			s.discardAssembledFile(blobs, errorFileID, now)
-			if current, ok := s.store.GetBatch(batch.AccountID, batchID); ok {
+			current, ok := s.store.GetBatch(batch.AccountID, batchID)
+			if !ok {
+				return nil, nil
+			}
+			if batchIsTerminal(current.Status) {
+				// The other pass's attach and status CAS both landed.
 				return &FinalizeResult{Status: current.Status, OutputFileID: current.OutputFileID, ErrorFileID: current.ErrorFileID}, nil
 			}
-			return nil, nil
+			// The other pass's attach won but the status CAS that should have
+			// followed it was lost or errored, leaving output files attached
+			// and the batch wedged open. Retry the CAS against its current
+			// status and files instead of giving up.
+			batch = current
+			outputFileID, errorFileID = current.OutputFileID, current.ErrorFileID
 		}
 	}
 
+	return s.finalizeBatchStatus(batch, items, outputFileID, errorFileID, now)
+}
+
+// finalizeBatchStatus runs the terminal status CAS for a batch whose output
+// files are already attached — either by this pass or a previous one whose own
+// CAS was lost — and cleans up item input blobs once it moves. It returns
+// (nil, nil) if the CAS itself is lost to a concurrent finalize.
+func (s *Server) finalizeBatchStatus(batch *store.Batch, items []*store.BatchItem, outputFileID, errorFileID *string, now time.Time) (*FinalizeResult, error) {
 	target := store.BatchCompleted
 	if batch.Status == store.BatchCancelling {
 		target = store.BatchCancelled
 	}
-	moved, err := s.store.SetBatchStatus(batchID, batch.Status, target, now)
+	moved, err := s.store.SetBatchStatus(batch.ID, batch.Status, target, now)
 	if err != nil {
 		return nil, fmt.Errorf("batch: finalize status: %w", err)
 	}
@@ -144,13 +162,13 @@ func (s *Server) FinalizeBatchIfDone(batchID string, now time.Time) (*FinalizeRe
 		if it.BlobRef == "" {
 			continue
 		}
-		if err := blobs.Delete(it.BlobRef); err != nil {
+		if err := s.batchBlobs.Delete(it.BlobRef); err != nil {
 			s.logger.Error("batch: deleting an item input blob failed", "item_id", it.ID, "error", err)
 		}
 	}
 
 	s.logger.Info("batch: finalized",
-		"batch_id", batchID, "status", string(target),
+		"batch_id", batch.ID, "status", string(target),
 		"completed", batch.CountsCompleted, "failed", batch.CountsFailed, "total", batch.CountsTotal)
 
 	return &FinalizeResult{Status: target, OutputFileID: outputFileID, ErrorFileID: errorFileID}, nil

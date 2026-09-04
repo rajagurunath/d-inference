@@ -3,6 +3,8 @@ package payments
 import (
 	"strconv"
 	"strings"
+
+	"github.com/eigeninference/d-inference/coordinator/registry"
 )
 
 // Pricing model for Darkbloom.
@@ -115,6 +117,81 @@ func calculateCost(model string, promptTokens, completionTokens int, customInput
 		// nonzero usage away for free: integer micro-USD rounding can floor a
 		// tiny request to 0, so charge at least 1 micro-USD.
 		cost = 1
+	}
+	return cost
+}
+
+// BatchDiscount is the price multiplier applied to registry.LaneBatch
+// requests (docs/design/tidal-batch-lane.md §3.5): batch work that fills idle
+// provider slots is billed at half the resolved (provider custom / platform /
+// fallback) price, with no per-request minimum charge.
+const BatchDiscount = 0.5
+
+// LaneMultiplier returns the price multiplier for lane: BatchDiscount for
+// registry.LaneBatch, 1.0 for every other lane, including the zero value
+// registry.LaneOnline.
+func LaneMultiplier(lane registry.Lane) float64 {
+	if lane == registry.LaneBatch {
+		return BatchDiscount
+	}
+	return 1.0
+}
+
+// BatchPricePerMillion returns the batch-lane advertised price for a list
+// (online) price in micro-USD per 1M tokens: the same BatchDiscount the
+// settlement path applies, so /v1/pricing cannot advertise a rate the meter
+// does not charge. Truncates to whole micro-USD like the settlement path.
+func BatchPricePerMillion(listPricePerMillion int64) int64 {
+	return int64(float64(listPricePerMillion) * BatchDiscount)
+}
+
+// scaledComponentCost applies the lane multiplier to a token*rate product
+// before the per-million integer division — "the multiplier is applied after
+// override resolution, before rounding" (docs/design/tidal-batch-lane.md
+// §3.5). mult == 1.0 (LaneOnline) takes the pure-integer path so online
+// billing is unchanged bit-for-bit; LaneBatch's mult (BatchDiscount, exactly
+// representable in float64) scales the product before the division.
+func scaledComponentCost(tokens, rate int64, mult float64) int64 {
+	if mult == 1.0 {
+		return tokens * rate / 1_000_000
+	}
+	return int64(float64(tokens*rate) * mult / 1_000_000)
+}
+
+// CalculateCostForLane is like CalculateCostWithOverrides but scales the cost
+// by LaneMultiplier(lane) before rounding. registry.LaneOnline behaves
+// identically to CalculateCostWithOverrides (the per-request minimum charge
+// applies). registry.LaneBatch has NO per-request minimum charge — like
+// CalculateCostWithOverridesNoMinimum, a nonzero token count that rounds to 0
+// micro-USD after the discount is floored at 1 so batch usage is never billed
+// for free.
+func CalculateCostForLane(model string, promptTokens, completionTokens int, customInput, customOutput int64, hasCustom bool, lane registry.Lane) int64 {
+	var inputRate, outputRate int64
+	if hasCustom {
+		inputRate = customInput
+		outputRate = customOutput
+	} else {
+		inputRate = InputPricePerMillion(model)
+		outputRate = OutputPricePerMillion(model)
+	}
+
+	mult := LaneMultiplier(lane)
+	inputCost := scaledComponentCost(int64(promptTokens), inputRate, mult)
+	outputCost := scaledComponentCost(int64(completionTokens), outputRate, mult)
+	cost := inputCost + outputCost
+
+	if lane == registry.LaneBatch {
+		if cost == 0 && (promptTokens > 0 || completionTokens > 0) {
+			// No per-request minimum (batch lane), but never give nonzero
+			// usage away for free: integer micro-USD rounding can floor a
+			// tiny discounted request to 0, so charge at least 1 micro-USD.
+			cost = 1
+		}
+		return cost
+	}
+
+	if cost < minimumChargeMicroUSD {
+		cost = minimumChargeMicroUSD
 	}
 	return cost
 }

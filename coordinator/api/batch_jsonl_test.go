@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -63,6 +64,27 @@ func TestParseBatchJSONLRewritesModelToBuildID(t *testing.T) {
 	}
 	if !strings.Contains(string(items[0].Raw), `"concrete-build"`) {
 		t.Fatalf("body was not rewritten to the build id: %s", items[0].Raw)
+	}
+}
+
+// TestParseBatchJSONLPreservesLargeIntegersOnRewrite pins the fix for decoding
+// a batch line's body with json.Decoder.UseNumber(): rewriting "model" to the
+// resolved build id re-marshals the body, and without UseNumber the default
+// float64 decode of a large integer like "seed" loses precision above 2^53 and
+// silently mangles it on the way back out.
+func TestParseBatchJSONLPreservesLargeIntegersOnRewrite(t *testing.T) {
+	const bigSeed = "9007199254740993" // 2^53 + 1 — not exactly representable as float64
+	input := `{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"alias","seed":` + bigSeed + `,"messages":[]}}`
+	items, err := parseBatchJSONL(strings.NewReader(input), "/v1/chat/completions", maxFileLines,
+		func(string) (string, bool) { return "concrete-build", true })
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !strings.Contains(string(items[0].Raw), `"concrete-build"`) {
+		t.Fatalf("body was not rewritten to the build id: %s", items[0].Raw)
+	}
+	if !strings.Contains(string(items[0].Raw), `"seed":`+bigSeed) {
+		t.Fatalf("seed was not preserved byte-exact across the rewrite: %s", items[0].Raw)
 	}
 }
 
@@ -138,6 +160,108 @@ func TestParseBatchJSONLRejectsNonTextContentParts(t *testing.T) {
 	be := batchErrorFrom(t, err)
 	if be.Code != "unsupported_content" {
 		t.Fatalf("code = %q, want unsupported_content", be.Code)
+	}
+}
+
+// TestBatchValidationErrorsNeverEchoConsumerStrings pins the privacy contract
+// stated at the top of batch_jsonl.go: a rejection identifies a line number and
+// a field name and nothing else. An error body travels back through whatever
+// proxies and log pipelines sit in front of the coordinator, so a rejected
+// model name, endpoint, custom_id, or content part type must not ride along.
+// Every case below feeds a marker string no rejection may quote back.
+func TestBatchValidationErrorsNeverEchoConsumerStrings(t *testing.T) {
+	const marker = "leaky-consumer-string"
+
+	cases := []struct {
+		name     string
+		wantCode string
+		parse    func() error
+	}{
+		{
+			name:     "unknown model on a file line",
+			wantCode: "model_not_found",
+			parse: func() error {
+				line := `{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"` + marker + `"}}`
+				_, err := parseBatchJSONL(strings.NewReader(line), "/v1/chat/completions", maxFileLines, rejectAllResolver)
+				return err
+			},
+		},
+		{
+			name:     "unsupported batch endpoint",
+			wantCode: "invalid_endpoint",
+			parse: func() error {
+				_, err := parseBatchJSONL(strings.NewReader("{}"), "/v1/"+marker, maxFileLines, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "line url that does not match the batch endpoint",
+			wantCode: "invalid_line",
+			parse: func() error {
+				line := `{"custom_id":"a","method":"POST","url":"/v1/completions","body":{"model":"m"}}`
+				_, err := parseBatchJSONL(strings.NewReader(line), "/v1/chat/completions", maxFileLines, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "url that is not a batch endpoint at all",
+			wantCode: "invalid_endpoint",
+			parse: func() error {
+				line := `{"custom_id":"a","method":"POST","url":"/v1/` + marker + `","body":{"model":"m"}}`
+				_, err := parseBatchJSONL(strings.NewReader(line), "", maxFileLines, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "malformed custom_id",
+			wantCode: "invalid_custom_id",
+			parse: func() error {
+				line := `{"custom_id":"` + marker + `!!","method":"POST","url":"/v1/chat/completions","body":{"model":"m"}}`
+				_, err := parseBatchJSONL(strings.NewReader(line), "/v1/chat/completions", maxFileLines, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "non-text content part",
+			wantCode: "unsupported_content",
+			parse: func() error {
+				line := `{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[{"role":"user","content":[{"type":"` + marker + `"}]}]}}`
+				_, err := parseBatchJSONL(strings.NewReader(line), "/v1/chat/completions", maxFileLines, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "unsupported endpoint on the inline path",
+			wantCode: "invalid_endpoint",
+			parse: func() error {
+				_, err := parseInlineRequests(nil, "/v1/"+marker, "m", maxInlineRequests, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "unknown model on the inline path",
+			wantCode: "model_not_found",
+			parse: func() error {
+				reqs := []inlineRequest{{CustomID: "a", Body: json.RawMessage(`{"model":"` + marker + `"}`)}}
+				_, err := parseInlineRequests(reqs, "/v1/chat/completions", marker, maxInlineRequests, rejectAllResolver)
+				return err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			be := batchErrorFrom(t, tc.parse())
+			if be.Code != tc.wantCode {
+				t.Fatalf("code = %q, want %q", be.Code, tc.wantCode)
+			}
+			if strings.Contains(be.Message, marker) {
+				t.Fatalf("error message echoes a consumer string: %q", be.Message)
+			}
+			if strings.Contains(be.Param, marker) {
+				t.Fatalf("error param echoes a consumer string: %q", be.Param)
+			}
+		})
 	}
 }
 
