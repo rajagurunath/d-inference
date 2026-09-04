@@ -1,6 +1,6 @@
 # Darkbloom documentation
 
-> Last updated: 2026-09-03 · commit `5d400cf75`
+> Last updated: 2026-09-04 · commit `da6db27f2`
 
 > Darkbloom is a decentralized private-inference network: an OpenAI- and
 > Anthropic-compatible HTTP API served by a Go coordinator that routes each
@@ -97,6 +97,7 @@
 
 - [`developer/build.md`](developer/build.md): build the coordinator, sidecar, provider, and UIs; toolchain pins.
 - [`developer/test.md`](developer/test.md): every test suite, what CI runs, how to run the e2e suite.
+- [`developer/single-mac-dev-loop.md`](developer/single-mac-dev-loop.md): run a coordinator and provider on one Mac with `make dev-stack` and a chat-completion smoke script.
 
 ## Operations runbooks (production; human approval per mutation)
 
