@@ -48,3 +48,88 @@ func (r *Registry) batchRowsAllowedLocked(p *Provider, model string) int {
 	}
 	return allowed
 }
+
+// BatchSlot is a read-only copy of one provider·model slot's live capacity
+// state plus that pair's batch row allowance — everything the batch
+// dispatcher's per-slot controller reads, and nothing else.
+//
+// It exists so coordinator/batchlane never touches a live *Provider: every
+// field is copied under the same r.mu/p.mu pair the reservation path takes, the
+// established lock order, so the dispatcher can walk the fleet without holding
+// a registry mutex (the same contract ProviderSnapshot gives the base-rewards
+// engine).
+type BatchSlot struct {
+	ProviderID string
+	Model      string
+	// NumRunning / NumWaiting are the slot's live scheduler counters, whichever
+	// lane the rows belong to.
+	NumRunning int
+	NumWaiting int
+	// ObservedDecodeTPS is the provider's EWMA of measured per-request decode
+	// throughput for the slot; 0 when unmeasured.
+	ObservedDecodeTPS float64
+	// ActiveTokenBudgetUsed / Max are the slot's KV budget. Max is 0 on a
+	// provider that does not report one, in which case there is no KV signal.
+	ActiveTokenBudgetUsed int64
+	ActiveTokenBudgetMax  int64
+	// BatchRowsAllowed is BatchRowsAllowed for the pair, resolved under the same
+	// lock as the counters above so the allowance and the state it is compared
+	// against are from the same instant.
+	BatchRowsAllowed int
+}
+
+// BatchSlots returns a snapshot of every loaded slot serving model that the
+// router would route to, or of every loaded routable slot in the fleet when
+// model is empty. The empty form is what the batch dispatcher asks for: it
+// decides only HOW MANY batch rows may be in flight fleet-wide, while WHERE
+// each one lands stays the reservation path's decision.
+func (r *Registry) BatchSlots(model string) []BatchSlot {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make([]BatchSlot, 0, len(r.providers))
+	for _, p := range r.providers {
+		p.mu.Lock()
+		if (p.Status == StatusOnline || p.Status == StatusServing) && p.BackendCapacity != nil {
+			for _, slot := range p.BackendCapacity.Slots {
+				if model != "" && slot.Model != model {
+					continue
+				}
+				if !slotStateModelLoaded(slot.State) {
+					continue
+				}
+				if !r.providerServesRoutableModelLocked(p, slot.Model, false) {
+					continue
+				}
+				out = append(out, BatchSlot{
+					ProviderID:            p.ID,
+					Model:                 slot.Model,
+					NumRunning:            slot.NumRunning,
+					NumWaiting:            slot.NumWaiting,
+					ObservedDecodeTPS:     slot.ObservedDecodeTPS,
+					ActiveTokenBudgetUsed: slot.ActiveTokenBudgetUsed,
+					ActiveTokenBudgetMax:  slot.ActiveTokenBudgetMax,
+					BatchRowsAllowed:      r.batchRowsAllowedLocked(p, slot.Model),
+				})
+			}
+		}
+		p.mu.Unlock()
+	}
+	return out
+}
+
+// QualityCapFloorTPS returns the per-request sustained-decode quality floor the
+// admission cap is derived from (the warm pool's DecodeFloorTPS, 15 tok/s by
+// default). The batch dispatcher compares a slot's observed decode rate against
+// it before adding a row, so the lane backs off against the SAME floor the
+// router sizes the quality batch with. 0 means the floor is disabled.
+//
+// Mirrors QualityCapOvercommit.
+func (r *Registry) QualityCapFloorTPS() float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.qualityCapFloorTPS
+}
