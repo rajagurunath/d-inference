@@ -2220,7 +2220,13 @@ func (s *Server) handleCompleteAt(
 		s.registry.RecordJobSuccess(providerID, 0)
 	}
 	// Serving this model proves the pair can load — lift any cool-down early.
-	s.registry.ClearDispatchLoadCooldown(providerID, pr.Model)
+	// Batch is excluded on the same grounds as the success count above: the
+	// load cooldown is an ONLINE routing signal, and a batch success must not
+	// clear a cooldown that online traffic put there (nor a batch failure arm
+	// one — see handleInferenceError).
+	if pr.Traits.Lane != registry.LaneBatch {
+		s.registry.ClearDispatchLoadCooldown(providerID, pr.Model)
+	}
 
 	// Resolve the consumer once: platform-fee override (nil = global default)
 	// and whether this is a wholesale/service channel (e.g. OpenRouter). A
@@ -2847,8 +2853,13 @@ func (s *Server) handleInferenceErrorOwned(providerID string, provider *registry
 	// text never carries the load-failure vocabulary anyway; the explicit
 	// allowlist (legacy or fault only) makes both guarantees unconditional
 	// rather than dependent on provider error-string phrasing.
+	// Batch never arms it: the lane is excluded from every routing-health
+	// signal, and a batch load failure would make the pair unroutable for
+	// ONLINE traffic (see the ClearDispatchLoadCooldown exemption in
+	// handleCompleteAt).
 	if (causeClass == causeClassLegacy || causeClass == causeClassFault) &&
-		msg.ErrorReason == errorReasonModelLoad {
+		msg.ErrorReason == errorReasonModelLoad &&
+		pr.Traits.Lane != registry.LaneBatch {
 		if s.registry.RecordDispatchLoadFailure(providerID, pr.Model) {
 			s.logger.Warn("load-failure cool-down started",
 				"provider_id", providerID,

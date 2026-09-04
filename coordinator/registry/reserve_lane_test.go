@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -181,6 +182,112 @@ func TestReserveLaneBatchOnlyTakesHeadroomSlots(t *testing.T) {
 		onlinePR := batchLaneRequest("online-2", LaneOnline)
 		if op, _, _ := reg.ReserveProviderWithPlan(model, onlinePR); op == nil {
 			t.Fatal("online reservation failed on a fleet that is merely batch-closed")
+		}
+	})
+}
+
+// TestReserveLaneBatchDebitsLiveLoadWithinOneScan is the stale-row-count
+// regression: the gate must read the occupancy number the online admission cap
+// reads (pendingLoadForModelLocked, debited synchronously by addPendingLocked),
+// not the heartbeat-derived NumRunning. Three batch reservations back to back
+// against a slot whose batch allowance is 2, with NO heartbeat in between: the
+// first two take the two batch rows, the third is refused. Gating on
+// NumRunning alone would admit all three, because NumRunning does not move
+// until the provider's next heartbeat.
+func TestReserveLaneBatchDebitsLiveLoadWithinOneScan(t *testing.T) {
+	reg := New(testLogger())
+	model := "batch-live-load-model"
+	p := laneTestProvider(t, reg, "solo", model, 40, 0, 0)
+	// Router cap 3 → batch allowance 2, one row reserved for online.
+	p.mu.Lock()
+	p.BackendCapacity.Slots[0].MaxConcurrency = 3
+	p.mu.Unlock()
+
+	if got := reg.BatchRowsAllowed(p, model); got != 2 {
+		t.Fatalf("fixture: BatchRowsAllowed=%d, want 2", got)
+	}
+
+	for i := 1; i <= 2; i++ {
+		pr := batchLaneRequest(fmt.Sprintf("batch-live-%d", i), LaneBatch)
+		got, decision, _ := reg.ReserveProviderWithPlan(model, pr)
+		if got == nil {
+			t.Fatalf("batch reservation %d failed: %+v", i, decision)
+		}
+	}
+
+	// Third: the two batch rows are taken and no heartbeat has landed, so
+	// NumRunning is still 0 while the live pending load is 2.
+	p.mu.Lock()
+	running := p.BackendCapacity.Slots[0].NumRunning
+	p.mu.Unlock()
+	if running != 0 {
+		t.Fatalf("fixture: NumRunning=%d, want a stale 0 (no heartbeat)", running)
+	}
+
+	pr := batchLaneRequest("batch-live-3", LaneBatch)
+	got, decision, _ := reg.ReserveProviderWithPlan(model, pr)
+	if got != nil {
+		t.Fatalf("third batch reservation took %q: the allowance of 2 was overrun "+
+			"against a stale row count", got.ID)
+	}
+	if decision.GateRejections[GateBatchHeadroom] != 1 {
+		t.Fatalf("batch_headroom gate rejections=%d, want 1",
+			decision.GateRejections[GateBatchHeadroom])
+	}
+
+	// The reserved online row is still there: the same fleet serves online.
+	if op, d, _ := reg.ReserveProviderWithPlan(model, batchLaneRequest("online-live", LaneOnline)); op == nil {
+		t.Fatalf("online reservation failed on a merely batch-full slot: %+v", d)
+	}
+}
+
+// TestReserveLaneBatchSkipsColdSlots: a provider that has the model on disk but
+// not loaded (slotState "unknown") is a perfectly good ONLINE candidate — it
+// pays the cold-load penalty and RecordWarmPoolColdDispatch is charged. Batch
+// must never be the traffic that makes a provider load weights or evict another
+// model, so the same provider is closed to the batch lane.
+func TestReserveLaneBatchSkipsColdSlots(t *testing.T) {
+	model := "batch-cold-model"
+
+	newColdFleet := func(t *testing.T) *Registry {
+		t.Helper()
+		reg := New(testLogger())
+		p := laneTestProvider(t, reg, "cold", model, 40, 0, 0)
+		// Model advertised (Models list) but no slot for it: the snapshot's
+		// slot state stays "unknown" — eligible, cold.
+		p.mu.Lock()
+		p.BackendCapacity.Slots = nil
+		p.mu.Unlock()
+		return reg
+	}
+
+	t.Run("batch skips the cold provider", func(t *testing.T) {
+		reg := newColdFleet(t)
+		p, decision, plan := reg.ReserveProviderWithPlan(model, batchLaneRequest("batch-cold", LaneBatch))
+		if p != nil {
+			t.Fatalf("batch reserved cold provider %q: it would force a model load", p.ID)
+		}
+		// No reservation and no retained alternate, so RecordWarmPoolColdDispatch
+		// (scheduler.go, dispatch_plan.go — both keyed on !slotStateModelLoaded)
+		// is never reached for a batch attempt.
+		if ids := planProviderIDs(plan); len(ids) != 0 {
+			t.Fatalf("batch plan retained %v: a cold slot is not batch-eligible", ids)
+		}
+		if decision.GateRejections[GateBatchHeadroom] != 1 {
+			t.Fatalf("batch_headroom gate rejections=%d, want 1 (the cold slot)",
+				decision.GateRejections[GateBatchHeadroom])
+		}
+	})
+
+	t.Run("online still takes the cold provider", func(t *testing.T) {
+		reg := newColdFleet(t)
+		p, decision, _ := reg.ReserveProviderWithPlan(model, batchLaneRequest("online-cold", LaneOnline))
+		if p == nil {
+			t.Fatalf("online reservation failed on a cold-but-servable provider: %+v", decision)
+		}
+		if decision.GateRejections[GateBatchHeadroom] != 0 {
+			t.Fatalf("batch_headroom gate fired on the online lane: %d",
+				decision.GateRejections[GateBatchHeadroom])
 		}
 	})
 }
