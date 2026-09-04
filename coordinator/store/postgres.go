@@ -1177,6 +1177,68 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		`DO $$ BEGIN ALTER TABLE fleet_snapshots ADD COLUMN IF NOT EXISTS model_vision BOOL NOT NULL DEFAULT FALSE; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
 		`DO $$ BEGIN ALTER TABLE fleet_snapshots ADD COLUMN IF NOT EXISTS template_render_ok BOOL; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
 		fleetSnapshotsProviderIndexDDL,
+
+		// Batch lane (docs/design/tidal-batch-lane.md §3.2). Metadata only: the
+		// request body and the result live in the sealed blob store on disk,
+		// addressed by blob_ref / result_blob_ref, which are the row's own id.
+		// No column here holds content, a hash of it, or a prefix of it —
+		// batch_store_test.go's information_schema guard pins that.
+		`CREATE TABLE IF NOT EXISTS batch_files (
+			id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			purpose TEXT NOT NULL,
+			filename TEXT NOT NULL,
+			size_bytes BIGINT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			blob_ref TEXT NOT NULL,
+			sealed_by TEXT NOT NULL,
+			purged_at TIMESTAMPTZ
+		)`,
+		`CREATE INDEX IF NOT EXISTS batch_files_purgeable ON batch_files(created_at) WHERE purged_at IS NULL`,
+		`CREATE TABLE IF NOT EXISTS batches (
+			id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			input_file_id TEXT NOT NULL REFERENCES batch_files(id),
+			endpoint TEXT NOT NULL,
+			status TEXT NOT NULL,
+			completion_window TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			expires_at TIMESTAMPTZ NOT NULL,
+			in_progress_at TIMESTAMPTZ,
+			completed_at TIMESTAMPTZ,
+			cancelled_at TIMESTAMPTZ,
+			counts_total INT NOT NULL DEFAULT 0,
+			counts_completed INT NOT NULL DEFAULT 0,
+			counts_failed INT NOT NULL DEFAULT 0,
+			output_file_id TEXT,
+			error_file_id TEXT,
+			result_public_key TEXT NOT NULL DEFAULT '',
+			sealed_to TEXT NOT NULL DEFAULT 'coordinator',
+			source TEXT NOT NULL DEFAULT 'file',
+			model TEXT NOT NULL DEFAULT '',
+			metadata_json JSONB
+		)`,
+		`CREATE INDEX IF NOT EXISTS batches_account_created ON batches(account_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS batches_open ON batches(created_at) WHERE status IN ('in_progress', 'cancelling')`,
+		`CREATE TABLE IF NOT EXISTS batch_items (
+			id TEXT PRIMARY KEY,
+			batch_id TEXT NOT NULL REFERENCES batches(id),
+			custom_id TEXT NOT NULL,
+			line_no INT NOT NULL,
+			state TEXT NOT NULL,
+			attempts INT NOT NULL DEFAULT 0,
+			last_error_code TEXT NOT NULL DEFAULT '',
+			prompt_tokens INT NOT NULL DEFAULT 0,
+			completion_tokens INT NOT NULL DEFAULT 0,
+			submitted_at TIMESTAMPTZ,
+			finished_at TIMESTAMPTZ,
+			request_id TEXT NOT NULL DEFAULT '',
+			blob_ref TEXT NOT NULL,
+			result_blob_ref TEXT NOT NULL DEFAULT '',
+			UNIQUE (batch_id, custom_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS batch_items_claim ON batch_items(batch_id, state, line_no)`,
+		`CREATE INDEX IF NOT EXISTS batch_items_finished ON batch_items(finished_at) WHERE finished_at IS NOT NULL`,
 	}
 
 	for _, m := range migrations {

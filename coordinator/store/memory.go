@@ -155,6 +155,15 @@ type MemoryStore struct {
 	floorDrawSeq       int64
 	floorDrawKeys      map[string]struct{} // "providerKey|epochID" → settled marker
 
+	// Batch lane. Metadata only: request bodies and results live in the sealed
+	// blob store keyed by item/file id. batchItemsByBatch holds each batch's
+	// items pre-sorted by line_no so a claim walks them in dispatch order under
+	// the lock, matching the Postgres ORDER BY line_no.
+	batchFiles        map[string]*BatchFile
+	batches           map[string]*Batch
+	batchItems        map[string]*BatchItem   // itemID → item
+	batchItemsByBatch map[string][]*BatchItem // batchID → items, line_no order
+
 }
 
 // NewMemory creates a new MemoryStore. If adminKey is non-empty it is
@@ -214,6 +223,10 @@ func NewMemory(scfg Config) *MemoryStore {
 		fleetSnapshots:                make([]FleetSnapshotRow, 0),
 		providerFloorDraws:            make([]ProviderFloorDraw, 0),
 		floorDrawKeys:                 make(map[string]struct{}),
+		batchFiles:                    make(map[string]*BatchFile),
+		batches:                       make(map[string]*Batch),
+		batchItems:                    make(map[string]*BatchItem),
+		batchItemsByBatch:             make(map[string][]*BatchItem),
 	}
 	if scfg.AdminKey != "" {
 		s.keyRecords[scfg.AdminKey] = &APIKey{
