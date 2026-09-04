@@ -1,6 +1,6 @@
 # Design records — what was decided, and whether it shipped
 
-> Last updated: 2026-09-03 · commit `5d400cf75`
+> Last updated: 2026-09-04 · commit `fcecc3675`
 
 Plans, proposals, and architecture decision records. Each file is frozen at the
 moment it was written except for its **Status** line, which says whether the
@@ -48,6 +48,7 @@ below repeats the vocabulary word only; the file's line 5 carries the evidence.
 | Record | Status | Date | One line |
 |---|---|---|---|
 | [base-rewards.md](base-rewards.md) | Implemented | 2026-06-06 | Additive base income for providers; as built in [`../architecture/billing.md`](../architecture/billing.md) |
+| [tidal-batch-lane.md](tidal-batch-lane.md) | Proposed | 2026-09-05 | Sell idle fleet capacity as a 24 h, half-price Batch API inside the coordinator; AIMD-throttled, laxity-escalated, sealed at rest |
 | [provider-referral-growth-program.md](provider-referral-growth-program.md) | Proposed | 2026-08-21 | Provider-acquisition referral rewards plus an interim payout share, on top of the existing referral fee split |
 
 ## Adding a record
