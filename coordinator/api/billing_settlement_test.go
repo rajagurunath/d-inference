@@ -8,6 +8,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -303,5 +304,136 @@ func TestOverageChargeClampOnInsufficientBalance(t *testing.T) {
 	// failed, no refund since totalCost was clamped to exactly the reservation.
 	if got := srv.ledger.Balance(consumerID); got != 0 {
 		t.Errorf("consumer balance = %d, want 0", got)
+	}
+}
+
+// TestBatchLaneSettlementHalvesPriceWithNoMinimumCharge extends the
+// cost_micro_usd settlement coverage above (TestLinkedProviderAccountCustomPriceUsedForSettlement)
+// with registry.LaneBatch: settlement resolves prices exactly as before, then
+// applies the lane multiplier before the minimum-charge rule
+// (docs/design/tidal-batch-lane.md §3.5). At fallback prices, 1M prompt + 1M
+// completion tokens cost 250,000 µUSD online and 125,000 µUSD (half) on the
+// batch lane; a 10-completion-token request hits the 100 µUSD minimum charge
+// online but has no minimum on the batch lane. Provider payout at the
+// platform's 0% default fee equals the (possibly discounted) cost exactly,
+// and both the inference_routes row and the provider_earnings row are
+// stamped with the lane the request settled on.
+func TestBatchLaneSettlementHalvesPriceWithNoMinimumCharge(t *testing.T) {
+	tests := []struct {
+		name             string
+		lane             registry.Lane
+		promptTokens     int
+		completionTokens int
+		wantCost         int64
+	}{
+		{"online 1M+1M tokens at fallback prices", registry.LaneOnline, 1_000_000, 1_000_000, 250_000},
+		{"batch 1M+1M tokens at fallback prices is half price", registry.LaneBatch, 1_000_000, 1_000_000, 125_000},
+		{"online 10-token completion hits the minimum charge", registry.LaneOnline, 0, 10, 100},
+		{"batch 10-token completion has no minimum charge", registry.LaneBatch, 0, 10, 1},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, st, ledger := billingTestServer(t)
+
+			model := fmt.Sprintf("batch-lane-settlement-model-%d", i)
+			accountID := fmt.Sprintf("batch-lane-provider-account-%d", i)
+			reqID := fmt.Sprintf("batch-lane-settlement-req-%d", i)
+
+			provider := srv.registry.Register(fmt.Sprintf("batch-lane-provider-%d", i), nil, &protocol.RegisterMessage{
+				Models: []protocol.ModelInfo{{ID: model, ModelType: "chat", Quantization: "4bit"}},
+			})
+			provider.Mu().Lock()
+			provider.AccountID = accountID
+			provider.Mu().Unlock()
+
+			consumerID := testConsumerID
+
+			if err := st.RecordInferenceRoute(&store.InferenceRouteRecord{
+				RequestID: reqID,
+				Attempt:   0,
+				Model:     model,
+				CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("RecordInferenceRoute: %v", err)
+			}
+
+			pr := &registry.PendingRequest{
+				RequestID:   reqID,
+				Model:       model,
+				ConsumerKey: consumerID,
+				ChunkCh:     make(chan registry.ProviderChunk, 1),
+				CompleteCh:  make(chan protocol.UsageInfo, 1),
+				ErrorCh:     make(chan protocol.InferenceErrorMessage, 1),
+			}
+			pr.Traits.Lane = tt.lane
+			provider.AddPending(pr)
+
+			srv.handleComplete(provider.ID, provider, &protocol.InferenceCompleteMessage{
+				Type:      protocol.TypeInferenceComplete,
+				RequestID: reqID,
+				Usage:     protocol.UsageInfo{PromptTokens: tt.promptTokens, CompletionTokens: tt.completionTokens},
+			})
+
+			wantPayout := payments.ProviderPayoutWithPercent(tt.wantCost, nil)
+			if got := st.GetWithdrawableBalance(accountID); got != wantPayout {
+				t.Fatalf("provider payout = %d, want %d (cost %d at the platform's 0%% default fee)", got, wantPayout, tt.wantCost)
+			}
+
+			usageEntries := ledger.Usage(consumerID)
+			if len(usageEntries) == 0 {
+				t.Fatalf("no usage entry recorded for consumer %q", consumerID)
+			}
+			if got := usageEntries[len(usageEntries)-1].CostMicroUSD; got != tt.wantCost {
+				t.Fatalf("usage cost_micro_usd = %d, want %d", got, tt.wantCost)
+			}
+
+			earnings, err := st.GetAccountEarnings(accountID, 10)
+			if err != nil {
+				t.Fatalf("GetAccountEarnings: %v", err)
+			}
+			var earning *store.ProviderEarning
+			for i := range earnings {
+				if earnings[i].JobID == reqID {
+					earning = &earnings[i]
+				}
+			}
+			if earning == nil {
+				t.Fatalf("no provider_earnings row for job %q", reqID)
+			}
+			if earning.AmountMicroUSD != wantPayout {
+				t.Fatalf("provider_earnings amount = %d, want %d", earning.AmountMicroUSD, wantPayout)
+			}
+			if earning.Lane != string(tt.lane) {
+				t.Fatalf("provider_earnings lane = %q, want %q", earning.Lane, string(tt.lane))
+			}
+
+			// The inference_routes outcome update is written off the request
+			// path (submitTelemetry), so poll briefly for it to land.
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				var route *store.InferenceRouteRecord
+				for _, r := range st.InferenceRouteRecordsSince(time.Time{}) {
+					if r.RequestID == reqID {
+						rec := r
+						route = &rec
+						break
+					}
+				}
+				if route != nil && route.FinalStatus != "" {
+					if route.CostMicroUSD != tt.wantCost {
+						t.Fatalf("inference_routes cost_micro_usd = %d, want %d", route.CostMicroUSD, tt.wantCost)
+					}
+					if route.Lane != string(tt.lane) {
+						t.Fatalf("inference_routes lane = %q, want %q", route.Lane, string(tt.lane))
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("inference_routes row for %q did not settle in time", reqID)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
 	}
 }

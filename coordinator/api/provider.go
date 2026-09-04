@@ -2251,11 +2251,20 @@ func (s *Server) handleCompleteAt(
 	if !hasCustom {
 		customIn, customOut, hasCustom = s.store.GetModelPrice("platform", pr.Model)
 	}
+	// Lane multiplier (0.5 for registry.LaneBatch, 1.0 otherwise) applies after
+	// the price resolution above and before the minimum-charge rule
+	// (docs/design/tidal-batch-lane.md §3.5). CalculateCostForLane drops the
+	// per-request minimum entirely for LaneBatch, which is also the invariant
+	// service/wholesale channels already have for every lane (their advertised
+	// pricing is purely per-token — see CalculateCostWithOverridesNoMinimum), so
+	// the two only need reconciling on the service+LaneOnline combination: that
+	// case keeps its existing no-minimum billing untouched.
 	var totalCost int64
-	if isServiceConsumer {
+	switch {
+	case isServiceConsumer && pr.Traits.Lane != registry.LaneBatch:
 		totalCost = payments.CalculateCostWithOverridesNoMinimum(pr.Model, msg.Usage.PromptTokens, msg.Usage.CompletionTokens, customIn, customOut, hasCustom)
-	} else {
-		totalCost = payments.CalculateCostWithOverrides(pr.Model, msg.Usage.PromptTokens, msg.Usage.CompletionTokens, customIn, customOut, hasCustom)
+	default:
+		totalCost = payments.CalculateCostForLane(pr.Model, msg.Usage.PromptTokens, msg.Usage.CompletionTokens, customIn, customOut, hasCustom, pr.Traits.Lane)
 	}
 
 	providerPayout := payments.ProviderPayoutWithPercent(totalCost, feePercent)
@@ -2611,6 +2620,7 @@ func (s *Server) handleCompleteAt(
 						PromptTokens:     msg.Usage.PromptTokens,
 						CompletionTokens: msg.Usage.CompletionTokens,
 						CreatedAt:        time.Now(),
+						Lane:             string(pr.Traits.Lane),
 					}); err != nil {
 						s.logger.Error("failed to credit linked provider account",
 							"provider_id", providerID,
