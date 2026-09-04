@@ -877,6 +877,11 @@ func main() {
 		saferun.Go(logger, "base_rewards_settlement", func() { br.Run(ctx) })
 	}
 
+	// Batch lane: the 1 Hz dispatcher that fills slots the online quality cap is
+	// leaving empty with 24-hour batch work. No-ops unless a sealed batch blob
+	// store is configured. Spawns its own panic-safe loop.
+	startBatchDispatcher(ctx, logger, srv, reg, st)
+
 	// Stripe payout reconciler: heals connected accounts stuck on a legacy
 	// manual payout schedule and alerts on withdrawals stuck in "transferred".
 	// No-op when Stripe Connect isn't configured. Spawns its own panic-safe loop.
