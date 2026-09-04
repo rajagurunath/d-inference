@@ -59,9 +59,26 @@ func seedBatch(t *testing.T, st store.Store, blobs *sealedblob.Store, id string,
 // sealed to its own key.
 func seedBatchKeyed(t *testing.T, st store.Store, blobs *sealedblob.Store, id string, n int, expiresAt time.Time, resultPublicKey string) *store.Batch {
 	t.Helper()
+	return seedBatchWith(t, st, blobs, id, n, expiresAt, resultPublicKey, "")
+}
+
+// seedBatchWith is the full seeder: resultPublicKey selects consumer sealing,
+// apiKeyID is the key the batch was submitted with ("" for a caller that had
+// none).
+func seedBatchWith(
+	t *testing.T,
+	st store.Store,
+	blobs *sealedblob.Store,
+	id string,
+	n int,
+	expiresAt time.Time,
+	resultPublicKey, apiKeyID string,
+) *store.Batch {
+	t.Helper()
 	b := &store.Batch{
 		ID:               id,
 		AccountID:        testAccount,
+		APIKeyID:         apiKeyID,
 		InputFileID:      "file-" + id,
 		Endpoint:         "/v1/chat/completions",
 		CompletionWindow: "24h",
@@ -647,6 +664,46 @@ func waitForCalls(t *testing.T, f *FakeDispatch, n int) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %d dispatch calls (have %d)", n, f.Len())
+}
+
+// TestDispatchCarriesTheBatchesAPIKey: the batch row's submitting key is what
+// the funnel is called with, so the key's AllowedModels and spend cap apply to
+// every item. Before PR3c the dispatcher passed "" and key-level enforcement
+// was silently skipped for all batch traffic.
+func TestDispatchCarriesTheBatchesAPIKey(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, Config{MaxAttempts: 3})
+	idleSlot(h.view, 4)
+	const keyID = "key_submitter"
+	seedBatchWith(t, h.st, h.blobs, "batch_keyed", 1, testStart.Add(24*time.Hour), "", keyID)
+
+	h.tick(t, ctx, testStart)
+	waitForCalls(t, h.dispatch, 1)
+
+	calls := h.dispatch.Calls()
+	if calls[0].APIKeyID != keyID {
+		t.Fatalf("dispatch APIKeyID = %q, want %q — the batch's key was dropped", calls[0].APIKeyID, keyID)
+	}
+	if calls[0].AccountID != testAccount {
+		t.Fatalf("dispatch AccountID = %q, want %q", calls[0].AccountID, testAccount)
+	}
+}
+
+// A batch created by a caller with no API key (Privy JWT session, admin key)
+// dispatches with "" and runs under account-level limits only — the same thing
+// that caller's online requests do.
+func TestDispatchCarriesAnEmptyAPIKeyForKeylessBatches(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, Config{MaxAttempts: 3})
+	idleSlot(h.view, 4)
+	seedBatch(t, h.st, h.blobs, "batch_keyless", 1, testStart.Add(24*time.Hour))
+
+	h.tick(t, ctx, testStart)
+	waitForCalls(t, h.dispatch, 1)
+
+	if got := h.dispatch.Calls()[0].APIKeyID; got != "" {
+		t.Fatalf("dispatch APIKeyID = %q, want \"\"", got)
+	}
 }
 
 // A non-nil error carrying request_failed is the funnel reporting a permanent
