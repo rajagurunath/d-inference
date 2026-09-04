@@ -700,6 +700,12 @@ func buildCoServeReport(in coServeReportInput) testbed.CoServeReport {
 			Value:      fmt.Sprintf("%s / %s (n=%d served)", ms(in.CoServe.P50), ms(in.CoServe.P99), in.CoServe.OK),
 		},
 		{
+			Name:       "online admission",
+			Definition: "HTTP 200 vs 429 on the online arm, baseline then co-serving — a 429 here is the provider refusing on capacity after the coordinator's retries",
+			Value: fmt.Sprintf("online_only %d × 200, %d × 429; coserve %d × 200, %d × 429 (of %d each)",
+				in.OnlineOnly.OK, in.OnlineOnly.Reject, in.CoServe.OK, in.CoServe.Reject, in.OnlineOnly.Total),
+		},
+		{
 			Name:       "online p50 ratio",
 			Definition: "co-serving p50 ÷ online-only p50",
 			Value:      fmt.Sprintf("%.2f×", in.P50Ratio),
@@ -751,7 +757,7 @@ func buildCoServeReport(in coServeReportInput) testbed.CoServeReport {
 			"`online_only` — replay the seeded schedule with nothing else running. This is the baseline every ratio below is taken against, measured in the same session on the same box, never against a historical number.",
 			fmt.Sprintf("`offline_only` — submit a %d-item batch alone, sample `GET /v1/batches/{id}` once a second, and take items/s over the %s window that opens %s in (the first seconds are the dispatcher's AIMD ramp, not steady state). The batch is cancelled once the window closes.", coServeBatchItems, coServeMeasure, coServeWarmup),
 			"`coserve` — the same batch and the same arrival schedule together, measured the same way on both sides.",
-			`flex — the same schedule again with service_tier: "batch" on every synchronous request, counting 200s against 429s.`,
+			"`flex` — the same schedule again with `service_tier: \"batch\"` on every synchronous request, counting 200s against 429s. It runs alone, so its 429s are the batch lane's headroom-only admission refusing on an otherwise quiet stack, not contention with an offline job.",
 			"Earnings come from the store's `provider_earnings` rows, bucketed by their `Lane` column over each phase's wall-clock window and scaled to an hourly rate.",
 		},
 		Gates: []string{
@@ -765,6 +771,8 @@ func buildCoServeReport(in coServeReportInput) testbed.CoServeReport {
 			fmt.Sprintf("**Small n.** The schedule produces %d arrivals per phase, so p99 is effectively the worst observed request rather than a stable tail estimate. The hand-run predecessor of this benchmark (`plans/e2e-batch-run.md` step 7, n=10 per arm) saw the online penalty land anywhere between 1.2× and 1.9× depending on the round; read a single ratio in that spread as consistent with the earlier measurement, not as a tighter result than the sample supports.", len(in.Schedule)),
 			"**Phases are sequential, not simultaneous.** The baseline and the co-serving arm are minutes apart on the same box, so slow drift (thermals, other processes) is inside the ratio.",
 			"**The offline job is cancelled, not drained.** Both batch phases stop once the measurement window closes; the ceiling and the co-serving rate are steady-state rates, not end-to-end completion times for the whole 300 items.",
+			"**The earnings gap is the online minimum charge, not the lane multiplier.** Every request here is about 30 tokens, so its token cost rounds below `minimumChargeMicroUSD` (100 µUSD). An online request is floored up to that minimum; a batch-lane request is explicitly exempt from it and is floored only at 1 µUSD (`coordinator/payments/pricing.go`, `CalculateCostForLane`). The ~100× per-request gap in the earnings rows above is that floor, not the 0.5 `batchDiscount`. On requests large enough to price above the minimum, the ratio is the multiplier.",
+			"**Earnings are bucketed by wall clock, not by phase membership.** A request that starts inside a phase and settles after it lands in the next bucket or none, so the per-phase row counts run a little under the requests each phase issued.",
 		},
 		Metrics: metrics,
 	}
