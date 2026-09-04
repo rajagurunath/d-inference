@@ -1,6 +1,10 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/eigeninference/d-inference/coordinator/registry"
+)
 
 // OpenRouter-formula uptime instrumentation.
 //
@@ -58,6 +62,16 @@ func isOpenRouterScoredDispatchEndpoint(endpoint string) bool {
 
 func (d *dispatchState) recordDispatchedRequestOutcome(attr kvBackendAttribution, class string) {
 	if d == nil || !isOpenRouterScoredDispatchEndpoint(d.consumerEndpoint) {
+		return
+	}
+	// Batch never lands in the OR-uptime series. The metric is the numerator and
+	// denominator of the uptime figure OpenRouter scores the ONLINE endpoint on;
+	// a batch item is placed on leftover headroom, refused outright when there
+	// is none, and runs against a 120s first-content budget, so its successes
+	// would inflate the ratio and its refusals would deflate it — either way
+	// describing traffic no online consumer ever sent. Same exemption as the
+	// reputation, TTFT-calibration and capacity-cooldown sites.
+	if d.lane == registry.LaneBatch {
 		return
 	}
 	d.s.recordRequestOutcome(d.model, attr, class)
