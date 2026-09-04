@@ -137,7 +137,17 @@ type routingSnapshot struct {
 	// slot state the online reservation is scored on. Filled ONLY for a batch-lane
 	// snapshot (traits.Lane == LaneBatch); zero — and unread — otherwise, so the
 	// online hot path pays nothing for it.
-	batchRowsAllowed   int
+	batchRowsAllowed int
+	// batchPendingLoad is p.pendingLoadForModelLocked(model) — the SAME live
+	// occupancy number the online admission cap is compared against
+	// (hasConcurrencyHeadroomForModelCapResolvedLocked), i.e. max(the
+	// coordinator's own pending count for the pair, the slot's last-reported
+	// NumRunning+NumWaiting). It is debited synchronously when a reservation is
+	// taken, so several batch reservations inside a single scan see each other;
+	// backendRunning alone is heartbeat-derived and would let a whole scan's
+	// worth of batch work in against one stale row count. Filled ONLY for a
+	// batch-lane snapshot, like batchRowsAllowed.
+	batchPendingLoad   int
 	maxTokensPotential int64
 	decodeTPS          float64
 	prefillTPS         float64
@@ -1792,6 +1802,7 @@ func (r *Registry) snapshotProviderReasonLockedEx(p *Provider, model string, tra
 	// runs after p.mu has been released). Online snapshots skip it entirely.
 	if traits.Lane == LaneBatch {
 		snap.batchRowsAllowed = r.batchRowsAllowedLocked(p, model)
+		snap.batchPendingLoad = p.pendingLoadForModelLocked(model)
 	}
 	snap.hasBackendCapacity = p.BackendCapacity != nil
 
@@ -2103,18 +2114,31 @@ func (r *Registry) buildCandidateGateLocked(snap routingSnapshot, pr *PendingReq
 	if !snap.hasHeadroom {
 		return nil, rejectCapacity, GateNoHeadroom, false
 	}
-	// Batch lane: headroom-only placement. A batch attempt may occupy a slot
-	// ONLY while nothing is already waiting on it (any lane — a waiting row means
-	// the slot is oversubscribed right now) and its running count is still below
-	// the batch row allowance, which is the router's own quality-concurrency cap
-	// for the pair minus the row reserved for online traffic. Both terms come
-	// from the SAME live snapshot the online reservation is scored on, so batch
-	// can never be admitted against a stale or parallel view of the slot.
+	// Batch lane: headroom-only placement on an already-warm slot. A batch
+	// attempt may occupy a slot ONLY while
+	//
+	//   1. the model is already resident there — batch must never be the reason
+	//      a provider loads weights or evicts another model, and a cold slot
+	//      ("unknown") is otherwise eligible and would trigger exactly that;
+	//   2. nothing is already waiting on it (any lane — a waiting row means the
+	//      slot is oversubscribed right now);
+	//   3. its live occupancy is still below the batch row allowance, which is
+	//      the router's own quality-concurrency cap for the pair minus the row
+	//      reserved for online traffic.
+	//
+	// Occupancy (batchSlotOccupancy) leads with batchPendingLoad, the same
+	// pendingLoadForModelLocked value the online admission cap is enforced
+	// against — NOT backendRunning alone, which only moves on the provider's next
+	// heartbeat and would let an entire scan's worth of batch reservations in
+	// against one stale row count. Every term comes from the SAME locked snapshot
+	// the online reservation is scored on.
 	// Reported as a capacity rejection (transient — the slot reopens as soon as
 	// online traffic drains), with its own gate reason so co-serving telemetry
 	// can tell a closed batch slot apart from a full one.
 	if pr.Traits.Lane == LaneBatch &&
-		(snap.backendWaiting > 0 || snap.backendRunning >= snap.batchRowsAllowed) {
+		(!slotStateModelLoaded(snap.slotState) ||
+			snap.backendWaiting > 0 ||
+			batchSlotOccupancy(snap) >= snap.batchRowsAllowed) {
 		return nil, rejectCapacity, GateBatchHeadroom, false
 	}
 
