@@ -1,6 +1,6 @@
 # Single-Mac dev loop
 
-> Last updated: 2026-09-04 · commit `a0a03dca8`
+> Last updated: 2026-09-04 · commit `e22a7d6ce`
 
 Run a coordinator and one provider on one Mac for manual testing, without
 touching the shared dev environment or writing a throwaway launch script. For

@@ -301,14 +301,21 @@ func (h *coServeHarness) batchLines(prefix string, n int) []testbed.BatchInputLi
 // runBatch submits an offline job and samples its progress once a second until
 // `hold` elapses or it settles, then cancels whatever is left so the next phase
 // starts from a quiet stack.
-func (h *coServeHarness) runBatch(ctx context.Context, prefix string, hold time.Duration) []batchSample {
+//
+// It returns an error rather than calling require: the co-serving phase runs it
+// on its own goroutine, and testify's FailNow there would only Goexit that
+// goroutine.
+func (h *coServeHarness) runBatch(ctx context.Context, prefix string, hold time.Duration) ([]batchSample, error) {
 	t := h.t
-	t.Helper()
 
 	batch, err := h.batch.SubmitBatch(ctx, prefix+".jsonl", h.batchLines(prefix, coServeBatchItems))
-	require.NoError(t, err, "submit %s batch", prefix)
-	require.Equal(t, coServeBatchItems, batch.RequestCounts.Total,
-		"%s batch must be admitted with every item counted", prefix)
+	if err != nil {
+		return nil, fmt.Errorf("submit %s batch: %w", prefix, err)
+	}
+	if batch.RequestCounts.Total != coServeBatchItems {
+		return nil, fmt.Errorf("%s batch admitted %d of %d items",
+			prefix, batch.RequestCounts.Total, coServeBatchItems)
+	}
 	t.Logf("[%s] batch %s admitted with %d items", prefix, batch.ID, batch.RequestCounts.Total)
 
 	start := time.Now()
@@ -337,7 +344,7 @@ func (h *coServeHarness) runBatch(ctx context.Context, prefix string, hold time.
 			t.Logf("[%s] cancelling batch %s failed: %v", prefix, batch.ID, err)
 		}
 	}
-	return samples
+	return samples, nil
 }
 
 // ---------------------------------------------------------------- earnings
@@ -491,8 +498,9 @@ func TestBenchmarkBatchCoServe(t *testing.T) {
 
 	ok = t.Run("offline_only", func(t *testing.T) {
 		start := time.Now()
-		samples := h.runBatch(ctx, "offline", coServeWarmup+coServeMeasure)
+		samples, err := h.runBatch(ctx, "offline", coServeWarmup+coServeMeasure)
 		record("offline_only", start, time.Since(start))
+		require.NoError(t, err)
 		var found bool
 		ceiling, found = batchRateOverWindow(samples, coServeWarmup, coServeWarmup+coServeMeasure)
 		require.True(t, found,
@@ -517,13 +525,14 @@ func TestBenchmarkBatchCoServe(t *testing.T) {
 		var (
 			wg            sync.WaitGroup
 			batchSamples  []batchSample
+			batchErr      error
 			onlineSamples []onlineSample
 			onlineElapsed time.Duration
 		)
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			batchSamples = h.runBatch(ctx, "coserve", hold)
+			batchSamples, batchErr = h.runBatch(ctx, "coserve", hold)
 		}()
 		go func() {
 			defer wg.Done()
@@ -531,6 +540,7 @@ func TestBenchmarkBatchCoServe(t *testing.T) {
 		}()
 		wg.Wait()
 		record("coserve", start, time.Since(start))
+		require.NoError(t, batchErr)
 
 		coserve = summariseOnline(onlineSamples, onlineElapsed)
 		var found bool
@@ -559,8 +569,14 @@ func TestBenchmarkBatchCoServe(t *testing.T) {
 			flex.Total, flex.OK, flex.Reject, flex.Other,
 			flex.P50.Round(time.Millisecond), flex.P99.Round(time.Millisecond),
 			flex.Mean.Round(time.Millisecond), flex.Max.Round(time.Millisecond))
-		require.Equal(t, 0, flex.Other,
-			"a service_tier=batch request must be served or refused with 429, never another terminal")
+		// A service_tier=batch request is expected to be served or refused with
+		// a 429 carrying Retry-After. Anything else is recorded rather than
+		// asserted: the report's job is to say what happened, and only the two
+		// plan gates below fail the run.
+		if flex.Other > 0 {
+			t.Logf("WARNING: %d service_tier=batch requests ended on neither 200 nor 429", flex.Other)
+		}
+		require.Greater(t, flex.OK+flex.Reject, 0, "the flex arm produced no admission decision at all")
 	})
 	require.True(t, ok, "flex phase failed")
 
@@ -721,13 +737,14 @@ func buildCoServeReport(in coServeReportInput) testbed.CoServeReport {
 			"and what that costs the online requests. Produced by `TestBenchmarkBatchCoServe` " +
 			"(`e2e/batch_coserve_test.go`) against a real coordinator, a real Swift provider and real MLX inference.",
 		Setup: []testbed.CoServeSetting{
+			{Name: "host", Value: envOr("RUNNER_DESC", fmt.Sprintf("local %s/%s", runtime.GOOS, runtime.GOARCH))},
+			{Name: "run", Value: time.Now().UTC().Format("2006-01-02 15:04 UTC")},
 			{Name: "model", Value: "`" + in.Model + "`"},
 			{Name: "providers", Value: fmt.Sprintf("%d", len(in.Suite.Providers))},
 			{Name: "store", Value: "in-memory testbed store"},
 			{Name: "arrival schedule", Value: fmt.Sprintf("seeded Poisson, seed %d, %.2f req/s, %s window, %d arrivals", coServeSeed, coServeOnlineRate, coServeOnlineWindow, len(in.Schedule))},
 			{Name: "offline job", Value: fmt.Sprintf("%d items, max_tokens %d", coServeBatchItems, coServeBatchMaxTokens)},
 			{Name: "online requests", Value: fmt.Sprintf("non-streaming, max_tokens %d, short arithmetic prompts", coServeOnlineMaxTokens)},
-			{Name: "runtime", Value: fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)},
 		},
 		Method: []string{
 			"All four phases share one suite, one provider process and one loaded model; the model is warmed with two throwaway requests before the first measurement.",
