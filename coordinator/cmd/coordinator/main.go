@@ -891,6 +891,11 @@ func main() {
 	// Batch lane: the 1 Hz dispatcher that fills slots the online quality cap is
 	// leaving empty with 24-hour batch work. No-ops unless a sealed batch blob
 	// store is configured. Spawns its own panic-safe loop.
+	//
+	// Like the other loops here, shutdown is fire-and-forget: cancelling ctx
+	// makes the dispatcher cancel every in-flight item, but nothing joins its
+	// drain. Items still inflight in the store when the process exits are
+	// returned to pending by the next process's restart recovery.
 	startBatchDispatcher(ctx, logger, srv, reg, st)
 
 	// Stripe payout reconciler: heals connected accounts stuck on a legacy

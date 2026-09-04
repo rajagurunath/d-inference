@@ -1,34 +1,42 @@
-package batchlane
-
-// fakes.go holds the test doubles for the dispatcher: a mutable registry view
-// and a scriptable dispatch funnel. They live in the non-test build so a future
-// e2e harness (PR5) can drive the dispatcher without a provider fleet.
+// Package batchlanetest holds the test doubles for the batch dispatcher: a
+// mutable registry view, a scriptable dispatch funnel and a recording finalize
+// hook.
+//
+// They live in their own package rather than in batchlane so the production
+// build of batchlane carries no fakes, while PR5's co-serving benchmark — which
+// drives the dispatcher without a provider fleet — can still import them. That
+// is also why batchlane's own dispatcher tests are an external test package
+// (batchlane_test): an in-package test file may not import a package that
+// imports batchlane.
+package batchlanetest
 
 import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/eigeninference/d-inference/coordinator/batchlane"
 )
 
 // FakeView is a RegistryView whose signals the test sets directly. Safe for
 // concurrent use so a test can move a slot under a running dispatcher.
 type FakeView struct {
 	mu    sync.Mutex
-	slots map[SlotKey]SlotSignal
+	slots map[batchlane.SlotKey]batchlane.SlotSignal
 }
 
 // NewFakeView returns an empty view.
-func NewFakeView() *FakeView { return &FakeView{slots: map[SlotKey]SlotSignal{}} }
+func NewFakeView() *FakeView { return &FakeView{slots: map[batchlane.SlotKey]batchlane.SlotSignal{}} }
 
 // Set installs (or replaces) one slot's signal.
-func (v *FakeView) Set(key SlotKey, sig SlotSignal) {
+func (v *FakeView) Set(key batchlane.SlotKey, sig batchlane.SlotSignal) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.slots[key] = sig
 }
 
 // Update applies fn to one slot's signal in place.
-func (v *FakeView) Update(key SlotKey, fn func(*SlotSignal)) {
+func (v *FakeView) Update(key batchlane.SlotKey, fn func(*batchlane.SlotSignal)) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	sig := v.slots[key]
@@ -37,17 +45,17 @@ func (v *FakeView) Update(key SlotKey, fn func(*SlotSignal)) {
 }
 
 // Remove drops a slot, as if the provider disconnected.
-func (v *FakeView) Remove(key SlotKey) {
+func (v *FakeView) Remove(key batchlane.SlotKey) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	delete(v.slots, key)
 }
 
 // Slots implements RegistryView.
-func (v *FakeView) Slots(string) map[SlotKey]SlotSignal {
+func (v *FakeView) Slots(string) map[batchlane.SlotKey]batchlane.SlotSignal {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	out := make(map[SlotKey]SlotSignal, len(v.slots))
+	out := make(map[batchlane.SlotKey]batchlane.SlotSignal, len(v.slots))
 	for k, s := range v.slots {
 		out[k] = s
 	}
@@ -72,15 +80,15 @@ type FakeDispatch struct {
 	calls []DispatchCall
 	// Respond returns the outcome for call n (zero-based). Nil means a bare
 	// success.
-	Respond func(n int, model string, body []byte) (Outcome, error)
+	Respond func(n int, model string, body []byte) (batchlane.Outcome, error)
 	// Block, when non-nil, is waited on inside every call before it returns, so
 	// a test can hold an item in flight while it cancels the batch.
 	Block chan struct{}
 }
 
-// Fn returns the DispatchFn to hand to New.
-func (f *FakeDispatch) Fn() DispatchFn {
-	return func(ctx context.Context, accountID, apiKeyID, model string, body []byte) (Outcome, error) {
+// Fn returns the batchlane.DispatchFn to hand to batchlane.New.
+func (f *FakeDispatch) Fn() batchlane.DispatchFn {
+	return func(ctx context.Context, accountID, apiKeyID, model string, body []byte) (batchlane.Outcome, error) {
 		f.mu.Lock()
 		n := len(f.calls)
 		f.calls = append(f.calls, DispatchCall{
@@ -98,14 +106,14 @@ func (f *FakeDispatch) Fn() DispatchFn {
 			case <-ctx.Done():
 				// The dispatch funnel reports a cancelled attempt rather than a
 				// failure, so the dispatcher does not charge it an attempt.
-				return Outcome{ErrCode: ErrCodeCancelled}, nil
+				return batchlane.Outcome{ErrCode: batchlane.ErrCodeCancelled}, nil
 			}
 		}
 		if ctx.Err() != nil {
-			return Outcome{ErrCode: ErrCodeCancelled}, nil
+			return batchlane.Outcome{ErrCode: batchlane.ErrCodeCancelled}, nil
 		}
 		if respond == nil {
-			return Outcome{ResponseBody: []byte(`{"ok":true}`)}, nil
+			return batchlane.Outcome{ResponseBody: []byte(`{"ok":true}`)}, nil
 		}
 		return respond(n, model, body)
 	}
@@ -134,7 +142,7 @@ type FakeFinalize struct {
 	Err error
 }
 
-// Fn returns the finalize hook to hand to New.
+// Fn returns the finalize hook to hand to batchlane.New.
 func (f *FakeFinalize) Fn() func(batchID string, now time.Time) error {
 	return func(batchID string, _ time.Time) error {
 		f.mu.Lock()
