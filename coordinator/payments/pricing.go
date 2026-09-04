@@ -137,6 +137,14 @@ func LaneMultiplier(lane registry.Lane) float64 {
 	return 1.0
 }
 
+// BatchPricePerMillion returns the batch-lane advertised price for a list
+// (online) price in micro-USD per 1M tokens: the same BatchDiscount the
+// settlement path applies, so /v1/pricing cannot advertise a rate the meter
+// does not charge. Truncates to whole micro-USD like the settlement path.
+func BatchPricePerMillion(listPricePerMillion int64) int64 {
+	return int64(float64(listPricePerMillion) * BatchDiscount)
+}
+
 // scaledComponentCost applies the lane multiplier to a token*rate product
 // before the per-million integer division — "the multiplier is applied after
 // override resolution, before rounding" (docs/design/tidal-batch-lane.md

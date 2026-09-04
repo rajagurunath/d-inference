@@ -339,32 +339,53 @@ func (s *Server) handleReferralInfo(w http.ResponseWriter, r *http.Request) {
 // DB overrides (set via admin endpoint).
 func (s *Server) handleGetPricing(w http.ResponseWriter, r *http.Request) {
 	type priceEntry struct {
-		Model       string `json:"model"`
-		InputPrice  int64  `json:"input_price"`  // micro-USD per 1M tokens
-		OutputPrice int64  `json:"output_price"` // micro-USD per 1M tokens
-		InputUSD    string `json:"input_usd"`
-		OutputUSD   string `json:"output_usd"`
+		Model            string `json:"model"`
+		InputPrice       int64  `json:"input_price"`  // micro-USD per 1M tokens
+		OutputPrice      int64  `json:"output_price"` // micro-USD per 1M tokens
+		InputUSD         string `json:"input_usd"`
+		OutputUSD        string `json:"output_usd"`
+		BatchInputPrice  int64  `json:"batch_input_price"`  // micro-USD per 1M tokens, batch lane
+		BatchOutputPrice int64  `json:"batch_output_price"` // micro-USD per 1M tokens, batch lane
+		BatchInputUSD    string `json:"batch_input_usd"`
+		BatchOutputUSD   string `json:"batch_output_usd"`
 	}
 
 	// All model prices come from the database (set via PUT /v1/admin/pricing).
+	// Batch-lane prices are the same list prices scaled by the batch discount
+	// (docs/design/tidal-batch-lane.md §3.5) — they are never stored or set
+	// separately, so they cannot drift from the online price.
 	platformPrices := s.store.ListModelPrices("platform")
 	prices := make([]priceEntry, 0, len(platformPrices))
 	for _, mp := range platformPrices {
+		batchIn := payments.BatchPricePerMillion(mp.InputPrice)
+		batchOut := payments.BatchPricePerMillion(mp.OutputPrice)
 		prices = append(prices, priceEntry{
-			Model:       mp.Model,
-			InputPrice:  mp.InputPrice,
-			OutputPrice: mp.OutputPrice,
-			InputUSD:    fmt.Sprintf("$%.4f", float64(mp.InputPrice)/1_000_000),
-			OutputUSD:   fmt.Sprintf("$%.4f", float64(mp.OutputPrice)/1_000_000),
+			Model:            mp.Model,
+			InputPrice:       mp.InputPrice,
+			OutputPrice:      mp.OutputPrice,
+			InputUSD:         fmt.Sprintf("$%.4f", float64(mp.InputPrice)/1_000_000),
+			OutputUSD:        fmt.Sprintf("$%.4f", float64(mp.OutputPrice)/1_000_000),
+			BatchInputPrice:  batchIn,
+			BatchOutputPrice: batchOut,
+			BatchInputUSD:    fmt.Sprintf("$%.4f", float64(batchIn)/1_000_000),
+			BatchOutputUSD:   fmt.Sprintf("$%.4f", float64(batchOut)/1_000_000),
 		})
 	}
 
+	fallbackBatchIn := payments.BatchPricePerMillion(payments.DefaultInputPricePerMillion)
+	fallbackBatchOut := payments.BatchPricePerMillion(payments.DefaultOutputPricePerMillion)
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"prices":                prices,
-		"fallback_input_price":  payments.DefaultInputPricePerMillion,
-		"fallback_output_price": payments.DefaultOutputPricePerMillion,
-		"fallback_input_usd":    fmt.Sprintf("$%.4f", float64(payments.DefaultInputPricePerMillion)/1_000_000),
-		"fallback_output_usd":   fmt.Sprintf("$%.4f", float64(payments.DefaultOutputPricePerMillion)/1_000_000),
+		"prices":                      prices,
+		"fallback_input_price":        payments.DefaultInputPricePerMillion,
+		"fallback_output_price":       payments.DefaultOutputPricePerMillion,
+		"fallback_input_usd":          fmt.Sprintf("$%.4f", float64(payments.DefaultInputPricePerMillion)/1_000_000),
+		"fallback_output_usd":         fmt.Sprintf("$%.4f", float64(payments.DefaultOutputPricePerMillion)/1_000_000),
+		"batch_discount":              payments.BatchDiscount,
+		"fallback_batch_input_price":  fallbackBatchIn,
+		"fallback_batch_output_price": fallbackBatchOut,
+		"fallback_batch_input_usd":    fmt.Sprintf("$%.4f", float64(fallbackBatchIn)/1_000_000),
+		"fallback_batch_output_usd":   fmt.Sprintf("$%.4f", float64(fallbackBatchOut)/1_000_000),
 	})
 }
 
