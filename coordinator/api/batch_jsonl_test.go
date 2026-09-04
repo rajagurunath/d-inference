@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -159,6 +160,108 @@ func TestParseBatchJSONLRejectsNonTextContentParts(t *testing.T) {
 	be := batchErrorFrom(t, err)
 	if be.Code != "unsupported_content" {
 		t.Fatalf("code = %q, want unsupported_content", be.Code)
+	}
+}
+
+// TestBatchValidationErrorsNeverEchoConsumerStrings pins the privacy contract
+// stated at the top of batch_jsonl.go: a rejection identifies a line number and
+// a field name and nothing else. An error body travels back through whatever
+// proxies and log pipelines sit in front of the coordinator, so a rejected
+// model name, endpoint, custom_id, or content part type must not ride along.
+// Every case below feeds a marker string no rejection may quote back.
+func TestBatchValidationErrorsNeverEchoConsumerStrings(t *testing.T) {
+	const marker = "leaky-consumer-string"
+
+	cases := []struct {
+		name     string
+		wantCode string
+		parse    func() error
+	}{
+		{
+			name:     "unknown model on a file line",
+			wantCode: "model_not_found",
+			parse: func() error {
+				line := `{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"` + marker + `"}}`
+				_, err := parseBatchJSONL(strings.NewReader(line), "/v1/chat/completions", maxFileLines, rejectAllResolver)
+				return err
+			},
+		},
+		{
+			name:     "unsupported batch endpoint",
+			wantCode: "invalid_endpoint",
+			parse: func() error {
+				_, err := parseBatchJSONL(strings.NewReader("{}"), "/v1/"+marker, maxFileLines, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "line url that does not match the batch endpoint",
+			wantCode: "invalid_line",
+			parse: func() error {
+				line := `{"custom_id":"a","method":"POST","url":"/v1/completions","body":{"model":"m"}}`
+				_, err := parseBatchJSONL(strings.NewReader(line), "/v1/chat/completions", maxFileLines, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "url that is not a batch endpoint at all",
+			wantCode: "invalid_endpoint",
+			parse: func() error {
+				line := `{"custom_id":"a","method":"POST","url":"/v1/` + marker + `","body":{"model":"m"}}`
+				_, err := parseBatchJSONL(strings.NewReader(line), "", maxFileLines, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "malformed custom_id",
+			wantCode: "invalid_custom_id",
+			parse: func() error {
+				line := `{"custom_id":"` + marker + `!!","method":"POST","url":"/v1/chat/completions","body":{"model":"m"}}`
+				_, err := parseBatchJSONL(strings.NewReader(line), "/v1/chat/completions", maxFileLines, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "non-text content part",
+			wantCode: "unsupported_content",
+			parse: func() error {
+				line := `{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[{"role":"user","content":[{"type":"` + marker + `"}]}]}}`
+				_, err := parseBatchJSONL(strings.NewReader(line), "/v1/chat/completions", maxFileLines, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "unsupported endpoint on the inline path",
+			wantCode: "invalid_endpoint",
+			parse: func() error {
+				_, err := parseInlineRequests(nil, "/v1/"+marker, "m", maxInlineRequests, passthroughResolver)
+				return err
+			},
+		},
+		{
+			name:     "unknown model on the inline path",
+			wantCode: "model_not_found",
+			parse: func() error {
+				reqs := []inlineRequest{{CustomID: "a", Body: json.RawMessage(`{"model":"` + marker + `"}`)}}
+				_, err := parseInlineRequests(reqs, "/v1/chat/completions", marker, maxInlineRequests, rejectAllResolver)
+				return err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			be := batchErrorFrom(t, tc.parse())
+			if be.Code != tc.wantCode {
+				t.Fatalf("code = %q, want %q", be.Code, tc.wantCode)
+			}
+			if strings.Contains(be.Message, marker) {
+				t.Fatalf("error message echoes a consumer string: %q", be.Message)
+			}
+			if strings.Contains(be.Param, marker) {
+				t.Fatalf("error param echoes a consumer string: %q", be.Param)
+			}
+		})
 	}
 }
 

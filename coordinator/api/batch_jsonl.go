@@ -9,9 +9,10 @@ package api
 // downstream — blob sealing, dispatch, output assembly — sees only []parsedItem.
 //
 // Privacy: no error produced here quotes a custom_id, a metadata key or value,
-// a filename, a requested model, an endpoint, or any body bytes. Failures
-// identify a line number and a field name, which is enough for a consumer to
-// fix the input and carries nothing a log line could not already hold.
+// a filename, a requested model, an endpoint, a content part type, or any body
+// bytes. Failures identify a line number and a field name, which is enough for
+// a consumer to fix the input and carries nothing a log line could not already
+// hold.
 
 import (
 	"bufio"
@@ -349,7 +350,8 @@ func validateBatchBody(body json.RawMessage, defaultModel string, lineNo int, re
 // validateTextOnlyContent rejects image, audio, video, and file content parts.
 // A batch item may wait hours before it is dispatched; a media reference that
 // was live at submission time is not guaranteed to be live at dispatch, and the
-// batch lane deliberately does not run the media resolver.
+// batch lane deliberately does not run the media resolver. The offending part
+// type is a consumer string and is never echoed into the error.
 func validateTextOnlyContent(parsed map[string]any, lineNo int) error {
 	messages, ok := parsed["messages"].([]any)
 	if !ok {
@@ -372,7 +374,7 @@ func validateTextOnlyContent(parsed map[string]any, lineNo int) error {
 			kind, _ := part["type"].(string)
 			if !textContentPartTypes[kind] {
 				return batchErr("unsupported_content", "messages",
-					"line %d: content part type %q is not supported in batch — text only", lineNo, kind)
+					"line %d: only text content parts are supported in batch", lineNo)
 			}
 		}
 	}
