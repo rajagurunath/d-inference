@@ -1,0 +1,12 @@
+graph TD
+  ON["POST /v1/chat/completions"] --> PRE["parseInferencePrelude / resolveRequestLane"]
+  BD["batchlane dispatcher 1 Hz: claim then DispatchBatchItem"] --> PRE
+  PRE -->|"Lane = online"| RO["reserve: any eligible slot"]
+  PRE -->|"service_tier=batch or internal ctx lane"| RB["reserve: headroom only. model resident, NumWaiting == 0, load below BatchRowsAllowed"]
+  RO -->|"no slot"| Q["wait queue, then hedge"]
+  RB -->|"no slot"| NC["429 Retry-After 5, code no_capacity"]
+  RO --> DIS["dispatchWithReserver to provider"]
+  RB --> DIS
+  DIS --> SET["settle"]
+  SET -->|"online"| FB["reputation, TTFT calibration, cooldowns, OR-uptime"]
+  SET -->|"batch"| SK["all feedback paths skipped"]

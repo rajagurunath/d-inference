@@ -1,8 +1,15 @@
 # Tidal batch lane: co-serving online and batch traffic on the idle fleet
 
-> Last updated: 2026-09-04 · commit `676793b51`
+> Last updated: 2026-09-04 · commit `a0a03dca8`
 
-**Status: Proposed** — 2026-09-05; evidence: fleet utilization of 12–19% and a
+**Status: In progress** — 2026-09-05. The store, the sealed blob store, the
+Batch API, the lane trait and reservation filter, the 1 Hz dispatcher and the
+half-price metering have landed; the co-serving benchmark has not. As-built
+description:
+[`../architecture/batch-lane.md`](../architecture/batch-lane.md); consumer
+how-to: [`../consumer/batch-api.md`](../consumer/batch-api.md).
+
+Original status: **Proposed** — 2026-09-05; evidence: fleet utilization of 12–19% and a
 99.94% free token budget recorded in [`routing-v2.md`](routing-v2.md), and the
 `base-rewards.md` observation that a 64 GB Mac needs ~35% sustained batched
 utilization to earn its own floor from real traffic.

@@ -1,6 +1,6 @@
 # Darkbloom documentation
 
-> Last updated: 2026-09-04 · commit `da6db27f2`
+> Last updated: 2026-09-04 · commit `a0a03dca8`
 
 > Darkbloom is a decentralized private-inference network: an OpenAI- and
 > Anthropic-compatible HTTP API served by a Go coordinator that routes each
@@ -35,6 +35,7 @@
 - [`architecture/routing.md`](architecture/routing.md): how a request becomes a provider choice — eligibility gates, cost model, selection, hedged dispatch, breakers.
 - [`architecture/scheduling.md`](architecture/scheduling.md): per-model queues, slot states, token-budget admission, model swaps, warm pool, heartbeat and eviction.
 - [`architecture/cache-aware-routing.md`](architecture/cache-aware-routing.md): provider-confirmed exact prefix-cache routing and its kill switch.
+- [`architecture/batch-lane.md`](architecture/batch-lane.md): the 24-hour batch lane — headroom-only placement, the 1 Hz AIMD/laxity dispatcher, the feedback paths batch is kept out of, and sealed-at-rest storage.
 - [`architecture/inference.md`](architecture/inference.md): the CBv2 engine — request lifecycle and `CBv2RequestTiming`, scheduler and lease defaults, deadlines, MTP, sampling, tool parsers, vision constraints, supported families.
 - [`architecture/prefix-cache.md`](architecture/prefix-cache.md): KV layouts (contiguous default, paged), block hashing, the prefix-reuse plan per model family, RAM staging plus the encrypted SSD tier, and why a default box builds no SSD cache.
 - [`architecture/prompt-contract-sidecar.md`](architecture/prompt-contract-sidecar.md): the Rust sidecar that derives token boundaries for cache routing, and its failure isolation.
@@ -75,6 +76,7 @@
 - [`consumer/quickstart.md`](consumer/quickstart.md): first request, streaming, SDK base-URL swap.
 - [`consumer/authentication.md`](consumer/authentication.md): create and manage API keys, sign in with Privy, run the device-code flow for the CLI; auth failures and fixes.
 - [`consumer/models.md`](consumer/models.md): the model catalog, aliases, capabilities, and how to query it.
+- [`consumer/batch-api.md`](consumer/batch-api.md): run a 24-hour batch — upload, create, poll, download; the inline form; `service_tier: "batch"`; optional result sealing; limits.
 - [`consumer/billing.md`](consumer/billing.md): funding a balance, reading usage, what a 402 means.
 - [`consumer/verification.md`](consumer/verification.md): verify the provider that served you.
 - [`consumer/privacy-expectations.md`](consumer/privacy-expectations.md): what a consumer can and cannot assume, in plain terms.
