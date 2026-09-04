@@ -184,6 +184,11 @@ type InferenceRouteRecord struct {
 	AdmittedButFailed      bool    `json:"admitted_but_failed"`
 	UsedBackup             bool    `json:"used_backup"`
 	BackupWon              bool    `json:"backup_won"`
+	// Lane is the service class the request routed on: "" (registry.LaneOnline)
+	// for ordinary traffic, "batch" (registry.LaneBatch) for the discounted,
+	// headroom-only batch lane (docs/design/tidal-batch-lane.md §3.5). Written
+	// at settlement so earnings can be reported by lane.
+	Lane string `json:"lane,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -202,6 +207,10 @@ type InferenceRouteOutcome struct {
 	ActualTTFTMs           float64 `json:"actual_ttft_ms"`
 	DispatchToFirstChunkMs float64 `json:"dispatch_to_first_chunk_ms"`
 	TotalDurationMs        float64 `json:"total_duration_ms"`
+	// Lane is the service class the request routed on (registry.Lane as a
+	// plain string; "" for LaneOnline, "batch" for LaneBatch). Stamped at
+	// settlement alongside CostMicroUSD.
+	Lane string `json:"lane,omitempty"`
 
 	// Coordinator-side latency decomposition (ms). Zero = not measured.
 	ParseMs     float64 `json:"parse_ms"`
@@ -804,6 +813,10 @@ type ProviderEarning struct {
 	PromptTokens     int       `json:"prompt_tokens"`
 	CompletionTokens int       `json:"completion_tokens"`
 	CreatedAt        time.Time `json:"created_at"`
+	// Lane is the service class the earning came from ("" for the ordinary
+	// online lane, "batch" for the discounted batch lane), so earnings can be
+	// reported by lane (docs/design/tidal-batch-lane.md §3.5).
+	Lane string `json:"lane,omitempty"`
 }
 
 // ProviderFloorDraw is one epoch's base-reward settlement for one machine.
