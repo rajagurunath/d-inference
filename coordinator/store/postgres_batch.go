@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -171,8 +172,14 @@ func (s *PostgresStore) ListPurgeableFiles(before time.Time) ([]*BatchFile, erro
 
 // --- BatchStore ---
 
+// batchItemInsertColumns is the column list CreateBatch's CopyFrom writes, in
+// the order its row source produces them.
+var batchItemInsertColumns = []string{"id", "batch_id", "custom_id", "line_no", "state", "blob_ref"}
+
 // CreateBatch writes the batch and all of its items in one transaction, so a
-// concurrent claim never sees a half-written batch.
+// concurrent claim never sees a half-written batch. Items are loaded with
+// CopyFrom rather than one INSERT per item, and the context timeout scales
+// with the item count, so a large batch does not time out.
 func (s *PostgresStore) CreateBatch(b *Batch, items []*BatchItem) error {
 	if b == nil {
 		return errors.New("store: batch is required")
@@ -180,8 +187,17 @@ func (s *PostgresStore) CreateBatch(b *Batch, items []*BatchItem) error {
 	if b.ID == "" {
 		return errors.New("store: batch id is required")
 	}
+	for _, it := range items {
+		if it == nil || it.ID == "" {
+			return errors.New("store: batch item id is required")
+		}
+	}
+	if err := checkDuplicateCustomIDs(items); err != nil {
+		return err
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	timeout := 30*time.Second + time.Duration(len(items))*time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	metadata, err := marshalBatchMetadata(b.Metadata)
@@ -209,16 +225,17 @@ func (s *PostgresStore) CreateBatch(b *Batch, items []*BatchItem) error {
 		return fmt.Errorf("store: insert batch %q: %w", b.ID, err)
 	}
 
-	for _, it := range items {
-		if it == nil || it.ID == "" {
-			return errors.New("store: batch item id is required")
+	if len(items) > 0 {
+		rows := pgx.CopyFromSlice(len(items), func(i int) ([]any, error) {
+			it := items[i]
+			return []any{it.ID, b.ID, it.CustomID, it.LineNo, string(ItemPending), it.BlobRef}, nil
+		})
+		n, err := tx.CopyFrom(ctx, pgx.Identifier{"batch_items"}, batchItemInsertColumns, rows)
+		if err != nil {
+			return fmt.Errorf("store: insert batch items for %q: %w", b.ID, err)
 		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO batch_items (id, batch_id, custom_id, line_no, state, blob_ref)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			it.ID, b.ID, it.CustomID, it.LineNo, ItemPending, it.BlobRef,
-		); err != nil {
-			return fmt.Errorf("store: insert batch item %q: %w", it.ID, err)
+		if n != int64(len(items)) {
+			return fmt.Errorf("store: insert batch items for %q: copied %d of %d rows", b.ID, n, len(items))
 		}
 	}
 
@@ -243,7 +260,10 @@ func (s *PostgresStore) GetBatch(accountID, id string) (*Batch, bool) {
 
 // ListBatches returns an account's batches newest first. The cursor is
 // (created_at, id) of the batch named by after, so a page boundary is stable
-// even when two batches share a timestamp.
+// even when two batches share a timestamp. after is resolved scoped to
+// accountID; an after that does not name one of the account's batches (wrong
+// account, or an id that no longer exists) is ignored, returning the first
+// page rather than an empty one.
 func (s *PostgresStore) ListBatches(accountID string, limit int, after string) ([]*Batch, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -255,8 +275,19 @@ func (s *PostgresStore) ListBatches(accountID string, limit int, after string) (
 	query := `SELECT ` + batchColumns + ` FROM batches WHERE account_id = $1`
 	args := []any{accountID}
 	if after != "" {
-		query += ` AND (created_at, id) < (SELECT created_at, id FROM batches WHERE id = $2)`
-		args = append(args, after)
+		var anchorCreatedAt time.Time
+		err := s.pool.QueryRow(ctx,
+			`SELECT created_at FROM batches WHERE id = $1 AND account_id = $2`, after, accountID,
+		).Scan(&anchorCreatedAt)
+		switch {
+		case err == nil:
+			query += ` AND (created_at, id) < ($2, $3)`
+			args = append(args, anchorCreatedAt, after)
+		case errors.Is(err, pgx.ErrNoRows):
+			// Unknown cursor: fall through and return the first page.
+		default:
+			return nil, fmt.Errorf("store: resolve list batches cursor: %w", err)
+		}
 	}
 	query += ` ORDER BY created_at DESC, id DESC LIMIT $` + fmt.Sprint(len(args)+1)
 	args = append(args, limit)
@@ -302,7 +333,7 @@ func (s *PostgresStore) SetBatchStatus(id string, from, to BatchStatus, at time.
 
 // AttachOutputFiles records the assembled result files. The NULL guard on both
 // columns is what makes it first-writer-wins.
-func (s *PostgresStore) AttachOutputFiles(id string, outputFileID, errorFileID *string, at time.Time) (bool, error) {
+func (s *PostgresStore) AttachOutputFiles(id string, outputFileID, errorFileID *string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -344,8 +375,10 @@ func (s *PostgresStore) ListOpenBatches() ([]*Batch, error) {
 	return out, nil
 }
 
-// CompletionRate counts items that finished in [now-window, now] across every
-// batch and divides by the window.
+// CompletionRate counts items that succeeded or failed in [now-window, now]
+// across every batch and divides by the window. Expired and cancelled items
+// also carry finished_at but never dispatched to completion, so they are
+// excluded.
 func (s *PostgresStore) CompletionRate(window time.Duration, now time.Time) (float64, bool) {
 	if window <= 0 {
 		return 0, false
@@ -357,9 +390,14 @@ func (s *PostgresStore) CompletionRate(window time.Duration, now time.Time) (flo
 	var finished int
 	err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM batch_items
-		 WHERE finished_at >= $1 AND finished_at <= $2`, now.Add(-window), now,
+		 WHERE finished_at >= $1 AND finished_at <= $2
+		   AND state IN ('succeeded', 'failed')`, now.Add(-window), now,
 	).Scan(&finished)
-	if err != nil || finished == 0 {
+	if err != nil {
+		slog.Error("store: completion rate query failed", "error", err)
+		return 0, false
+	}
+	if finished == 0 {
 		return 0, false
 	}
 	return float64(finished) / window.Seconds(), true
