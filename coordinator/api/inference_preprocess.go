@@ -86,11 +86,28 @@ type inferencePrelude struct {
 	lane registry.Lane
 }
 
+// serviceTierBatch is the OpenAI `service_tier` value that opts a SYNCHRONOUS
+// request into the batch lane. It is how a consumer that paces its own batch
+// work — OpenRouter's beta Batch API has no provider-side batch contract and
+// sends ordinary synchronous calls — reaches the discounted lane
+// (docs/design/tidal-batch-lane.md §3.6): headroom slots only, no queue, no
+// hedge, batch price, and a 429 with Retry-After when no slot has headroom.
+const serviceTierBatch = "batch"
+
 // resolveRequestLane decides which lane a parsed inference request routes on.
-// A coordinator-stamped context lane (DispatchBatchItem) is authoritative.
+//
+// A coordinator-stamped context lane (DispatchBatchItem) is authoritative — it
+// is set by trusted internal code, not by the caller. Otherwise the body's
+// `service_tier` decides: exactly "batch" selects the batch lane, and EVERY
+// other value — including OpenAI's own "auto", "default", "flex", "priority",
+// and any non-string — is ignored rather than rejected, so an OpenAI SDK that
+// always sets the field keeps working unchanged.
 func resolveRequestLane(ctx context.Context, parsed map[string]any) registry.Lane {
 	if lane := laneFromContext(ctx); lane != registry.LaneOnline {
 		return lane
+	}
+	if tier, ok := parsed["service_tier"].(string); ok && tier == serviceTierBatch {
+		return registry.LaneBatch
 	}
 	return registry.LaneOnline
 }
