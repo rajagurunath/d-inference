@@ -34,8 +34,11 @@ type tcpListener struct {
 	baseURL string
 }
 
-func netListen() (*tcpListener, error) {
-	inner, err := net.Listen("tcp", "127.0.0.1:0")
+func netListen(addr string) (*tcpListener, error) {
+	if addr == "" {
+		addr = "127.0.0.1:0"
+	}
+	inner, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -82,6 +85,10 @@ type Coordinator struct {
 	Registry *registry.Registry
 	baseURL  string
 	port     int
+	// ListenAddr pins the HTTP listener to a fixed address; empty keeps the
+	// ephemeral 127.0.0.1:0 default. Set from SuiteConfig.ListenAddr before
+	// Start.
+	ListenAddr string
 
 	httpServer *http.Server
 	cancel     context.CancelFunc
@@ -301,8 +308,9 @@ func (s *Suite) startCoordinator() error {
 	reg.SetQueue(registry.NewRequestQueue(s.Config.QueueCapacity, s.Config.QueueTimeout))
 
 	s.Coordinator = &Coordinator{
-		Server:   srv,
-		Registry: reg,
+		Server:     srv,
+		Registry:   reg,
+		ListenAddr: s.Config.ListenAddr,
 	}
 
 	return s.Coordinator.Start(s.Ctx, s.Logger)
@@ -613,7 +621,7 @@ func (s *Suite) ReportedPrivacyCapabilities(providerID string) (*protocol.Privac
 }
 
 func (c *Coordinator) Start(ctx context.Context, logger *slog.Logger) error {
-	listener, err := netListen()
+	listener, err := netListen(c.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
@@ -784,6 +792,14 @@ func (p *Provider) Running() bool {
 	default:
 		return true
 	}
+}
+
+// PID returns the provider child process's PID, or 0 when it is not running.
+func (p *Provider) PID() int {
+	if p.cmd == nil {
+		return 0
+	}
+	return p.cmd.Pid
 }
 
 // DaemonStatePath returns the isolated provider state snapshot path.

@@ -52,6 +52,7 @@ import (
 	"github.com/eigeninference/d-inference/coordinator/registry"
 	"github.com/eigeninference/d-inference/coordinator/saferun"
 	"github.com/eigeninference/d-inference/coordinator/store"
+	"github.com/eigeninference/d-inference/coordinator/store/sealedblob"
 	"github.com/eigeninference/d-inference/coordinator/telemetry"
 	"golang.org/x/mod/semver"
 	"golang.org/x/sync/singleflight"
@@ -420,6 +421,11 @@ type Server struct {
 	// requests from senders. Set via SetCoordinatorKey. nil disables the
 	// /v1/encryption-key endpoint and the sealed-request middleware.
 	coordinatorKey *e2e.CoordinatorKey
+
+	// batchBlobs is the sealed-at-rest blob store the batch lane keeps request
+	// bodies and results in. Set once at start-up via SetBatchBlobStore; nil
+	// makes every /v1/files and /v1/batches route answer 503 batch_unavailable.
+	batchBlobs *sealedblob.Store
 
 	// chunkKeys memoizes the per-request NaCl shared key so streaming chunk
 	// decryption skips the X25519 scalar multiplication per token. Zero value
@@ -2786,6 +2792,21 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/completions", s.drainGate(s.requireAuth(s.rateLimitConsumer(s.sealedTransport(s.handleCompletions)))))
 	s.mux.HandleFunc("POST /v1/messages", s.drainGate(s.requireAuth(s.rateLimitConsumer(s.sealedTransport(s.handleAnthropicMessages)))))
 	s.mux.HandleFunc("GET /v1/models", s.requireAuth(s.handleListModels))
+
+	// Batch lane — the OpenAI Batch API plus the OpenRouter inline form
+	// (docs/design/tidal-batch-lane.md §3.6). The two mutating routes carry the
+	// same chain as the inference routes: drainGate outermost so a draining
+	// coordinator stops accepting new work, then auth, then the consumer
+	// limiter, then sealedTransport so an upload or an inline batch can be
+	// sealed in transit and re-sealed per item without ever hitting disk in the
+	// clear. Retrieval routes are cheap reads and skip the limiter.
+	s.mux.HandleFunc("POST /v1/files", s.drainGate(s.requireAuth(s.rateLimitConsumer(s.sealedTransport(s.handleBatchFileUpload)))))
+	s.mux.HandleFunc("GET /v1/files/{id}", s.requireAuth(s.handleBatchFileGet))
+	s.mux.HandleFunc("GET /v1/files/{id}/content", s.requireAuth(s.handleBatchFileContent))
+	s.mux.HandleFunc("POST /v1/batches", s.drainGate(s.requireAuth(s.rateLimitConsumer(s.sealedTransport(s.handleBatchCreate)))))
+	s.mux.HandleFunc("GET /v1/batches", s.requireAuth(s.handleBatchList))
+	s.mux.HandleFunc("GET /v1/batches/{id}", s.requireAuth(s.handleBatchGet))
+	s.mux.HandleFunc("POST /v1/batches/{id}/cancel", s.drainGate(s.requireAuth(s.rateLimitConsumer(s.handleBatchCancel))))
 	// Dedicated OpenRouter provider feed — pure OpenRouter schema, no Darkbloom metadata.
 	s.mux.HandleFunc("GET /v1/models/openrouter", s.requireAuth(s.handleListModelsOpenRouter))
 	// OpenAI "retrieve model" — {id...} matches slashed HuggingFace-style ids;
