@@ -123,7 +123,10 @@ func (a *AIMD) Update(sig SlotSignal) int {
 
 	switch {
 	case sig.Waiting > 0 ||
-		(sig.DecodeFloor > 0 && sig.DecodeTPS < sig.DecodeFloor) ||
+		// A slot that reports no decode rate at all is UNMEASURED, not slow.
+		// Reading 0 as "below the floor" would pin every fresh provider's
+		// target at the floor and the lane would never start.
+		(sig.DecodeFloor > 0 && sig.DecodeTPS > 0 && sig.DecodeTPS < sig.DecodeFloor) ||
 		sig.KV > kvHigh:
 		a.Target /= 2 // multiplicative decrease
 	case sig.KV < kvLow:

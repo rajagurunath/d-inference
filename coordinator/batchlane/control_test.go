@@ -54,6 +54,28 @@ func TestAIMDHalvesBelowDecodeFloor(t *testing.T) {
 	}
 }
 
+// A provider that publishes no ObservedDecodeTPS (the field is omitempty and a
+// fresh slot has measured nothing) must not read as a slot decoding at 0 tok/s.
+func TestAIMDIgnoresAnUnmeasuredDecodeRate(t *testing.T) {
+	a := AIMD{Target: 3}
+	sig := healthySignal(8)
+	sig.DecodeTPS = 0
+	if got := a.Update(sig); got != 4 {
+		t.Fatalf("target with an unmeasured decode rate = %d, want 4 (increase, not halve)", got)
+	}
+}
+
+// A disabled floor (0) never triggers the decrease either.
+func TestAIMDIgnoresADisabledDecodeFloor(t *testing.T) {
+	a := AIMD{Target: 3}
+	sig := healthySignal(8)
+	sig.DecodeTPS = 1
+	sig.DecodeFloor = 0
+	if got := a.Update(sig); got != 4 {
+		t.Fatalf("target with the floor disabled = %d, want 4", got)
+	}
+}
+
 func TestAIMDHalvesOnKVHigh(t *testing.T) {
 	a := AIMD{Target: 8}
 	sig := healthySignal(8)

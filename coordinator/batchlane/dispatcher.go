@@ -1,0 +1,812 @@
+package batchlane
+
+// dispatcher.go is the 1 Hz control loop (docs/design/tidal-batch-lane.md §3.4).
+// One tick, in order:
+//
+//	drain   settle the outcomes the previous tick's dispatch goroutines reported
+//	observe smooth every slot's live signal with an EWMA
+//	control run the per-slot AIMD, producing a fleet-wide in-flight budget
+//	rank    laxity → urgency → priority for every open batch
+//	claim   Σ(target − inflight) items, highest priority first, line order within
+//	        a batch, only from in_progress batches
+//	dispatch one goroutine per claimed item under its batch's context
+//	sweep   expire batches past their window, drain cancelled ones
+//
+// Tick is synchronous apart from the dispatch goroutines, which report back
+// through a channel drained at the start of the next tick, so a test can drive
+// the whole loop by hand with no sleeping and no wall clock.
+//
+// Placement is NOT decided here. The dispatcher decides only HOW MANY batch
+// rows may be in flight fleet-wide; WHERE each one lands is the reservation
+// path's decision, which admits a LaneBatch request only to a slot with no
+// waiting row and running below its batch allowance (registry/scheduler.go).
+//
+// Privacy: nothing in this file logs a request body, a result, a custom_id or a
+// metadata value. Log fields are ids, counts, targets and bounded error codes.
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/eigeninference/d-inference/coordinator/store"
+	"github.com/eigeninference/d-inference/coordinator/store/sealedblob"
+)
+
+// Outcome is the result of running one batch item through the dispatch funnel.
+// It mirrors api.BatchOutcome field for field; batchlane must not import api
+// (api imports batchlane), so the api layer adapts one to the other when it
+// builds the DispatchFn.
+type Outcome struct {
+	RequestID                      string
+	PromptTokens, CompletionTokens int
+	ResponseBody                   []byte
+	// ErrCode is "" on success, ErrCodeNoCapacity when no slot had batch
+	// headroom, ErrCodeCancelled when the attempt's context was cancelled, and
+	// ErrCodeRequestFailed for every other non-success terminal.
+	ErrCode string
+}
+
+// The bounded outcome vocabulary. Neither the store nor a log line ever carries
+// anything else, so provider prose can never reach a consumer's error file.
+const (
+	// ErrCodeNoCapacity means no provider slot had batch headroom. The claim is
+	// released without charging an attempt: the item never reached a provider.
+	ErrCodeNoCapacity = "no_capacity"
+	// ErrCodeCancelled means the attempt's context was cancelled — coordinator
+	// shutdown, or the batch itself being cancelled or expired. Accounted like
+	// ErrCodeNoCapacity: no attempt is charged, because the failure is ours.
+	ErrCodeCancelled = "cancelled"
+	// ErrCodeRequestFailed is every other non-success terminal.
+	ErrCodeRequestFailed = "request_failed"
+)
+
+// DispatchFn runs one batch item through the standard consumer dispatch funnel
+// on the batch lane and waits for it to complete. api wires
+// (*api.Server).DispatchBatchItem to it.
+type DispatchFn func(ctx context.Context, accountID, apiKeyID, model string, body []byte) (Outcome, error)
+
+// FinalizeFn assembles a batch's output and error files once it has no open
+// items left, and moves it to its terminal status. PR2's assembler provides the
+// real hook; nil is a no-op, which leaves a completed batch's items settled and
+// its files unwritten.
+type FinalizeFn func(batchID string, now time.Time) error
+
+// Config are the dispatcher's tunables. The zero value means the spec defaults.
+type Config struct {
+	// Tick is the control period. <= 0 means DefaultTick.
+	Tick time.Duration
+	// MaxAttempts is how many times one item may reach a provider before it is
+	// settled as failed. <= 0 means DefaultMaxAttempts.
+	MaxAttempts int
+	// AIMD are the per-slot controller's watermarks.
+	AIMD AIMDConfig
+}
+
+const (
+	// DefaultTick is the 1 Hz control period from the spec.
+	DefaultTick = time.Second
+	// DefaultMaxAttempts is the spec's maxAttempts.
+	DefaultMaxAttempts = 3
+	// resultBlobSuffix separates an item's result blob from its request blob.
+	// Both refs are derived from the item id and from nothing the consumer
+	// supplied, so a directory listing carries no content (PR1's blob-ref rule).
+	resultBlobSuffix = "-out"
+	// resultBuffer bounds the outcomes a tick may have to drain. Dispatch
+	// goroutines are themselves bounded by the AIMD targets, which are bounded
+	// by the fleet's batch row allowance, so this is slack rather than a limit.
+	resultBuffer = 1024
+)
+
+// ResultBlobRef is the sealed blob key one item's result is stored under. PR2's
+// assembler reads it back from the item row; it is exported so the two agree by
+// construction rather than by convention.
+func ResultBlobRef(itemID string) string { return itemID + resultBlobSuffix }
+
+// Dispatcher fills idle provider slots with batch work. One instance per
+// coordinator, run under saferun.
+type Dispatcher struct {
+	st       store.Store
+	blob     *sealedblob.Store
+	view     RegistryView
+	dispatch DispatchFn
+	finalize FinalizeFn
+	cfg      Config
+	logger   *slog.Logger
+
+	results chan itemOutcome
+	wg      sync.WaitGroup
+	// stop is closed when Run returns, so a dispatch goroutine reporting into a
+	// full channel after shutdown exits instead of leaking.
+	stop     chan struct{}
+	stopOnce sync.Once
+
+	mu       sync.Mutex
+	slots    map[SlotKey]*slotState
+	batches  map[string]*batchState
+	attempts map[string]int // per item id, in memory (see settleFailure)
+	inflight int
+}
+
+// slotState is one provider·slot's controller plus the smoothing that feeds it.
+type slotState struct {
+	aimd   *AIMD
+	decode EWMA
+	kv     EWMA
+}
+
+// batchState is the per-batch escalation state and the cancellation handle for
+// everything the dispatcher has in flight for it.
+type batchState struct {
+	rate     ObservedRate
+	bucket   TokenBucket
+	ctx      context.Context
+	cancel   context.CancelFunc
+	inflight int
+	// claimable caches the last tick's view of whether the batch may be claimed
+	// from, so a settle can tell "release this back to pending" from "leave it
+	// to the sweep" without a second store read.
+	claimable bool
+}
+
+// itemOutcome is what a dispatch goroutine reports back.
+type itemOutcome struct {
+	batchID string
+	itemID  string
+	outcome Outcome
+	err     error
+}
+
+// New builds a dispatcher and performs restart recovery: every item some
+// previous process left inflight is returned to pending, keeping its attempt
+// count, because the dispatch really did happen and only its outcome is
+// unknown.
+//
+// finalize may be nil (no-op). A nil blob store or dispatch funnel makes Tick a
+// no-op rather than a panic, so a coordinator with the batch lane unconfigured
+// can still start the loop.
+func New(
+	st store.Store,
+	blob *sealedblob.Store,
+	view RegistryView,
+	dispatch DispatchFn,
+	finalize FinalizeFn,
+	cfg Config,
+	logger *slog.Logger,
+) *Dispatcher {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if cfg.Tick <= 0 {
+		cfg.Tick = DefaultTick
+	}
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = DefaultMaxAttempts
+	}
+	d := &Dispatcher{
+		st:       st,
+		blob:     blob,
+		view:     view,
+		dispatch: dispatch,
+		finalize: finalize,
+		cfg:      cfg,
+		logger:   logger,
+		results:  make(chan itemOutcome, resultBuffer),
+		stop:     make(chan struct{}),
+		slots:    map[SlotKey]*slotState{},
+		batches:  map[string]*batchState{},
+		attempts: map[string]int{},
+	}
+	d.requeueAfterRestart()
+	return d
+}
+
+// requeueAfterRestart returns every open batch's inflight items to pending.
+func (d *Dispatcher) requeueAfterRestart() {
+	if d.st == nil {
+		return
+	}
+	batches, err := d.st.ListOpenBatches()
+	if err != nil {
+		d.logger.Error("batch lane: could not list open batches for restart recovery", "error", err)
+		return
+	}
+	total := 0
+	for _, b := range batches {
+		n, err := d.st.RequeueInflightItems(b.ID)
+		if err != nil {
+			d.logger.Error("batch lane: could not requeue inflight items", "batch_id", b.ID, "error", err)
+			continue
+		}
+		total += n
+	}
+	if total > 0 {
+		d.logger.Info("batch lane: requeued items left inflight by a previous process",
+			"batches", len(batches), "items", total)
+	}
+}
+
+// Run drives Tick at cfg.Tick until ctx is done, then cancels every in-flight
+// item and waits for the dispatch goroutines to report. Call it under
+// saferun.Go.
+func (d *Dispatcher) Run(ctx context.Context) {
+	ticker := time.NewTicker(d.cfg.Tick)
+	defer ticker.Stop()
+	d.logger.Info("batch lane dispatcher started", "tick", d.cfg.Tick, "max_attempts", d.cfg.MaxAttempts)
+
+	for {
+		select {
+		case <-ctx.Done():
+			d.shutdown()
+			return
+		case now := <-ticker.C:
+			d.Tick(ctx, now)
+		}
+	}
+}
+
+// shutdown cancels every batch context and waits for the goroutines. Items left
+// inflight in the store are recovered by the next process's New.
+func (d *Dispatcher) shutdown() {
+	d.mu.Lock()
+	for _, bs := range d.batches {
+		bs.cancel()
+	}
+	d.mu.Unlock()
+	d.stopOnce.Do(func() { close(d.stop) })
+	d.wg.Wait()
+	d.logger.Info("batch lane dispatcher stopped")
+}
+
+// Tick runs one iteration of the control loop. Everything it decides is a
+// function of (state, the view's signals, now); it never reads the clock.
+func (d *Dispatcher) Tick(ctx context.Context, now time.Time) {
+	if d.st == nil || d.blob == nil || d.dispatch == nil || d.view == nil {
+		return
+	}
+
+	d.drainResults(now)
+
+	budget := d.updateTargets(now)
+
+	batches, err := d.st.ListOpenBatches()
+	if err != nil {
+		d.logger.Error("batch lane: could not list open batches", "error", err)
+		return
+	}
+
+	d.claimAndDispatch(ctx, batches, budget, now)
+	d.sweep(batches, now)
+	d.pruneBatchState(batches)
+}
+
+// updateTargets folds each slot's fresh signal into its EWMAs, runs its AIMD
+// step, and returns the fleet-wide in-flight budget: Σtarget − items already
+// out. A slot the view no longer reports has disconnected and its controller
+// state is dropped.
+func (d *Dispatcher) updateTargets(now time.Time) int {
+	signals := d.view.Slots("")
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	total := 0
+	for key, sig := range signals {
+		st, ok := d.slots[key]
+		if !ok {
+			st = &slotState{aimd: NewAIMD(d.cfg.AIMD)}
+			d.slots[key] = st
+		}
+		// An unmeasured decode rate (0) is not a slow one: folding it in would
+		// drag the average to zero and pin the target at the floor forever.
+		if sig.DecodeTPS > 0 {
+			sig.DecodeTPS = st.decode.Observe(sig.DecodeTPS)
+		} else if st.decode.Initialized() {
+			sig.DecodeTPS = st.decode.Value
+		}
+		sig.KV = st.kv.Observe(sig.KV)
+		// Waiting is deliberately NOT smoothed: it is the backpressure signal,
+		// and an EWMA of it would both delay the backoff and never fully decay,
+		// leaving the target halved long after the online burst passed.
+		total += st.aimd.Update(sig)
+	}
+	for key := range d.slots {
+		if _, ok := signals[key]; !ok {
+			delete(d.slots, key)
+		}
+	}
+
+	budget := total - d.inflight
+	if budget < 0 {
+		budget = 0
+	}
+	return budget
+}
+
+// batchPlan is one open batch's rank for this tick.
+type batchPlan struct {
+	batch   *store.Batch
+	pending int
+	urgency float64
+	prio    int
+}
+
+// claimAndDispatch ranks the claimable batches by priority, spends the budget
+// across them highest priority first, and starts one goroutine per claimed
+// item. A batch whose slack has run out gets a token-bucket progress floor of
+// one item even when the budget is zero.
+func (d *Dispatcher) claimAndDispatch(ctx context.Context, batches []*store.Batch, budget int, now time.Time) {
+	plans := make([]batchPlan, 0, len(batches))
+	for _, b := range batches {
+		// Only in_progress batches are claimable, and never one already past
+		// its window: this tick's sweep is about to expire it.
+		claimable := b.Status == store.BatchInProgress && now.Before(b.ExpiresAt)
+		bs := d.batchStateFor(ctx, b.ID)
+		d.mu.Lock()
+		bs.claimable = claimable
+		d.mu.Unlock()
+		if !claimable {
+			continue
+		}
+
+		_, pending, inflight, _, _, err := d.st.CountItems(b.ID)
+		if err != nil {
+			d.logger.Error("batch lane: could not count items", "batch_id", b.ID, "error", err)
+			continue
+		}
+		if pending == 0 {
+			continue
+		}
+		u := d.urgencyOf(bs, b, pending+inflight, now)
+		plans = append(plans, batchPlan{batch: b, pending: pending, urgency: u, prio: Priority(u)})
+	}
+
+	// Highest priority (lowest number) first; oldest batch breaks a tie so a
+	// fleet of equally healthy batches drains in submission order.
+	sort.SliceStable(plans, func(i, j int) bool {
+		if plans[i].prio != plans[j].prio {
+			return plans[i].prio < plans[j].prio
+		}
+		if !plans[i].batch.CreatedAt.Equal(plans[j].batch.CreatedAt) {
+			return plans[i].batch.CreatedAt.Before(plans[j].batch.CreatedAt)
+		}
+		return plans[i].batch.ID < plans[j].batch.ID
+	})
+
+	for _, p := range plans {
+		want := p.pending
+		if want > budget {
+			want = budget
+		}
+		if want == 0 && p.urgency >= FloorUrgency {
+			// The deadline progress floor: one item, rate limited to
+			// FloorItemsPerSec, so an urgent batch is never starved to expiry
+			// however busy the online lane is. It does NOT raise the AIMD
+			// target — the reservation path still refuses a slot with no
+			// headroom, so the floor can only use capacity that really exists.
+			bs := d.batchStateFor(ctx, p.batch.ID)
+			d.mu.Lock()
+			granted := bs.bucket.TryTake(now)
+			d.mu.Unlock()
+			if granted {
+				want = 1
+			}
+		}
+		if want == 0 {
+			continue
+		}
+		claimed, err := d.st.ClaimPendingItems(p.batch.ID, want, now)
+		if err != nil {
+			d.logger.Error("batch lane: could not claim items", "batch_id", p.batch.ID, "error", err)
+			continue
+		}
+		if len(claimed) == 0 {
+			continue
+		}
+		if n := len(claimed); n <= budget {
+			budget -= n
+		} else {
+			budget = 0
+		}
+		d.logger.Debug("batch lane: claimed items",
+			"batch_id", p.batch.ID, "items", len(claimed), "priority", p.prio, "budget_left", budget)
+		for _, it := range claimed {
+			d.start(ctx, p.batch, it)
+		}
+	}
+}
+
+// urgencyOf computes a batch's urgency from its own observed completion rate,
+// falling back to the fleet-wide rate and then to pure slack.
+func (d *Dispatcher) urgencyOf(bs *batchState, b *store.Batch, remaining int, now time.Time) float64 {
+	d.mu.Lock()
+	rate, known := bs.rate.PerSec(now)
+	d.mu.Unlock()
+	if !known {
+		rate, known = d.st.CompletionRate(ObservedRateWindow, now)
+	}
+	if !known {
+		rate = 0 // cold start: slack only
+	}
+	return Urgency(Laxity(b.ExpiresAt, now, remaining, rate))
+}
+
+// start launches one item's dispatch under its batch's context.
+func (d *Dispatcher) start(ctx context.Context, b *store.Batch, it *store.BatchItem) {
+	bs := d.batchStateFor(ctx, b.ID)
+
+	d.mu.Lock()
+	d.inflight++
+	bs.inflight++
+	itemCtx := bs.ctx
+	d.mu.Unlock()
+
+	batchID, itemID, blobRef := b.ID, it.ID, it.BlobRef
+	accountID, batchModel := b.AccountID, b.Model
+
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		out, err := d.runItem(itemCtx, accountID, batchModel, blobRef)
+		select {
+		case d.results <- itemOutcome{batchID: batchID, itemID: itemID, outcome: out, err: err}:
+		case <-d.stop:
+			// Shutting down. The item stays inflight in the store and the next
+			// process's restart recovery returns it to pending.
+		}
+	}()
+}
+
+// runItem opens the sealed request body and runs it through the funnel. The
+// plaintext lives only for the duration of this call: it is never stored on the
+// Dispatcher, never logged, and never copied into an outcome.
+func (d *Dispatcher) runItem(ctx context.Context, accountID, batchModel, blobRef string) (Outcome, error) {
+	body, err := d.blob.Open(blobRef)
+	if err != nil {
+		return Outcome{ErrCode: ErrCodeRequestFailed}, fmt.Errorf("open item body: %w", err)
+	}
+	model := batchModel
+	if model == "" {
+		model, err = modelOf(body)
+		if err != nil {
+			return Outcome{ErrCode: ErrCodeRequestFailed}, err
+		}
+	}
+	return d.dispatch(ctx, accountID, "", model, body)
+}
+
+// modelOf reads the model field out of an item's request body. The inline batch
+// form carries the model on the batch instead; the file form carries it per
+// line, which is what OpenAI's wire format specifies.
+func modelOf(body []byte) (string, error) {
+	var envelope struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		// The error deliberately does not wrap the decoder's message, which
+		// would quote the offending bytes.
+		return "", errors.New("batch item body is not a JSON object")
+	}
+	if envelope.Model == "" {
+		return "", errors.New("batch item body carries no model")
+	}
+	return envelope.Model, nil
+}
+
+// drainResults settles every outcome reported since the last tick.
+func (d *Dispatcher) drainResults(now time.Time) {
+	for {
+		select {
+		case res := <-d.results:
+			d.settle(res, now)
+		default:
+			return
+		}
+	}
+}
+
+// settle applies one outcome. A result for an item that is no longer inflight
+// (expired, cancelled, or already settled) is ignored: FinishItem and
+// ReleaseItem both return false and change nothing.
+func (d *Dispatcher) settle(res itemOutcome, now time.Time) {
+	d.mu.Lock()
+	d.inflight--
+	if d.inflight < 0 {
+		d.inflight = 0
+	}
+	bs := d.batches[res.batchID]
+	if bs != nil && bs.inflight > 0 {
+		bs.inflight--
+	}
+	claimable := bs != nil && bs.claimable
+	d.mu.Unlock()
+
+	switch {
+	case res.err == nil && res.outcome.ErrCode == "":
+		d.settleSuccess(res, now)
+	case res.outcome.ErrCode == ErrCodeNoCapacity || res.outcome.ErrCode == ErrCodeCancelled:
+		// Neither is the item's fault, so no attempt is charged. If the batch
+		// is no longer claimable its items belong to the sweep, which has
+		// already moved them to expired or cancelled.
+		if !claimable {
+			return
+		}
+		if _, err := d.st.ReleaseItem(res.itemID); err != nil {
+			d.logger.Error("batch lane: could not release a claim",
+				"batch_id", res.batchID, "item_id", res.itemID, "code", res.outcome.ErrCode, "error", err)
+		}
+	default:
+		d.settleFailure(res, claimable, now)
+	}
+}
+
+// settleSuccess seals the response and moves the item to succeeded.
+func (d *Dispatcher) settleSuccess(res itemOutcome, now time.Time) {
+	ref := ResultBlobRef(res.itemID)
+	if err := d.putResult(res.batchID, ref, res.outcome.ResponseBody); err != nil {
+		d.logger.Error("batch lane: could not seal a result",
+			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
+		d.settleFailure(res, true, now)
+		return
+	}
+
+	ok, err := d.st.FinishItem(store.ItemResult{
+		ItemID:           res.itemID,
+		Succeeded:        true,
+		PromptTokens:     res.outcome.PromptTokens,
+		CompletionTokens: res.outcome.CompletionTokens,
+		RequestID:        res.outcome.RequestID,
+		ResultBlobRef:    ref,
+	}, now)
+	if err != nil {
+		d.logger.Error("batch lane: could not finish an item",
+			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
+		return
+	}
+	if !ok {
+		// A late result for an item the sweep already closed. Drop the blob we
+		// just wrote so an expired batch leaves nothing behind.
+		if err := d.blob.Delete(ref); err != nil && !errors.Is(err, sealedblob.ErrNotFound) {
+			d.logger.Error("batch lane: could not drop a late result blob",
+				"batch_id", res.batchID, "item_id", res.itemID, "error", err)
+		}
+		return
+	}
+
+	d.mu.Lock()
+	delete(d.attempts, res.itemID)
+	if bs := d.batches[res.batchID]; bs != nil {
+		bs.rate.Record(now)
+	}
+	d.mu.Unlock()
+
+	d.runFinalize(res.batchID, now)
+}
+
+// putResult seals the response body to the consumer's key when the batch
+// carries one, and to the coordinator's own key otherwise.
+func (d *Dispatcher) putResult(batchID, ref string, body []byte) error {
+	b, ok := d.batchByID(batchID)
+	if ok && b.ResultPublicKey != "" {
+		key, err := decodePublicKey(b.ResultPublicKey)
+		if err != nil {
+			return err
+		}
+		return d.blob.PutTo(ref, body, key)
+	}
+	return d.blob.PutPlain(ref, body)
+}
+
+// decodePublicKey parses a batch's base64 X25519 result key. The error never
+// quotes the value.
+func decodePublicKey(encoded string) ([32]byte, error) {
+	var key [32]byte
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return key, errors.New("result_public_key is not valid base64")
+	}
+	if len(raw) != 32 {
+		return key, fmt.Errorf("result_public_key must be 32 bytes, got %d", len(raw))
+	}
+	copy(key[:], raw)
+	return key, nil
+}
+
+// settleFailure charges an attempt and either re-offers the item or settles it
+// as failed.
+//
+// The attempt tally is kept in memory rather than in the item row because the
+// store's only per-item requeue, ReleaseItem, un-counts the claim's attempt by
+// design (it exists for the no-capacity path), and the batch-wide
+// RequeueInflightItems would yank items that are genuinely still running. A
+// coordinator restart therefore forgets a partial retry budget, which costs at
+// most MaxAttempts-1 extra attempts per item and never loses one.
+func (d *Dispatcher) settleFailure(res itemOutcome, claimable bool, now time.Time) {
+	d.mu.Lock()
+	d.attempts[res.itemID]++
+	attempts := d.attempts[res.itemID]
+	d.mu.Unlock()
+
+	if attempts < d.cfg.MaxAttempts && claimable {
+		if _, err := d.st.ReleaseItem(res.itemID); err != nil {
+			d.logger.Error("batch lane: could not re-offer a failed item",
+				"batch_id", res.batchID, "item_id", res.itemID, "attempts", attempts, "error", err)
+		}
+		return
+	}
+
+	d.mu.Lock()
+	delete(d.attempts, res.itemID)
+	d.mu.Unlock()
+
+	ok, err := d.st.FinishItem(store.ItemResult{
+		ItemID:    res.itemID,
+		Succeeded: false,
+		ErrorCode: ErrCodeRequestFailed,
+	}, now)
+	if err != nil {
+		d.logger.Error("batch lane: could not fail an item",
+			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
+		return
+	}
+	if !ok {
+		return // already terminal
+	}
+	d.logger.Info("batch lane: item failed",
+		"batch_id", res.batchID, "item_id", res.itemID, "attempts", attempts, "code", ErrCodeRequestFailed)
+	d.runFinalize(res.batchID, now)
+}
+
+// sweep expires batches past their completion window and drains cancelled ones.
+func (d *Dispatcher) sweep(batches []*store.Batch, now time.Time) {
+	for _, b := range batches {
+		switch {
+		case b.Status == store.BatchInProgress && !now.Before(b.ExpiresAt):
+			d.expire(b, now)
+		case b.Status == store.BatchCancelling:
+			d.drainCancelled(b, now)
+		}
+	}
+}
+
+// expire closes a batch that ran out of window. Expired items move neither
+// counts_completed nor counts_failed, so completed + failed stays ≤ total.
+func (d *Dispatcher) expire(b *store.Batch, now time.Time) {
+	d.cancelBatch(b.ID)
+	n, err := d.st.ExpireOpenItems(b.ID, now)
+	if err != nil {
+		d.logger.Error("batch lane: could not expire open items", "batch_id", b.ID, "error", err)
+		return
+	}
+	ok, err := d.st.SetBatchStatus(b.ID, store.BatchInProgress, store.BatchExpired, now)
+	if err != nil {
+		d.logger.Error("batch lane: could not expire batch", "batch_id", b.ID, "error", err)
+		return
+	}
+	if !ok {
+		return
+	}
+	d.logger.Info("batch lane: batch expired", "batch_id", b.ID, "expired_items", n)
+	d.runFinalize(b.ID, now)
+}
+
+// drainCancelled stops a cancelling batch's in-flight work and closes it once
+// nothing is outstanding. Items are cancelled immediately so a result that
+// lands after this point is ignored by FinishItem.
+func (d *Dispatcher) drainCancelled(b *store.Batch, now time.Time) {
+	d.cancelBatch(b.ID)
+	if _, err := d.st.CancelOpenItems(b.ID, now); err != nil {
+		d.logger.Error("batch lane: could not cancel open items", "batch_id", b.ID, "error", err)
+		return
+	}
+	ok, err := d.st.SetBatchStatus(b.ID, store.BatchCancelling, store.BatchCancelled, now)
+	if err != nil {
+		d.logger.Error("batch lane: could not cancel batch", "batch_id", b.ID, "error", err)
+		return
+	}
+	if !ok {
+		return
+	}
+	d.logger.Info("batch lane: batch cancelled", "batch_id", b.ID)
+	d.runFinalize(b.ID, now)
+}
+
+// cancelBatch cancels every dispatch the batch has in flight.
+func (d *Dispatcher) cancelBatch(batchID string) {
+	d.mu.Lock()
+	bs := d.batches[batchID]
+	d.mu.Unlock()
+	if bs != nil {
+		bs.cancel()
+	}
+}
+
+func (d *Dispatcher) runFinalize(batchID string, now time.Time) {
+	if d.finalize == nil {
+		return
+	}
+	if err := d.finalize(batchID, now); err != nil {
+		d.logger.Error("batch lane: finalize failed", "batch_id", batchID, "error", err)
+	}
+}
+
+// batchStateFor returns (creating if needed) the per-batch escalation and
+// cancellation state. The context is derived from the tick's context, so a
+// coordinator shutdown cancels every batch as well.
+func (d *Dispatcher) batchStateFor(ctx context.Context, batchID string) *batchState {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if bs, ok := d.batches[batchID]; ok {
+		return bs
+	}
+	bctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	bs := &batchState{
+		bucket: TokenBucket{Rate: FloorItemsPerSec, Capacity: 1},
+		ctx:    bctx,
+		cancel: cancel,
+	}
+	d.batches[batchID] = bs
+	return bs
+}
+
+// pruneBatchState drops the state of batches that are no longer open and have
+// nothing outstanding, so a long-lived coordinator does not accumulate one
+// entry per batch it has ever seen.
+func (d *Dispatcher) pruneBatchState(open []*store.Batch) {
+	stillOpen := make(map[string]struct{}, len(open))
+	for _, b := range open {
+		stillOpen[b.ID] = struct{}{}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, bs := range d.batches {
+		if _, ok := stillOpen[id]; ok || bs.inflight > 0 {
+			continue
+		}
+		bs.cancel()
+		delete(d.batches, id)
+	}
+}
+
+// batchByID reads one batch without an account scope. Only the dispatcher may
+// do this; every request handler passes the authenticated account instead.
+func (d *Dispatcher) batchByID(batchID string) (*store.Batch, bool) {
+	open, err := d.st.ListOpenBatches()
+	if err != nil {
+		return nil, false
+	}
+	for _, b := range open {
+		if b.ID == batchID {
+			return b, true
+		}
+	}
+	return nil, false
+}
+
+// SlotTarget reports one slot's current AIMD target. For tests and operational
+// introspection.
+func (d *Dispatcher) SlotTarget(key SlotKey) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if st, ok := d.slots[key]; ok {
+		return st.aimd.Target
+	}
+	return 0
+}
+
+// InflightItems reports how many items the dispatcher currently has out.
+func (d *Dispatcher) InflightItems() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.inflight
+}
+
+// awaitDispatch waits for the dispatch goroutines started so far. Tests use it
+// to make a tick's asynchronous half deterministic.
+func (d *Dispatcher) awaitDispatch() { d.wg.Wait() }
