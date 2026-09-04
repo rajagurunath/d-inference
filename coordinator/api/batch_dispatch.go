@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"time"
 
 	"github.com/eigeninference/d-inference/coordinator/registry"
-	"github.com/eigeninference/d-inference/coordinator/store"
 )
 
 // batch_dispatch.go is the api-layer surface of the batch lane
@@ -36,9 +36,10 @@ const (
 // BatchOutcome is the result of running one batch item through the dispatch
 // funnel. Exactly one of a delivered response or an ErrCode is meaningful:
 // ErrCode is empty on success, batchNoCapacityCode ("no_capacity") when no
-// provider slot had batch headroom, and "request_failed" for every other
-// non-success terminal — the same bounded vocabulary the batch output/error
-// files use (docs/design/tidal-batch-lane.md §3.6).
+// provider slot had batch headroom, batchCancelledCode ("cancelled") when the
+// CALLER'S OWN context ended before the attempt finished, and "request_failed"
+// for every other non-success terminal — the same bounded vocabulary the batch
+// output/error files use (docs/design/tidal-batch-lane.md §3.6).
 type BatchOutcome struct {
 	// RequestID is the coordinator-owned inference job id of the attempt that
 	// committed, echoed from the X-Inference-Job-ID header. Empty when nothing
@@ -50,13 +51,37 @@ type BatchOutcome struct {
 	// ResponseBody is the complete non-streaming OpenAI response body on
 	// success, and the OpenAI-shaped error body otherwise.
 	ResponseBody []byte
-	// ErrCode is "" on success; see the type comment for the failure vocabulary.
+	// ErrCode is "" on success, and otherwise one of:
+	//   "no_capacity"    no provider slot had batch headroom. Release the claim
+	//                    WITHOUT counting an attempt and re-offer the item next tick.
+	//   "cancelled"      the caller's context was cancelled or timed out
+	//                    (shutdown, batch cancellation). Release the claim
+	//                    WITHOUT counting an attempt — nothing about the
+	//                    provider or the item was proven.
+	//   "request_failed" a real terminal. Count an attempt and retry up to
+	//                    maxAttempts.
 	ErrCode string
 }
 
 // batchRequestFailedCode is the bounded error code for a batch attempt that
 // reached a terminal that is not a capacity refusal.
 const batchRequestFailedCode = "request_failed"
+
+// batchCancelledCode is the bounded error code for an attempt that ended
+// because the CALLER'S context did, not because anything went wrong with the
+// request. Handed back separately from "request_failed" because it must not
+// burn one of the item's three attempts: a coordinator shutdown or an operator
+// cancelling the batch mid-flight says nothing about whether the item can be
+// served, and charging an attempt for it would retire a perfectly good item
+// after three restarts.
+const batchCancelledCode = "cancelled"
+
+// errBatchAPIKeyUnusable is returned when the attributing key ID does not
+// resolve to a live key owned by accountID: unknown, revoked, disabled, expired
+// or belonging to someone else. Typed so the dispatcher can fail the ITEM
+// (permanently — the key is not coming back this tick) rather than treating it
+// as a transient provider fault.
+var errBatchAPIKeyUnusable = errors.New("batch dispatch: api key is not usable")
 
 // DispatchBatchItem runs one batch request through the standard consumer
 // dispatch funnel on registry.LaneBatch and waits for it to complete, returning
@@ -113,8 +138,28 @@ func (s *Server) DispatchBatchItem(
 	req.Header.Set("Content-Type", "application/json")
 	rctx := withRequestLane(ctx, registry.LaneBatch)
 	rctx = context.WithValue(rctx, ctxKeyConsumer, accountID)
+	// Load the REAL key record. A stub carrying only the ID would satisfy
+	// apiKeyFromContext while reporting no AllowedModels and no LimitMicroUSD,
+	// so keyModelAllowed and checkKeySpendCap (api/apikey_handlers.go) would
+	// wave every batch item through — a key restricted to one model, or capped
+	// at $5, would be unrestricted the moment its traffic arrived on the batch
+	// lane. The key is scoped to accountID exactly as GET /v1/keys/{id} is, so a
+	// batch row cannot attribute itself to another account's key.
 	if apiKeyID != "" {
-		rctx = context.WithValue(rctx, ctxKeyAPIKey, &store.APIKey{ID: apiKeyID})
+		keyRec, err := s.store.GetAPIKeyByID(accountID, apiKeyID)
+		if err != nil || keyRec == nil {
+			return BatchOutcome{ErrCode: batchRequestFailedCode},
+				fmt.Errorf("%w: %q: %v", errBatchAPIKeyUnusable, apiKeyID, err)
+		}
+		if keyRec.Disabled {
+			return BatchOutcome{ErrCode: batchRequestFailedCode},
+				fmt.Errorf("%w: %q is revoked", errBatchAPIKeyUnusable, apiKeyID)
+		}
+		if keyRec.ExpiresAt != nil && time.Now().After(*keyRec.ExpiresAt) {
+			return BatchOutcome{ErrCode: batchRequestFailedCode},
+				fmt.Errorf("%w: %q is expired", errBatchAPIKeyUnusable, apiKeyID)
+		}
+		rctx = context.WithValue(rctx, ctxKeyAPIKey, keyRec)
 	}
 	req = req.WithContext(rctx)
 
@@ -136,6 +181,17 @@ func (s *Server) DispatchBatchItem(
 		responseErrorCode(respBody) == batchNoCapacityCode {
 		outcome.ErrCode = batchNoCapacityCode
 		return outcome, nil
+	}
+	// The caller's own context ended (coordinator shutdown, the batch cancelled
+	// under us, the dispatcher's per-item budget expiring). Every terminal the
+	// handler can write in that situation — a client-gone abort, a first-content
+	// deadline, a plain 500 — is indistinguishable from a provider failure by
+	// status code alone, so ask the context directly. Checked AFTER the success
+	// and no-capacity branches so a request that finished before the cancellation
+	// landed still reports what it actually achieved.
+	if err := ctx.Err(); err != nil {
+		outcome.ErrCode = batchCancelledCode
+		return outcome, fmt.Errorf("batch dispatch: %w", err)
 	}
 	outcome.ErrCode = batchRequestFailedCode
 	return outcome, nil
