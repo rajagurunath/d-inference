@@ -72,8 +72,8 @@ func TestRegistryViewMapsSlotSignals(t *testing.T) {
 	if sig.DecodeTPS != 22 {
 		t.Fatalf("DecodeTPS = %v, want 22", sig.DecodeTPS)
 	}
-	if sig.KV != 0.3 {
-		t.Fatalf("KV = %v, want 0.3 (300/1000)", sig.KV)
+	if sig.KV != 0.3 || !sig.KVKnown {
+		t.Fatalf("KV = %v (known %v), want 0.3 (300/1000) known", sig.KV, sig.KVKnown)
 	}
 	if sig.DecodeFloor != reg.QualityCapFloorTPS() {
 		t.Fatalf("DecodeFloor = %v, want the registry floor %v", sig.DecodeFloor, reg.QualityCapFloorTPS())
@@ -83,17 +83,18 @@ func TestRegistryViewMapsSlotSignals(t *testing.T) {
 	}
 }
 
-// A slot that reports no token budget has no KV signal to read. Reporting 0
-// would look like an idle slot and drive the controller to increase forever, so
-// an unknown budget must read as the hold band instead.
-func TestRegistryViewUnknownKVHolds(t *testing.T) {
+// A slot that reports no token budget has no KV signal to read. The view must
+// say so rather than substitute a number: any substitute is wrong in one
+// direction or the other (0 reads as idle and grows without bound, a hold-band
+// value pins a fresh slot at target 0 for good).
+func TestRegistryViewMarksAnAbsentKVBudgetUnknown(t *testing.T) {
 	reg := viewTestRegistry(t)
 	model := "view-nokv-model"
 	viewTestProvider(t, reg, "A", model, protocol.BackendSlotCapacity{NumRunning: 1})
 
 	sig := NewRegistryView(reg).Slots(model)[SlotKey{ProviderID: "A", Model: model}]
-	if sig.KV <= KVLow || sig.KV > KVHigh {
-		t.Fatalf("KV with no reported budget = %v, want the hold band (%v, %v]", sig.KV, KVLow, KVHigh)
+	if sig.KVKnown {
+		t.Fatalf("KVKnown = true for a slot with no reported budget (KV %v)", sig.KV)
 	}
 }
 

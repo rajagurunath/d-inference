@@ -58,27 +58,23 @@ type FinalizeResult struct {
 // in-flight items.
 //
 // This is the entry point the batch dispatcher calls after every FinishItem and
-// from its periodic sweep.
+// from its periodic sweep. It is finalize — not the caller — that performs the
+// terminal transition, and it performs it LAST, after the output and error
+// files are attached: the dispatcher's expiry and cancellation sweeps close
+// their items and then call this while the batch is still open, so a crash at
+// any point leaves the batch open and the next tick retries the whole pass
+// rather than leaving a terminal batch with no result files at all.
 func (s *Server) FinalizeBatchIfDone(batchID string, now time.Time) (*FinalizeResult, error) {
 	blobs := s.batchBlobs
 	if blobs == nil {
 		return nil, errors.New("batch: the batch lane is not configured")
 	}
 
-	// ListOpenBatches is the only unscoped read of a batch the store offers,
-	// and its in_progress/cancelling filter is exactly finalize's precondition.
-	open, err := s.store.ListOpenBatches()
-	if err != nil {
-		return nil, fmt.Errorf("batch: list open batches: %w", err)
-	}
-	var batch *store.Batch
-	for _, b := range open {
-		if b.ID == batchID {
-			batch = b
-			break
-		}
-	}
-	if batch == nil {
+	// GetBatchByID is the store's unscoped read: finalize runs on a background
+	// path and has no authenticated account. It resolves a batch in any status,
+	// so the open check is finalize's own.
+	batch, ok := s.store.GetBatchByID(batchID)
+	if !ok || !batchIsOpen(batch.Status) {
 		return nil, nil
 	}
 
@@ -119,7 +115,7 @@ func (s *Server) FinalizeBatchIfDone(batchID string, now time.Time) (*FinalizeRe
 			// batch never points at one pair while another sits on disk.
 			s.discardAssembledFile(blobs, outputFileID, now)
 			s.discardAssembledFile(blobs, errorFileID, now)
-			current, ok := s.store.GetBatch(batch.AccountID, batchID)
+			current, ok := s.store.GetBatchByID(batchID)
 			if !ok {
 				return nil, nil
 			}
@@ -139,15 +135,37 @@ func (s *Server) FinalizeBatchIfDone(batchID string, now time.Time) (*FinalizeRe
 	return s.finalizeBatchStatus(batch, items, outputFileID, errorFileID, now)
 }
 
+// batchIsOpen reports whether a batch is in a status finalize may act on.
+func batchIsOpen(status store.BatchStatus) bool {
+	return status == store.BatchInProgress || status == store.BatchCancelling
+}
+
+// finalizeTarget is the terminal status a finalize pass moves an open batch to.
+//
+// The expiry case is why the target is resolved from the ITEMS rather than from
+// the batch's own status. The dispatcher's sweep expires a batch's open items
+// and then calls finalize with the batch still in_progress, precisely so the
+// files are attached before the batch goes terminal; the expired items are the
+// evidence of which of the two in_progress terminals applies. A batch that ran
+// out of window with nothing left open expired nothing and completed normally.
+func finalizeTarget(batch *store.Batch, items []*store.BatchItem) store.BatchStatus {
+	if batch.Status == store.BatchCancelling {
+		return store.BatchCancelled
+	}
+	for _, it := range items {
+		if it.State == store.ItemExpired {
+			return store.BatchExpired
+		}
+	}
+	return store.BatchCompleted
+}
+
 // finalizeBatchStatus runs the terminal status CAS for a batch whose output
 // files are already attached — either by this pass or a previous one whose own
 // CAS was lost — and cleans up item input blobs once it moves. It returns
 // (nil, nil) if the CAS itself is lost to a concurrent finalize.
 func (s *Server) finalizeBatchStatus(batch *store.Batch, items []*store.BatchItem, outputFileID, errorFileID *string, now time.Time) (*FinalizeResult, error) {
-	target := store.BatchCompleted
-	if batch.Status == store.BatchCancelling {
-		target = store.BatchCancelled
-	}
+	target := finalizeTarget(batch, items)
 	moved, err := s.store.SetBatchStatus(batch.ID, batch.Status, target, now)
 	if err != nil {
 		return nil, fmt.Errorf("batch: finalize status: %w", err)

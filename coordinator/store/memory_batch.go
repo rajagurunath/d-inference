@@ -205,6 +205,18 @@ func (s *MemoryStore) GetBatch(accountID, id string) (*Batch, bool) {
 	return cloneBatch(b), true
 }
 
+// GetBatchByID returns the batch whatever account owns it.
+func (s *MemoryStore) GetBatchByID(id string) (*Batch, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	b, ok := s.batches[id]
+	if !ok {
+		return nil, false
+	}
+	return cloneBatch(b), true
+}
+
 // ListBatches returns an account's batches newest first, paged by the batch id
 // in after.
 func (s *MemoryStore) ListBatches(accountID string, limit int, after string) ([]*Batch, error) {

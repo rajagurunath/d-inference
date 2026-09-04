@@ -145,6 +145,15 @@ func (s *Server) DispatchBatchItem(
 	// at $5, would be unrestricted the moment its traffic arrived on the batch
 	// lane. The key is scoped to accountID exactly as GET /v1/keys/{id} is, so a
 	// batch row cannot attribute itself to another account's key.
+	//
+	// apiKeyID == "" is a legitimate state, not a missing value: the batch was
+	// created by a caller that has no API key (a Privy JWT session or the admin
+	// key). Nothing is stamped on the context, so keyModelAllowed and
+	// checkKeySpendCap see no key and the item runs under ACCOUNT-level limits
+	// only — exactly what that caller's ONLINE requests do. The decision is
+	// logged once per batch at creation (handleBatchCreate) rather than per
+	// item here, because the key id is fixed when the batch row is written and
+	// DispatchFn carries no batch id to deduplicate on.
 	if apiKeyID != "" {
 		keyRec, err := s.store.GetAPIKeyByID(accountID, apiKeyID)
 		if err != nil || keyRec == nil {

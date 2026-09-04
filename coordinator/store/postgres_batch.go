@@ -30,7 +30,7 @@ const batchItemColumns = `id, batch_id, custom_id, line_no, state, attempts, las
 
 // batchColumns is the column list every batch read returns, in the order
 // scanBatch expects.
-const batchColumns = `id, account_id, input_file_id, endpoint, status, completion_window,
+const batchColumns = `id, account_id, api_key_id, input_file_id, endpoint, status, completion_window,
 	created_at, expires_at, in_progress_at, completed_at, cancelled_at,
 	counts_total, counts_completed, counts_failed, output_file_id, error_file_id,
 	result_public_key, sealed_to, source, model, metadata_json`
@@ -65,7 +65,7 @@ func scanBatch(row pgx.Row) (*Batch, error) {
 		b        Batch
 		metadata []byte
 	)
-	err := row.Scan(&b.ID, &b.AccountID, &b.InputFileID, &b.Endpoint, &b.Status, &b.CompletionWindow,
+	err := row.Scan(&b.ID, &b.AccountID, &b.APIKeyID, &b.InputFileID, &b.Endpoint, &b.Status, &b.CompletionWindow,
 		&b.CreatedAt, &b.ExpiresAt, &b.InProgressAt, &b.CompletedAt, &b.CancelledAt,
 		&b.CountsTotal, &b.CountsCompleted, &b.CountsFailed, &b.OutputFileID, &b.ErrorFileID,
 		&b.ResultPublicKey, &b.SealedTo, &b.Source, &b.Model, &metadata)
@@ -216,10 +216,10 @@ func (s *PostgresStore) CreateBatch(b *Batch, items []*BatchItem) error {
 	defer tx.Rollback(ctx)
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO batches (id, account_id, input_file_id, endpoint, status, completion_window,
+		INSERT INTO batches (id, account_id, api_key_id, input_file_id, endpoint, status, completion_window,
 			created_at, expires_at, counts_total, result_public_key, sealed_to, source, model, metadata_json)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-		b.ID, b.AccountID, b.InputFileID, b.Endpoint, BatchValidating, b.CompletionWindow,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+		b.ID, b.AccountID, b.APIKeyID, b.InputFileID, b.Endpoint, BatchValidating, b.CompletionWindow,
 		createdAt, b.ExpiresAt, b.CountsTotal, b.ResultPublicKey, b.SealedTo, b.Source, b.Model, metadata,
 	); err != nil {
 		return fmt.Errorf("store: insert batch %q: %w", b.ID, err)
@@ -252,6 +252,19 @@ func (s *PostgresStore) GetBatch(accountID, id string) (*Batch, bool) {
 
 	b, err := scanBatch(s.pool.QueryRow(ctx,
 		`SELECT `+batchColumns+` FROM batches WHERE id = $1 AND account_id = $2`, id, accountID))
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// GetBatchByID returns the batch whatever account owns it.
+func (s *PostgresStore) GetBatchByID(id string) (*Batch, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	b, err := scanBatch(s.pool.QueryRow(ctx,
+		`SELECT `+batchColumns+` FROM batches WHERE id = $1`, id))
 	if err != nil {
 		return nil, false
 	}

@@ -17,6 +17,13 @@ import (
 // the batch with its items. The batch is left in validating.
 func seedBatch(t *testing.T, s Store, accountID string, n int) (*Batch, []*BatchItem) {
 	t.Helper()
+	return seedBatchSubmittedBy(t, s, accountID, "", n)
+}
+
+// seedBatchSubmittedBy is seedBatch for a batch stamped with the API key that
+// submitted it. apiKeyID may be "" — the caller had no key (Privy JWT, admin).
+func seedBatchSubmittedBy(t *testing.T, s Store, accountID, apiKeyID string, n int) (*Batch, []*BatchItem) {
+	t.Helper()
 
 	file := &BatchFile{
 		ID:        uniqueID("file"),
@@ -36,6 +43,7 @@ func seedBatch(t *testing.T, s Store, accountID string, n int) (*Batch, []*Batch
 	b := &Batch{
 		ID:               uniqueID("batch"),
 		AccountID:        accountID,
+		APIKeyID:         apiKeyID,
 		InputFileID:      file.ID,
 		Endpoint:         "/v1/chat/completions",
 		CompletionWindow: "24h",
@@ -111,6 +119,72 @@ func TestCreateBatchStartsValidating(t *testing.T) {
 				if it.State != ItemPending {
 					t.Errorf("item %d state = %q, want %q", i, it.State, ItemPending)
 				}
+			}
+		})
+	}
+}
+
+// TestBatchRoundTripsTheSubmittingAPIKey pins the column PR3c adds. The
+// dispatcher reads the key id off the batch row and hands it to the dispatch
+// funnel, which loads the real key and enforces its AllowedModels and spend cap
+// — so the id has to survive every read path the dispatcher uses, on both
+// backends. "" (a caller that authenticated without an API key) must come back
+// as "" and not as a NULL scan error.
+func TestBatchRoundTripsTheSubmittingAPIKey(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			const keyID = "key_batch_submitter"
+			account := uniqueID("acct")
+			keyed, _ := seedBatchSubmittedBy(t, s, account, keyID, 2)
+			unkeyed, _ := seedBatchSubmittedBy(t, s, account, "", 1)
+
+			for _, tc := range []struct {
+				batch *Batch
+				want  string
+			}{{keyed, keyID}, {unkeyed, ""}} {
+				got, ok := s.GetBatch(account, tc.batch.ID)
+				if !ok {
+					t.Fatalf("GetBatch(%s): not found", tc.batch.ID)
+				}
+				if got.APIKeyID != tc.want {
+					t.Errorf("GetBatch(%s).APIKeyID = %q, want %q", tc.batch.ID, got.APIKeyID, tc.want)
+				}
+			}
+
+			listed, err := s.ListBatches(account, 10, "")
+			if err != nil {
+				t.Fatalf("ListBatches: %v", err)
+			}
+			byID := map[string]string{}
+			for _, b := range listed {
+				byID[b.ID] = b.APIKeyID
+			}
+			if byID[keyed.ID] != keyID || byID[unkeyed.ID] != "" {
+				t.Errorf("ListBatches api key ids = %v, want %s=%q and %s=\"\"",
+					byID, keyed.ID, keyID, unkeyed.ID)
+			}
+
+			// ListOpenBatches is the dispatcher's own read path: it is where the
+			// key id is actually picked up on every tick.
+			if ok, err := s.SetBatchStatus(keyed.ID, BatchValidating, BatchInProgress, time.Now().UTC()); err != nil || !ok {
+				t.Fatalf("SetBatchStatus(validating->in_progress) = %v, %v", ok, err)
+			}
+			open, err := s.ListOpenBatches()
+			if err != nil {
+				t.Fatalf("ListOpenBatches: %v", err)
+			}
+			var found bool
+			for _, b := range open {
+				if b.ID != keyed.ID {
+					continue
+				}
+				found = true
+				if b.APIKeyID != keyID {
+					t.Errorf("ListOpenBatches APIKeyID = %q, want %q", b.APIKeyID, keyID)
+				}
+			}
+			if !found {
+				t.Errorf("ListOpenBatches did not return %s", keyed.ID)
 			}
 		})
 	}
@@ -697,6 +771,44 @@ func TestAttachOutputFilesFirstWriterWins(t *testing.T) {
 			}
 			if got.ErrorFileID == nil || *got.ErrorFileID != errFile {
 				t.Fatalf("error_file_id = %v, want %q", got.ErrorFileID, errFile)
+			}
+		})
+	}
+}
+
+// GetBatchByID is the unscoped read the dispatcher and the assembler need: it
+// resolves a batch from an id alone, in any status, and it is the only batch
+// read that ignores the account.
+func TestGetBatchByID(t *testing.T) {
+	for name, s := range storeBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			acct := uniqueID("acct")
+			b, _ := startBatch(t, s, acct, 2)
+
+			got, ok := s.GetBatchByID(b.ID)
+			if !ok {
+				t.Fatalf("GetBatchByID(%q) not found", b.ID)
+			}
+			if got.ID != b.ID || got.AccountID != acct {
+				t.Fatalf("GetBatchByID = %q/%q, want %q/%q", got.ID, got.AccountID, b.ID, acct)
+			}
+			// The scoped read of another account's batch still refuses.
+			if _, ok := s.GetBatch(uniqueID("acct"), b.ID); ok {
+				t.Fatal("GetBatch resolved a batch for the wrong account")
+			}
+
+			// A terminal batch resolves too — settle and finalize both run after
+			// the batch has left the open list.
+			if ok, err := s.SetBatchStatus(b.ID, BatchInProgress, BatchCompleted, time.Now().UTC()); err != nil || !ok {
+				t.Fatalf("SetBatchStatus(completed) = %v, %v", ok, err)
+			}
+			got, ok = s.GetBatchByID(b.ID)
+			if !ok || got.Status != BatchCompleted {
+				t.Fatalf("GetBatchByID after completion: ok=%v status=%v", ok, got)
+			}
+
+			if _, ok := s.GetBatchByID(uniqueID("batch")); ok {
+				t.Fatal("GetBatchByID resolved an id that does not exist")
 			}
 		})
 	}

@@ -14,8 +14,47 @@ func healthySignal(maxPerSlot int) SlotSignal {
 		DecodeTPS:   40,
 		DecodeFloor: 15,
 		KV:          0.20,
+		KVKnown:     true,
 		Running:     0,
 		MaxPerSlot:  maxPerSlot,
+	}
+}
+
+// A slot whose provider publishes no token budget has no KV signal at all. It
+// must still climb — the lane cannot depend on a field the protocol makes
+// optional — and it must still back off on the signals that remain.
+func TestAIMDGrowsWithoutAKVSignal(t *testing.T) {
+	a := AIMD{}
+	sig := healthySignal(4)
+	sig.KV, sig.KVKnown = 0, false
+
+	for want := 1; want <= 3; want++ {
+		if got := a.Update(sig); got != want {
+			t.Fatalf("target after %d ticks without a KV signal = %d, want %d", want, got, want)
+		}
+	}
+
+	// The remaining terms are still live: a waiting row halves it, and a decode
+	// rate under the floor halves it again.
+	sig.Waiting = 1
+	if got := a.Update(sig); got != 1 {
+		t.Fatalf("target after a waiting row = %d, want 1", got)
+	}
+	sig.Waiting, sig.DecodeTPS = 0, 12
+	if got := a.Update(sig); got != 0 {
+		t.Fatalf("target below the decode floor = %d, want 0", got)
+	}
+}
+
+// An unknown KV budget must not be read as pressure either: a slot reporting
+// none never halves on the KV term.
+func TestAIMDIgnoresAnUnknownKVBudget(t *testing.T) {
+	a := AIMD{Target: 8}
+	sig := healthySignal(16)
+	// A value that would be well past kvHigh if it were believed.
+	sig.KV, sig.KVKnown = 0.99, false
+	if got := a.Update(sig); got != 9 {
+		t.Fatalf("target with an unknown KV budget = %d, want 9 (increase, not halve)", got)
 	}
 }
 

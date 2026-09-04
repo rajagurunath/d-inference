@@ -213,10 +213,162 @@ func TestFinalizeReportsExpiredItemsWithTheirOwnCode(t *testing.T) {
 		}
 	}
 
-	// Counts stay at 0/0 for expiry (OpenAI semantics) but the batch completes.
+	// Counts stay at 0/0 for expiry (OpenAI semantics), and the terminal status
+	// finalize picks is expired rather than completed.
+	if res.Status != store.BatchExpired {
+		t.Fatalf("finalize status = %s, want expired", res.Status)
+	}
 	_, got := env.getJSON("/v1/batches/"+batchID, env.key)
+	if got["status"] != "expired" {
+		t.Fatalf("batch status = %v, want expired", got["status"])
+	}
 	if total, completed, failed := requestCounts(t, got); total != 2 || completed != 0 || failed != 0 {
 		t.Fatalf("request_counts = %d/%d/%d, want 2/0/0", total, completed, failed)
+	}
+}
+
+// The dispatcher's expiry sweep expires the open items and then calls finalize
+// with the batch STILL in_progress, so the output and error files are attached
+// before it goes terminal. Finalize owns the in_progress → expired transition;
+// a crash before it leaves the batch open and the next tick retries the pass.
+func TestFinalizeExpiresAPartiallyCompleteBatch(t *testing.T) {
+	env := newBatchEnv(t)
+	batchID := env.createFileBatch(5)
+
+	// Two items succeeded; the other three never left pending.
+	items := env.claimAll(batchID)
+	env.settleSucceeded(items[0], []byte(`{"id":"chatcmpl-0","object":"chat.completion"}`))
+	env.settleSucceeded(items[1], []byte(`{"id":"chatcmpl-1","object":"chat.completion"}`))
+	for _, it := range items[2:] {
+		if ok, err := env.st.ReleaseItem(it.ID); err != nil || !ok {
+			t.Fatalf("release %s: ok=%v err=%v", it.ID, ok, err)
+		}
+	}
+
+	now := time.Now().UTC()
+	// This is the sweep's order: close the items, leave the batch open.
+	n, err := env.st.ExpireOpenItems(batchID, now)
+	if err != nil || n != 3 {
+		t.Fatalf("ExpireOpenItems = %d, %v, want 3", n, err)
+	}
+	if b, ok := env.st.GetBatchByID(batchID); !ok || b.Status != store.BatchInProgress {
+		t.Fatalf("the sweep must leave the batch open for finalize: %+v", b)
+	}
+
+	res, err := env.srv.FinalizeBatchIfDone(batchID, now)
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if res == nil || res.Status != store.BatchExpired {
+		t.Fatalf("finalize = %+v, want expired", res)
+	}
+	if res.OutputFileID == nil || res.ErrorFileID == nil {
+		t.Fatalf("an expired batch still carries both files: %+v", res)
+	}
+
+	output := env.fetchFileLines(*res.OutputFileID)
+	if len(output) != 2 {
+		t.Fatalf("output has %d lines, want the 2 that succeeded", len(output))
+	}
+	for _, line := range output {
+		if line.Response == nil || line.Response.StatusCode != http.StatusOK {
+			t.Fatalf("output line = %+v", line)
+		}
+	}
+	errLines := env.fetchFileLines(*res.ErrorFileID)
+	if len(errLines) != 3 {
+		t.Fatalf("error file has %d lines, want the 3 that expired", len(errLines))
+	}
+	for _, line := range errLines {
+		if line.Error == nil || line.Error.Code != batchItemErrorExpired {
+			t.Fatalf("expired line = %+v", line)
+		}
+	}
+
+	_, got := env.getJSON("/v1/batches/"+batchID, env.key)
+	if got["status"] != "expired" {
+		t.Fatalf("batch status = %v, want expired", got["status"])
+	}
+	if got["output_file_id"] != *res.OutputFileID || got["error_file_id"] != *res.ErrorFileID {
+		t.Fatalf("the expired batch does not carry its files: %v", got)
+	}
+	// Expiry moves neither counter.
+	if total, completed, failed := requestCounts(t, got); total != 5 || completed != 2 || failed != 0 {
+		t.Fatalf("request_counts = %d/%d/%d, want 5/2/0", total, completed, failed)
+	}
+}
+
+// The cancellation drain is the same shape: cancel the open items, leave the
+// batch cancelling, and let finalize attach the files and CAS to cancelled. A
+// result that lands after the drain is ignored — FinishItem refuses an item
+// that is already terminal — so it changes neither the files nor the counts.
+func TestFinalizeCancelsWithALateResultIgnored(t *testing.T) {
+	env := newBatchEnv(t)
+	batchID := env.createFileBatch(5)
+
+	items := env.claimAll(batchID)
+	env.settleSucceeded(items[0], []byte(`{"id":"chatcmpl-0","object":"chat.completion"}`))
+	env.settleSucceeded(items[1], []byte(`{"id":"chatcmpl-1","object":"chat.completion"}`))
+	// items[2] stays inflight — a dispatch that is still out. The other two are
+	// back in pending.
+	for _, it := range items[3:] {
+		if ok, err := env.st.ReleaseItem(it.ID); err != nil || !ok {
+			t.Fatalf("release %s: ok=%v err=%v", it.ID, ok, err)
+		}
+	}
+
+	now := time.Now().UTC()
+	if ok, err := env.st.SetBatchStatus(batchID, store.BatchInProgress, store.BatchCancelling, now); err != nil || !ok {
+		t.Fatalf("cancel: ok=%v err=%v", ok, err)
+	}
+	n, err := env.st.CancelOpenItems(batchID, now)
+	if err != nil || n != 3 {
+		t.Fatalf("CancelOpenItems = %d, %v, want 3", n, err)
+	}
+
+	res, err := env.srv.FinalizeBatchIfDone(batchID, now)
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if res == nil || res.Status != store.BatchCancelled {
+		t.Fatalf("finalize = %+v, want cancelled", res)
+	}
+	if res.OutputFileID == nil {
+		t.Fatal("the two items that succeeded before the cancel belong in the output file")
+	}
+	if res.ErrorFileID != nil {
+		t.Fatalf("a cancelled item was never attempted, so it belongs in no file: %+v", res)
+	}
+	if lines := env.fetchFileLines(*res.OutputFileID); len(lines) != 2 {
+		t.Fatalf("output has %d lines, want 2", len(lines))
+	}
+
+	// The dispatch that was still out reports back. It is ignored.
+	ok, err := env.st.FinishItem(store.ItemResult{
+		ItemID: items[2].ID, Succeeded: true, RequestID: "req_late",
+		ResultBlobRef: BatchItemResultRef(items[2].ID),
+	}, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("late finish: %v", err)
+	}
+	if ok {
+		t.Fatal("a late result settled an item the cancel had already closed")
+	}
+
+	_, got := env.getJSON("/v1/batches/"+batchID, env.key)
+	if got["status"] != "cancelled" {
+		t.Fatalf("batch status = %v, want cancelled", got["status"])
+	}
+	if got["output_file_id"] != *res.OutputFileID {
+		t.Fatalf("the cancelled batch does not carry its output file: %v", got)
+	}
+	if total, completed, failed := requestCounts(t, got); total != 5 || completed != 2 || failed != 0 {
+		t.Fatalf("request_counts = %d/%d/%d, want 5/2/0", total, completed, failed)
+	}
+
+	// A second finalize changes nothing: the batch is terminal.
+	if again, err := env.srv.FinalizeBatchIfDone(batchID, now.Add(2*time.Second)); err != nil || again != nil {
+		t.Fatalf("second finalize = %+v, %v", again, err)
 	}
 }
 
