@@ -1,6 +1,6 @@
 # Single-Mac dev loop
 
-> Last updated: 2026-09-04 · commit `e22a7d6ce`
+> Last updated: 2026-09-04 · commit `1a541c33b`
 
 Run a coordinator and one provider on one Mac for manual testing, without
 touching the shared dev environment or writing a throwaway launch script. For
@@ -171,16 +171,25 @@ MODEL=$DARKBLOOM_TESTBED_MODEL ./scripts/dev-smoke-batch-api.sh
 Expect:
 
 ```
+--- warm the model with one synchronous completion ---
+model warm
 --- POST /v1/files ---
 uploaded file-…
 --- POST /v1/batches ---
 created batch_…
 --- GET /v1/batches/batch_… (poll to completed, up to 180s) ---
   status=in_progress completed=0 failed=0 total=3
+  status=in_progress completed=1 failed=0 total=3
   status=completed completed=3 failed=0 total=3
 batch batch_… completed with 3 of 3 requests
 batch API smoke PASSED
 ```
+
+The warm-up step is load-bearing. The dispatcher claims items only for a model
+some provider slot has headroom for, and a provider that has never served the
+model has no slot for it — so a batch created against a freshly started stack
+sits at `in_progress` indefinitely with nothing in the log. One ordinary chat
+completion loads the model and the next dispatcher tick starts claiming.
 
 **`make dev-stack` wires the batch lane, but only if the two
 `EIGENINFERENCE_BATCH_*` variables are exported before you start it.**
@@ -258,6 +267,7 @@ operator-facing surface for the model-load verdict.
 | smoke script prints `no SSE 'data:' line within 60s` | Slow first load, or the wrong model was requested | Re-run; confirm the script's `DARKBLOOM_TESTBED_MODEL` matches what `make dev-stack` served |
 | `DARKBLOOM_DEV_KEY not set` | Forgot to copy the key `make dev-stack` printed | Copy it from terminal A's startup output |
 | Port 18080 still held after you stopped the stack | SIGINT went to `make`/`sh`, not the Go binary | `kill -INT "$(pgrep -f 'exe/devstack')"` |
+| A batch stays at `in_progress` with `completed: 0` and nothing in the log | The model is not resident on any provider, so no slot has batch headroom and the dispatcher claims nothing | Serve one ordinary chat completion for that model first (`dev-smoke-batch-api.sh` now does this itself) |
 | Every `/v1/files` or `/v1/batches` call returns `503 batch_unavailable` | The coordinator has no batch blob store: `EIGENINFERENCE_BATCH_DEV_INSECURE_KEY` / `EIGENINFERENCE_BATCH_BLOB_DIR` were not exported *before* the stack started | Stop the stack, export both, start again; confirm `batch lane enabled` in the startup log |
 
 ## Related

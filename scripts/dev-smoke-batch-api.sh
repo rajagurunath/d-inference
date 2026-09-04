@@ -1,10 +1,16 @@
 #!/bin/bash
 # Smoke test for the coordinator's Batch API surface (Tidal batch lane, PR2).
 #
-# Uploads a three-line JSONL input file, creates a batch from it, polls until
-# the batch is `completed`, and asserts request_counts.completed == 3. With the
-# dispatcher running, three short items settle in seconds; the 180 s budget is
-# there for a cold model load on the first request.
+# Warms the model with one synchronous completion, uploads a three-line JSONL
+# input file, creates a batch from it, polls until the batch is `completed`, and
+# asserts request_counts.completed == 3. With the dispatcher running and the
+# model resident, three short items settle in seconds; the 180 s budget is there
+# for a slow box.
+#
+# The warm-up is not optional: the dispatcher claims items only for a model some
+# provider slot has headroom for, and a provider that has never served the model
+# has no slot for it, so a batch created against a cold stack sits at
+# `in_progress` forever.
 #
 # The coordinator must be running with the batch lane enabled, i.e. a mnemonic
 # configured, or EIGENINFERENCE_BATCH_DEV_INSECURE_KEY=true for local
@@ -63,6 +69,22 @@ print(json.dumps({
 PY
 done
 green "wrote $(wc -l < "$INPUT" | tr -d ' ') lines"
+
+step "warm the model with one synchronous completion"
+# The batch dispatcher only claims items for a model some provider slot has
+# headroom for, and a provider that has never served the model has no slot for
+# it at all. On a freshly started stack the batch therefore sits at
+# in_progress indefinitely. One ordinary chat completion loads the model (a few
+# seconds, cold) and the dispatcher starts claiming on its next tick.
+WARM_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$COORD/v1/chat/completions" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK.\"}],\"max_tokens\":8}")
+if [ "$WARM_CODE" != "200" ]; then
+  red "FAIL: warm-up completion returned HTTP $WARM_CODE — the model is not servable, so no batch item can be either"
+  exit 1
+fi
+green "model warm"
 
 step "POST /v1/files"
 FILE_JSON=$(curl -fsS -X POST "$COORD/v1/files" \
