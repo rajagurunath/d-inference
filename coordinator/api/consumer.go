@@ -357,6 +357,18 @@ func (s *Server) noteInferenceError(providerID string, pr *registry.PendingReque
 	if providerID == "" || pr == nil {
 		return
 	}
+	// Batch attempts feed no provider health or capacity tracker. This is the
+	// same exemption the success and failure reputation sites take
+	// (handleCompleteAt, handleInferenceError), extended to the capacity funnel:
+	// RecordCapacityReject* arms the capacity-reject cooldown, the one-shot
+	// budget clamp and the no-reset capacity-503 rate window, all of which the
+	// ONLINE reservation path scores providers on. A batch attempt is placed on
+	// leftover headroom against a 120s deadline and owns its own retry ladder,
+	// so letting its 503s derate a pair would make co-serving degrade the very
+	// online routing the lane exists to stay out of the way of.
+	if pr.Traits.Lane == registry.LaneBatch {
+		return
+	}
 	// Structured health-neutral outcomes (isProviderHealthNeutralErrorReason:
 	// jinja_* template-render failures, tool_noncompliance, and the
 	// request-clock-specific deadline_unreachable refusal) never feed provider

@@ -1,6 +1,6 @@
 # HTTP API contracts
 
-> Last updated: 2026-09-04 · commit `d574bd5af`
+> Last updated: 2026-09-04 · commit `1fd7457ab`
 
 The complete public HTTP surface of the coordinator, derived from the 105 `HandleFunc` registrations in `routes()` (`coordinator/api/server.go`), including the `/v1/` catch-all. Every route is listed once below with its handler symbol, authentication requirement, and rate-limit bucket; the second half of the page gives the wire shapes, headers, error table, SSE framing, limits, timeouts, and version-gate semantics that those routes share. For *why* the pipeline is built this way see [`../architecture/components/consumer.md`](../architecture/components/consumer.md); for the crypto model behind sealed transport see [`../architecture/security/encryption.md`](../architecture/security/encryption.md).
 
@@ -309,6 +309,32 @@ Requests are decoded into a generic JSON object with `json.Number` preserved (`p
 | `reasoning`, `reasoning_effort` | Applied per model policy by `applyResolvedModelReasoningPolicy` (`coordinator/api/reasoning_request_policy.go`) |
 | `provider` and other routing hints | Removed by `stripProviderRoutingFields` (`coordinator/api/request_introspection.go`) |
 | `image_url` parts with `http(s)` URLs | Fetched by the coordinator before dispatch (`resolveRemoteMedia`, `coordinator/api/media_resolve.go`) |
+| `service_tier` | `"batch"` puts the request on the batch lane; every other value is ignored. See [Service tier](#service-tier) |
+
+### Service tier
+
+`service_tier` selects the lane a request routes on (`resolveRequestLane`, `coordinator/api/inference_preprocess.go`). Accepted on `/v1/chat/completions` and the Responses API.
+
+| Value | Behaviour |
+|---|---|
+| absent, `"auto"`, `"default"`, `"flex"`, anything else | Online lane — the ordinary paid path. Unknown values are ignored rather than rejected, so a client that sends OpenAI's other tiers is served normally |
+| `"batch"` | Batch lane. Case-sensitive: `"Batch"` is ignored |
+
+On the batch lane the coordinator places the request only on a provider slot that already has the model **resident** and that the online quality-concurrency cap is leaving empty (`BatchRowsAllowed` = the pair's admission cap minus one row reserved for online). A batch request never enters the coordinator wait queue, never triggers a speculative hedge, and never feeds provider reputation, TTFT calibration, capacity cooldowns or the uptime series — so batch traffic cannot move how online traffic is routed. Its first-content deadline is 120 s rather than the online per-model deadline.
+
+When no slot has batch headroom the request is refused immediately instead of waiting:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 5
+
+{"error":{"code":"no_capacity","type":"rate_limit_exceeded",
+          "message":"no provider for model \"…\" has batch headroom right now"}}
+```
+
+Retry after the advertised interval; the slot reopens as soon as online traffic drains. Everything else about the request and response is identical to an online call.
+
+Pricing: batch traffic is metered at the batch rate — see the design record [`../design/tidal-batch-lane.md`](../design/tidal-batch-lane.md).
 
 ### Chat Completions response (`ChatCompletionResponse`, `coordinator/api/types/types.go`)
 

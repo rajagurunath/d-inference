@@ -48,3 +48,25 @@ func (r *Registry) batchRowsAllowedLocked(p *Provider, model string) int {
 	}
 	return allowed
 }
+
+// batchSlotOccupancy is how many rows the batch gate must treat as already
+// taken on a snapshot's slot.
+//
+// It leads with batchPendingLoad — p.pendingLoadForModelLocked, the number the
+// ONLINE admission cap is enforced against, which is debited synchronously by
+// addPendingLocked the moment a reservation is taken. backendRunning alone is
+// heartbeat-derived: several batch reservations inside one dispatcher tick would
+// all read the same pre-tick row count and overfill the slot.
+//
+// backendRunning still participates as a floor because pendingLoadForModelLocked
+// falls back to the coordinator's whole-provider pending count on a slot that
+// reports no MaxConcurrency, and that fallback cannot see rows the provider is
+// running on its own. Batch is the lane that must never be the request that
+// pushes a slot past its cap, so it takes the larger of the two views.
+func batchSlotOccupancy(snap routingSnapshot) int {
+	occupancy := snap.batchPendingLoad
+	if snap.backendRunning > occupancy {
+		occupancy = snap.backendRunning
+	}
+	return occupancy
+}

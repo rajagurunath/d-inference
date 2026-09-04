@@ -2272,6 +2272,38 @@ func (d *dispatchState) waitFirstChunk() (outcome dispatchOutcome) {
 // served by the caller's own machine) and either keep waiting for the primary
 // alone (no backup available) or race primary vs backup. Returns the same outcome
 // set as waitFirstChunk.
+// skipSpeculativeBackup reports whether this attempt must launch no speculative
+// backup at all, before the hedge governor is consulted. The clauses are
+// independent reasons to skip and are OR-ed, never assigned over each other: an
+// earlier true must survive a later false, or a batch request would get its
+// hedge back the moment the prefer clause happened not to apply to the winning
+// provider. That ordering bug is also why this lives in its own function — it
+// is the one part of runSpeculative a test can pin without a live provider.
+//
+// Batch lane: no speculative backup, EVER (the same rule tryAcquireBackupHedge
+// enforces on the governor side, which this must not depend on: a server built
+// without a hedge governor never reaches the governor at all, and this is then
+// the only thing standing between a batch item and a second billed attempt).
+//
+// Prefer policy: do NOT speculatively race a paid PUBLIC backup against a prefer
+// request that is being served by the caller's OWN machine — the user opted into
+// "prefer my machine (free)", so a slow owned machine must be waited on, not
+// raced (and billed) by the public fleet. (Exclusive self-route is already safe:
+// its backup selection is owned-only and returns nil when there is no other
+// owned machine.) When the prefer primary is itself a public provider (the owner
+// owns nothing / fell back), normal speculative behaviour applies.
+func (d *dispatchState) skipSpeculativeBackup(provider *registry.Provider) bool {
+	if d.lane == registry.LaneBatch {
+		return true
+	}
+	if d.policy.prefer && provider != nil {
+		provider.Mu().Lock()
+		defer provider.Mu().Unlock()
+		return d.policy.ownerAccountID != "" && provider.AccountID == d.policy.ownerAccountID
+	}
+	return false
+}
+
 func (d *dispatchState) runSpeculative() dispatchOutcome {
 	s := d.s
 	r := d.r
@@ -2296,26 +2328,10 @@ func (d *dispatchState) runSpeculative() dispatchOutcome {
 	backupRouteRequestID := ""
 	backupRouteAttempt := d.attempt
 
-	// Do NOT speculatively race a paid PUBLIC backup against a prefer
-	// request that is being served by the caller's OWN machine: the user
-	// opted into "prefer my machine (free)", so a slow owned machine must
-	// be waited on, not raced (and billed) by the public fleet. (Exclusive
-	// self-route is already safe — its backup selection is owned-only and
-	// returns nil when there's no other owned machine.) When the prefer
-	// primary is itself a public provider (the owner owns nothing / fell
-	// back), normal speculative behaviour applies.
-	skipBackup := false
-	// Batch lane: no speculative backup, ever (see tryAcquireBackupHedge). This
-	// falls through the nil-backup branch below — byte-identical to today's
-	// "no backup available" path — so the primary is simply waited on.
-	if d.lane == registry.LaneBatch {
-		skipBackup = true
-	}
-	if d.policy.prefer {
-		provider.Mu().Lock()
-		skipBackup = d.policy.ownerAccountID != "" && provider.AccountID == d.policy.ownerAccountID
-		provider.Mu().Unlock()
-	}
+	// Product/lane reasons to launch no speculative backup at all. Falls through
+	// the nil-backup branch below — byte-identical to today's "no backup
+	// available" path — so the primary is simply waited on.
+	skipBackup := d.skipSpeculativeBackup(provider)
 
 	// Hedge governor (Routing v2 Phase 4): insurance must never amplify an
 	// overload. A non-allow verdict suppresses the backup entirely and falls
