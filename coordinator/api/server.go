@@ -1160,6 +1160,16 @@ func (s *Server) SetChallengeInterval(d time.Duration) {
 
 func (s *Server) SetSkipChallenge(skip bool) {
 	s.skipChallenge = skip
+	if skip {
+		// Announce the test-only posture once, where it is set: no attestation
+		// is ever verified after registration, and challenge freshness is
+		// auto-refreshed so the routing liveness gate does not deroute every
+		// provider 16 minutes in (see Server.skippedChallengeRefreshLoop).
+		s.logger.Warn("attestation challenges are SKIPPED (testing only) — "+
+			"challenge freshness is auto-refreshed, nothing is re-attested",
+			"refresh_interval", skippedChallengeRefreshInterval(s.challengeInterval),
+			"freshness_max_age", registry.ChallengeFreshnessMaxAge())
+	}
 }
 
 // SetAllowDuplicateProviderSerialsForTesting lets the in-process E2E testbed

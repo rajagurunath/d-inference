@@ -53,6 +53,13 @@ const (
 	// DefaultChallengeInterval is how often the coordinator challenges providers.
 	DefaultChallengeInterval = 5 * time.Minute
 
+	// MaxSkippedChallengeRefreshInterval caps the cadence at which a
+	// skipChallenge coordinator restamps challenge freshness (see
+	// skippedChallengeRefreshLoop). It is an upper bound only: the effective
+	// period is also clamped to the configured challenge interval and to half
+	// the routing gate's freshness window, whichever is smaller.
+	MaxSkippedChallengeRefreshInterval = 5 * time.Minute
+
 	// ChallengeResponseTimeout is how long to wait for a challenge response.
 	ChallengeResponseTimeout = 30 * time.Second
 	// RegistrationAttestationMaxAge bounds replay of a previously valid signed
@@ -994,13 +1001,14 @@ func (s *Server) attachProviderLocation(providerID string, provider *registry.Pr
 
 // challengeLoop periodically sends attestation challenges to a provider.
 func (s *Server) challengeLoop(ctx context.Context, providerID string, provider *registry.Provider, tracker *challengeTracker) {
-	if s.skipChallenge {
-		return
-	}
-
 	interval := s.challengeInterval
 	if interval == 0 {
 		interval = DefaultChallengeInterval
+	}
+
+	if s.skipChallenge {
+		s.skippedChallengeRefreshLoop(ctx, providerID, provider, interval)
+		return
 	}
 
 	// Send initial challenge immediately so the provider is routable
@@ -1033,6 +1041,49 @@ func (s *Server) challengeLoop(ctx context.Context, providerID string, provider 
 			s.sendChallenge(ctx, providerID, provider, tracker)
 		}
 	}
+}
+
+// skippedChallengeRefreshLoop keeps a provider's challenge-freshness stamp
+// alive while attestation challenges are skipped (testing only).
+//
+// Skipping the challenge must not be equivalent to failing it. The routing
+// liveness gate derouts any provider whose LastChallengeVerified is older than
+// registry.ChallengeFreshnessMaxAge(), and with skipChallenge the stamp is
+// written exactly once — by registration attestation. Returning here (the
+// behaviour before this loop existed) therefore dropped every provider out of
+// candidate scans, /v1/models/capacity and the warm pool 16 minutes after it
+// connected, while the provider itself stayed connected and online. Harmless
+// for a sub-16-minute e2e run; fatal for a dev stack meant to run for hours.
+//
+// Production never reaches this: skipChallenge is set only by the e2e testbed.
+func (s *Server) skippedChallengeRefreshLoop(ctx context.Context, providerID string, provider *registry.Provider, interval time.Duration) {
+	ticker := time.NewTicker(skippedChallengeRefreshInterval(interval))
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if provider.ChallengeShouldStop() {
+				return
+			}
+			s.registry.RefreshChallengeFreshnessSkipped(providerID)
+		}
+	}
+}
+
+// skippedChallengeRefreshInterval is the cadence skippedChallengeRefreshLoop
+// restamps at: the configured challenge interval, but never longer than
+// MaxSkippedChallengeRefreshInterval and never more than half the routing
+// gate's freshness window — the testbed sets a one-hour challenge interval, so
+// following `interval` alone would restamp long after the gate has closed.
+func skippedChallengeRefreshInterval(interval time.Duration) time.Duration {
+	refresh := min(interval, MaxSkippedChallengeRefreshInterval, registry.ChallengeFreshnessMaxAge()/2)
+	if refresh <= 0 {
+		refresh = MaxSkippedChallengeRefreshInterval
+	}
+	return refresh
 }
 
 // generateNonce creates a random 32-byte nonce and returns it as base64.

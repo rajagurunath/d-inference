@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/api"
 	"github.com/eigeninference/d-inference/coordinator/store"
 )
 
@@ -373,6 +374,32 @@ type SuiteConfig struct {
 	// Empty preserves the ephemeral-port behaviour every existing suite
 	// relies on.
 	ListenAddr string
+	// RealChallenges runs the coordinator's production attestation-challenge
+	// loop: challenges are actually sent on the coordinator's default interval
+	// and the provider must answer them. Default (false) skips challenges, the
+	// posture every e2e suite has always used.
+	//
+	// Skipping is safe for a test that finishes in minutes and the coordinator
+	// now keeps challenge freshness alive while it skips, so a long-lived stack
+	// no longer derouts. This knob is about FIDELITY: set it when the lane
+	// should exercise the real challenge/response path end to end
+	// (e2e/cmd/devstack --real-challenges).
+	RealChallenges bool
+}
+
+// challengePosture returns the coordinator's attestation-challenge settings for
+// this suite: whether to skip challenges, and the challenge interval to
+// configure. The default posture parks the interval at an hour because nothing
+// is sent anyway; RealChallenges takes the production path on the coordinator's
+// own default interval.
+//
+// Split out of startCoordinator so the plumbing is unit-testable without
+// booting a coordinator.
+func (sc SuiteConfig) challengePosture() (skip bool, interval time.Duration) {
+	if sc.RealChallenges {
+		return false, api.DefaultChallengeInterval
+	}
+	return true, 1 * time.Hour
 }
 
 func DefaultSuiteConfig() SuiteConfig {

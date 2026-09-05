@@ -49,3 +49,28 @@ func TestResolveDatabaseURLEmptyMeansEphemeral(t *testing.T) {
 		t.Fatalf("resolveDatabaseURL = (%q, %q), want empty", url, source)
 	}
 }
+
+// --real-challenges defaults from DARKBLOOM_DEVSTACK_REAL_CHALLENGES. Off is
+// the historical posture (challenges skipped, freshness auto-refreshed by the
+// coordinator); on runs the real attestation challenge/response path.
+
+func TestEnvBoolAcceptsParseBoolTruthyValues(t *testing.T) {
+	for _, v := range []string{"true", "TRUE", "1", "t", "True"} {
+		t.Setenv(realChallengesEnv, v)
+		if !envBool(realChallengesEnv) {
+			t.Errorf("envBool(%q) = false, want true", v)
+		}
+	}
+}
+
+func TestEnvBoolIsFalseForUnsetEmptyAndGarbage(t *testing.T) {
+	if envBool("DARKBLOOM_DEVSTACK_DEFINITELY_UNSET") {
+		t.Error("unset variable should be false")
+	}
+	for _, v := range []string{"", "yes", "on", "please"} {
+		t.Setenv(realChallengesEnv, v)
+		if envBool(realChallengesEnv) {
+			t.Errorf("envBool(%q) = true, want false — a typo must not enable real challenges", v)
+		}
+	}
+}
