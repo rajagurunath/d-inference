@@ -69,7 +69,7 @@ func main() {
 	}
 	fmt.Printf("\nTo run the smoke script:\n")
 	if len(suite.Users) > 0 {
-		fmt.Printf("  DARKBLOOM_DEV_URL=%s DARKBLOOM_DEV_KEY=%s ./scripts/dev-smoke-batch.sh\n", suite.Coordinator.BaseURL(), suite.Users[0].APIKey)
+		fmt.Printf("  DARKBLOOM_DEV_URL=%s DARKBLOOM_DEV_KEY=%s ./scripts/dev-smoke-chat.sh\n", suite.Coordinator.BaseURL(), suite.Users[0].APIKey)
 	}
 	fmt.Printf("\nPress Ctrl-C to stop.\n\n")
 

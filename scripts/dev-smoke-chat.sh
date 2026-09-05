@@ -1,14 +1,13 @@
 #!/bin/bash
-# Smoke test for the single-Mac dev stack (`make dev-stack`). Phase 1: proves
-# a streaming chat completion round-trips through the in-process coordinator
-# and provider within 60 seconds. PR2 extends this script with the batch
-# round trip once /v1/files and /v1/batches exist; this phase only checks the
-# online chat path.
+# Smoke test for the single-Mac dev stack (`make dev-stack`): proves a
+# streaming chat completion round-trips through the in-process coordinator and
+# provider within 60 seconds. It checks the online chat path only; the batch
+# round trip has its own script, scripts/dev-smoke-batch-api.sh.
 #
 # Usage:
 #   DARKBLOOM_DEV_KEY=<api key printed by `make dev-stack`> \
 #   DARKBLOOM_TESTBED_MODEL=mlx-community/gemma-4-e2b-it-4bit \
-#   scripts/dev-smoke-batch.sh
+#   scripts/dev-smoke-chat.sh
 #
 # DARKBLOOM_DEV_URL defaults to http://127.0.0.1:18080 (the dev-stack listen
 # address). Exits 0 when an SSE `data:` line arrives within 60s, 1 otherwise.
