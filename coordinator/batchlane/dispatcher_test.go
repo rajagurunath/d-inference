@@ -62,12 +62,27 @@ func seedBatch(t *testing.T, st store.Store, blobs *sealedblob.Store, id string,
 // sealed to its own key.
 func seedBatchKeyed(t *testing.T, st store.Store, blobs *sealedblob.Store, id string, n int, expiresAt time.Time, resultPublicKey string) *store.Batch {
 	t.Helper()
-	return seedBatchWith(t, st, blobs, id, n, expiresAt, resultPublicKey, "")
+	return seedBatchWith(t, st, blobs, id, n, expiresAt, resultPublicKey, "", "")
+}
+
+// seedBatchForModel is seedBatch for the inline form, which declares its model
+// on the batch row instead of on every line.
+func seedBatchForModel(
+	t *testing.T,
+	st store.Store,
+	blobs *sealedblob.Store,
+	id, model string,
+	n int,
+	expiresAt time.Time,
+) *store.Batch {
+	t.Helper()
+	return seedBatchWith(t, st, blobs, id, n, expiresAt, "", "", model)
 }
 
 // seedBatchWith is the full seeder: resultPublicKey selects consumer sealing,
 // apiKeyID is the key the batch was submitted with ("" for a caller that had
-// none).
+// none), and model is the batch-level model of the inline form ("" for the file
+// form, whose lines each carry their own).
 func seedBatchWith(
 	t *testing.T,
 	st store.Store,
@@ -75,7 +90,7 @@ func seedBatchWith(
 	id string,
 	n int,
 	expiresAt time.Time,
-	resultPublicKey, apiKeyID string,
+	resultPublicKey, apiKeyID, model string,
 ) *store.Batch {
 	t.Helper()
 	b := &store.Batch{
@@ -90,7 +105,11 @@ func seedBatchWith(
 		CountsTotal:      n,
 		SealedTo:         "coordinator",
 		Source:           "file",
+		Model:            model,
 		ResultPublicKey:  resultPublicKey,
+	}
+	if model != "" {
+		b.Source = "inline"
 	}
 	if resultPublicKey != "" {
 		b.SealedTo = "consumer"
@@ -124,6 +143,14 @@ func seedBatchWith(
 // idleSlot is one provider·model slot with room for maxPerSlot batch rows.
 func idleSlot(v *batchlanetest.FakeView, maxPerSlot int) batchlane.SlotKey {
 	key := batchlane.SlotKey{ProviderID: "P1", Model: testModel}
+	v.Set(key, batchlane.SlotSignal{DecodeTPS: 40, DecodeFloor: 15, KV: 0.20, KVKnown: true, MaxPerSlot: maxPerSlot})
+	return key
+}
+
+// idleSlotFor is idleSlot for an arbitrary provider and model, so a test can
+// give one model headroom and leave another with no slots at all.
+func idleSlotFor(v *batchlanetest.FakeView, providerID, model string, maxPerSlot int) batchlane.SlotKey {
+	key := batchlane.SlotKey{ProviderID: providerID, Model: model}
 	v.Set(key, batchlane.SlotSignal{DecodeTPS: 40, DecodeFloor: 15, KV: 0.20, KVKnown: true, MaxPerSlot: maxPerSlot})
 	return key
 }
@@ -729,7 +756,7 @@ func TestDispatchCarriesTheBatchesAPIKey(t *testing.T) {
 	h := newHarness(t, batchlane.Config{MaxAttempts: 3})
 	idleSlot(h.view, 4)
 	const keyID = "key_submitter"
-	seedBatchWith(t, h.st, h.blobs, "batch_keyed", 1, testStart.Add(24*time.Hour), "", keyID)
+	seedBatchWith(t, h.st, h.blobs, "batch_keyed", 1, testStart.Add(24*time.Hour), "", keyID, "")
 
 	h.tick(t, ctx, testStart)
 	waitForCalls(t, h.dispatch, 1)
@@ -1402,4 +1429,99 @@ func TestProgressFloorGrantsOneItemPerTickAcrossBatches(t *testing.T) {
 
 	close(h.dispatch.Block)
 	h.d.AwaitDispatch()
+}
+
+// The AIMD runs per slot, so the allowance it produces belongs to the model
+// those slots serve. Spending a fleet-wide sum on any ranked batch let a batch
+// for model X claim items no X slot could take: each one ran the whole dispatch
+// funnel — a fleet scan under the registry's read lock — came back no_capacity,
+// and was released, once per tick, for the life of the batch.
+func TestBudgetIsScopedPerModel(t *testing.T) {
+	const modelX, modelY = "model-x", "model-y"
+
+	t.Run("a batch for a model with no slots claims nothing", func(t *testing.T) {
+		ctx := context.Background()
+		h := newHarness(t, batchlane.Config{MaxAttempts: 3})
+		idleSlotFor(h.view, "P-Y", modelY, 4)
+		seedBatchForModel(t, h.st, h.blobs, "batch_x", modelX, 5, testStart.Add(24*time.Hour))
+
+		// Five ticks: long enough for Y's AIMD target to climb well past 1, so
+		// a fleet-wide budget would have been spent on X several times over.
+		for i := 0; i < 5; i++ {
+			h.tick(t, ctx, testStart.Add(time.Duration(i)*time.Second))
+		}
+		if n := h.dispatch.Len(); n != 0 {
+			t.Fatalf("dispatch calls = %d, want 0 — model-y's budget is not model-x's", n)
+		}
+		if states := itemStates(t, h.st, "batch_x"); states[store.ItemPending] != 5 {
+			t.Fatalf("item states = %v, want all 5 still pending", states)
+		}
+	})
+
+	t.Run("the model that has the slots still drains", func(t *testing.T) {
+		ctx := context.Background()
+		h := newHarness(t, batchlane.Config{MaxAttempts: 3})
+		idleSlotFor(h.view, "P-Y", modelY, 4)
+		seedBatchForModel(t, h.st, h.blobs, "batch_x", modelX, 5, testStart.Add(24*time.Hour))
+		seedBatchForModel(t, h.st, h.blobs, "batch_y", modelY, 5, testStart.Add(24*time.Hour))
+
+		for i := 0; i < 5; i++ {
+			h.tick(t, ctx, testStart.Add(time.Duration(i)*time.Second))
+		}
+		for _, c := range h.dispatch.Calls() {
+			if c.Model != modelY {
+				t.Fatalf("dispatched model %q, want only %q", c.Model, modelY)
+			}
+		}
+		if h.dispatch.Len() == 0 {
+			t.Fatal("the batch whose model has the slots dispatched nothing")
+		}
+		if states := itemStates(t, h.st, "batch_x"); states[store.ItemPending] != 5 {
+			t.Fatalf("model-x item states = %v, want all 5 still pending", states)
+		}
+		if states := itemStates(t, h.st, "batch_y"); states[store.ItemPending] == 5 {
+			t.Fatalf("model-y item states = %v, want some of them claimed", states)
+		}
+	})
+
+	t.Run("a file-form batch still spends the fleet budget", func(t *testing.T) {
+		ctx := context.Background()
+		h := newHarness(t, batchlane.Config{MaxAttempts: 3})
+		idleSlotFor(h.view, "P-Y", modelY, 4)
+		// No model on the row: the file form carries one per line, so there is
+		// no single model to scope to and the fleet budget is the bound.
+		seedBatch(t, h.st, h.blobs, "batch_file", 5, testStart.Add(24*time.Hour))
+
+		for i := 0; i < 3; i++ {
+			h.tick(t, ctx, testStart.Add(time.Duration(i)*time.Second))
+		}
+		if h.dispatch.Len() == 0 {
+			t.Fatal("a file-form batch claimed nothing from the fleet budget")
+		}
+	})
+}
+
+// A model's in-flight items are debited from its OWN headroom, so a second
+// batch for the same model sees what the first one spent rather than the full
+// per-tick target again.
+func TestModelHeadroomCountsItsOwnInflightItems(t *testing.T) {
+	ctx := context.Background()
+	const model = "model-shared"
+	h := newHarness(t, batchlane.Config{MaxAttempts: 3})
+	idleSlotFor(h.view, "P1", model, 4)
+	// Hold every dispatch so claimed items stay in flight across ticks.
+	h.dispatch.Block = make(chan struct{})
+	defer close(h.dispatch.Block)
+	seedBatchForModel(t, h.st, h.blobs, "batch_a", model, 10, testStart.Add(24*time.Hour))
+	seedBatchForModel(t, h.st, h.blobs, "batch_b", model, 10, testStart.Add(24*time.Hour))
+
+	// The target climbs by one per healthy tick and every claim stays out, so
+	// after n ticks exactly n items are in flight across BOTH batches.
+	for i := 1; i <= 4; i++ {
+		h.d.Tick(ctx, testStart.Add(time.Duration(i-1)*time.Second))
+		waitForCalls(t, h.dispatch, i)
+	}
+	if n := h.d.InflightItems(); n != 4 {
+		t.Fatalf("in-flight items = %d, want 4 — the model's headroom is shared", n)
+	}
 }
