@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1168,5 +1170,50 @@ func TestBatchItemExists(t *testing.T) {
 				t.Fatalf("BatchItemExists(unknown) = %v, %v, want false", ok, err)
 			}
 		})
+	}
+}
+
+// TestBatchTablesAreCreatedComplete pins the batch lane's migration contract.
+//
+// The batch tables have never shipped, so every column belongs in the CREATE
+// TABLE — there is no deployed database to upgrade. api_key_id was instead
+// added by a `DO $$ ... EXCEPTION WHEN others THEN NULL $$` ALTER, which
+// swallows EVERY error: a permissions failure, a lock timeout, a typo in the
+// column type all become a silent no-op and the coordinator boots on a schema
+// that is missing a column it will then write to. The repo contract allows
+// swallowing only duplicate_column (two coordinators racing the same ALTER).
+//
+// Both halves are asserted: the columns exist on a freshly migrated database,
+// and no batch-table statement swallows `WHEN others`.
+func TestBatchTablesAreCreatedComplete(t *testing.T) {
+	source, err := os.ReadFile("postgres.go")
+	if err != nil {
+		t.Fatalf("read postgres.go: %v", err)
+	}
+	for i, line := range strings.Split(string(source), "\n") {
+		if !strings.Contains(line, "TABLE batches") && !strings.Contains(line, "TABLE batch_") {
+			continue
+		}
+		if strings.Contains(line, "EXCEPTION WHEN others") {
+			t.Errorf("postgres.go:%d swallows every error on a batch table: %s", i+1, strings.TrimSpace(line))
+		}
+	}
+
+	s := testPostgresStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, column := range []string{"api_key_id", "model", "requested_model"} {
+		var exists bool
+		if err := s.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				 WHERE table_schema = current_schema()
+				   AND table_name = 'batches' AND column_name = $1)`, column).Scan(&exists); err != nil {
+			t.Fatalf("probe batches.%s: %v", column, err)
+		}
+		if !exists {
+			t.Errorf("batches.%s was not created by migrate()", column)
+		}
 	}
 }

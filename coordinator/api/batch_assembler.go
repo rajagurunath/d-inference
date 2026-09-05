@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/batchlane"
 	"github.com/eigeninference/d-inference/coordinator/store"
 	"github.com/eigeninference/d-inference/coordinator/store/sealedblob"
 )
@@ -40,10 +41,6 @@ var batchItemErrorMessages = map[string]string{
 	batchItemErrorExpired:   "The batch expired before this request was processed.",
 	batchItemErrorCancelled: "The batch was cancelled before this request was processed.",
 }
-
-// BatchOutputRetention is how long an assembled output or error file, and the
-// result blobs behind it, survive after the batch completes.
-const BatchOutputRetention = 7 * 24 * time.Hour
 
 // FinalizeResult reports what a finalize pass did. It is nil when the batch was
 // not ready (or not open), which is the common case on a busy tick.
@@ -239,7 +236,7 @@ func (s *Server) assembleBatchFiles(blobs *sealedblob.Store, batch *store.Batch,
 func (s *Server) readItemResult(blobs *sealedblob.Store, batch *store.Batch, it *store.BatchItem) (json.RawMessage, error) {
 	ref := it.ResultBlobRef
 	if ref == "" {
-		ref = BatchItemResultRef(it.ID)
+		ref = batchlane.ResultBlobRef(it.ID)
 	}
 	var (
 		raw []byte
@@ -340,22 +337,33 @@ func (s *Server) discardAssembledFile(blobs *sealedblob.Store, fileID *string, n
 // inlineBatchResults renders the OpenRouter inline results array for a
 // terminal inline batch. It reads the same result blobs the output file is
 // assembled from, so both surfaces agree.
-func (s *Server) inlineBatchResults(batch *store.Batch) ([]inlineResult, error) {
+//
+// It stops at maxInlineResults and reports truncated=true, because every
+// succeeded item costs a blob open, a decrypt and a re-encode on the request
+// goroutine: a 10 000-item batch would otherwise turn one poll into 10 000 disk
+// reads. The full set is always in the assembled output and error files, which
+// the same batch object names.
+func (s *Server) inlineBatchResults(batch *store.Batch) ([]inlineResult, bool, error) {
 	blobs := s.batchBlobs
 	if blobs == nil {
-		return nil, errors.New("batch: the batch lane is not configured")
+		return nil, false, errors.New("batch: the batch lane is not configured")
 	}
 	items, err := s.store.ListItems(batch.ID)
 	if err != nil {
-		return nil, fmt.Errorf("batch: list items: %w", err)
+		return nil, false, fmt.Errorf("batch: list items: %w", err)
 	}
-	results := make([]inlineResult, 0, len(items))
+	results := make([]inlineResult, 0, min(len(items), maxInlineResults))
+	truncated := false
 	for _, it := range items {
+		if len(results) >= maxInlineResults {
+			truncated = true
+			break
+		}
 		switch it.State {
 		case store.ItemSucceeded:
 			body, err := s.readItemResult(blobs, batch, it)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			results = append(results, inlineResult{
 				ID:       it.ID,
@@ -374,7 +382,7 @@ func (s *Server) inlineBatchResults(batch *store.Batch) ([]inlineResult, error) 
 			})
 		}
 	}
-	return results, nil
+	return results, truncated, nil
 }
 
 // PurgeExpiredBatchFiles deletes the sealed bytes of every batch file past its
@@ -389,7 +397,7 @@ func (s *Server) PurgeExpiredBatchFiles(now time.Time) (int, error) {
 	if blobs == nil {
 		return 0, nil
 	}
-	files, err := s.store.ListPurgeableFiles(now.Add(-BatchOutputRetention))
+	files, err := s.store.ListPurgeableFiles(now.Add(-batchlane.DefaultOutputRetention))
 	if err != nil {
 		return 0, fmt.Errorf("batch: list purgeable files: %w", err)
 	}

@@ -4,9 +4,11 @@ package main
 // (docs/design/tidal-batch-lane.md §3.4): the 1 Hz loop that fills provider
 // slots the online quality cap is leaving empty with 24-hour batch work.
 //
-// It lives in main because it is the only place that may import both api and
-// batchlane: batchlane must never import api (api imports batchlane), so the
-// adapter from api.BatchOutcome to batchlane.Outcome belongs here.
+// It lives in main because it is the only place that holds both the api server
+// and the dispatcher. The import direction is one-way — api imports batchlane,
+// never the reverse — so api speaks the dispatcher's own vocabulary
+// (batchlane.Outcome, batchlane.ResultBlobRef, batchlane.DefaultOutputRetention)
+// and this file wires the two together with no adapter of its own.
 
 import (
 	"context"
@@ -53,35 +55,21 @@ func startBatchDispatcher(
 		st,
 		blobs,
 		batchlane.NewRegistryView(reg),
-		batchDispatchFn(srv),
+		// DispatchBatchItem's signature IS batchlane.DispatchFn — no adapter.
+		srv.DispatchBatchItem,
 		batchFinalizeFn(srv),
 		batchlane.Config{
 			Tick:        batchlane.DefaultTick,
 			MaxAttempts: batchlane.DefaultMaxAttempts,
 			// One retention boundary for the assembled files and for the
-			// per-item result blobs behind them.
-			OutputRetention: api.BatchOutputRetention,
+			// per-item result blobs behind them. The assembler reads the same
+			// constant, so there is one number, not two that must agree.
+			OutputRetention: batchlane.DefaultOutputRetention,
 			Purge:           srv.PurgeExpiredBatchFiles,
 		},
 		logger,
 	)
 	saferun.Go(logger, "batch_dispatcher", func() { d.Run(ctx) })
-}
-
-// batchDispatchFn adapts the api layer's batch dispatch entry to the
-// dispatcher's funnel type. The two Outcome structs are field-for-field
-// identical; they are separate types only to keep the import direction one-way.
-func batchDispatchFn(srv *api.Server) batchlane.DispatchFn {
-	return func(ctx context.Context, accountID, apiKeyID, model string, body []byte) (batchlane.Outcome, error) {
-		out, err := srv.DispatchBatchItem(ctx, accountID, apiKeyID, model, body)
-		return batchlane.Outcome{
-			RequestID:        out.RequestID,
-			PromptTokens:     out.PromptTokens,
-			CompletionTokens: out.CompletionTokens,
-			ResponseBody:     out.ResponseBody,
-			ErrCode:          out.ErrCode,
-		}, err
-	}
 }
 
 // batchFinalizeFn adapts the assembler to the dispatcher's finalize hook. The

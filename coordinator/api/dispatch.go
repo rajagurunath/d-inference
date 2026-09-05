@@ -1386,12 +1386,6 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			d.latchProviderBodyTooLarge(d.providerBodyTooLargeErr)
 			return outcomeFailFast
 		}
-		if attempt > 0 && !d.shouldQueueCompatibleProvider(decision) {
-			if d.lastErr == "" {
-				d.setLastError(dispatchErr, dispatchErrCode)
-			}
-			return outcomeFailFast
-		}
 		// Batch lane: never queue. The batch lane only ever fills headroom the
 		// online quality cap leaves empty, so "no headroom right now" is the
 		// normal state, not a failure to wait out: parking the item in the
@@ -1401,6 +1395,14 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 		// entitled to first. Answer with a retryable 429 + Retry-After instead;
 		// the caller (the batch dispatcher, or an OpenRouter-style paced client
 		// on service_tier=batch) re-offers the item on its next tick.
+		//
+		// This sits ABOVE the retry fail-fast on purpose. Both branches describe
+		// "no provider is free", but only this one answers in the vocabulary the
+		// batch dispatcher settles on. Below the fail-fast, a batch item that
+		// found headroom on attempt 0 and none on attempt 1 terminated with
+		// attempt 0's latched error instead — a "request_failed" that BURNS one
+		// of the item's three attempts for a capacity refusal that proved
+		// nothing, so three unlucky ticks retire a perfectly good item.
 		if d.lane == registry.LaneBatch {
 			s.ddIncr("routing.decisions", []string{
 				"model:" + d.model,
@@ -1414,6 +1416,12 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 				fmt.Sprintf("no provider for model %q has batch headroom right now", d.publicModel),
 				batchNoCapacityCode)
 			return outcomeResponseWritten
+		}
+		if attempt > 0 && !d.shouldQueueCompatibleProvider(decision) {
+			if d.lastErr == "" {
+				d.setLastError(dispatchErr, dispatchErrCode)
+			}
+			return outcomeFailFast
 		}
 		// No idle provider — try queueing.
 		d.requestID = uuid.New().String()

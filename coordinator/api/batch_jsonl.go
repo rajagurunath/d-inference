@@ -122,11 +122,20 @@ type inlineRequest struct {
 // parsedItem is one validated request ready to be sealed and stored. Raw is
 // the body with model rewritten to the concrete build id, so the dispatcher
 // never repeats alias resolution hours later when the alias may have moved.
+//
+// BOTH names are kept, because they answer different questions:
+//
+//   - RequestedModel is what the CONSUMER typed (an alias, or a raw build id).
+//     It is the name the per-key allow-list is checked against, exactly as an
+//     online request's is (api/inference_preprocess.go), so a key restricted to
+//     an alias means the same thing on both lanes.
+//   - Model is the resolved build id. It is what dispatch uses.
 type parsedItem struct {
-	Line   batchLine
-	LineNo int
-	Model  string
-	Raw    []byte
+	Line           batchLine
+	LineNo         int
+	Model          string
+	RequestedModel string
+	Raw            []byte
 }
 
 // modelResolver maps a consumer-requested model to the concrete build id, or
@@ -197,15 +206,16 @@ func parseBatchJSONL(r io.Reader, endpoint string, maxLines int, resolveModel mo
 		}
 		seen[line.CustomID] = struct{}{}
 
-		model, body, err := validateBatchBody(line.Body, "", lineNo, resolveModel)
+		requested, model, body, err := validateBatchBody(line.Body, "", lineNo, resolveModel)
 		if err != nil {
 			return nil, err
 		}
 		items = append(items, parsedItem{
-			Line:   batchLine{CustomID: line.CustomID, Method: http.MethodPost, URL: endpoint},
-			LineNo: len(items) + 1,
-			Model:  model,
-			Raw:    body,
+			Line:           batchLine{CustomID: line.CustomID, Method: http.MethodPost, URL: endpoint},
+			LineNo:         len(items) + 1,
+			Model:          model,
+			RequestedModel: requested,
+			Raw:            body,
 		})
 	}
 	if err := scanner.Err(); err != nil {
@@ -254,15 +264,16 @@ func parseInlineRequests(reqs []inlineRequest, endpoint, model string, max int, 
 		}
 		seen[req.CustomID] = struct{}{}
 
-		resolved, body, err := validateBatchBody(req.Body, model, lineNo, resolveModel)
+		requested, resolved, body, err := validateBatchBody(req.Body, model, lineNo, resolveModel)
 		if err != nil {
 			return nil, err
 		}
 		items = append(items, parsedItem{
-			Line:   batchLine{CustomID: req.CustomID, Method: http.MethodPost, URL: endpoint},
-			LineNo: lineNo,
-			Model:  resolved,
-			Raw:    body,
+			Line:           batchLine{CustomID: req.CustomID, Method: http.MethodPost, URL: endpoint},
+			LineNo:         lineNo,
+			Model:          resolved,
+			RequestedModel: requested,
+			Raw:            body,
 		})
 	}
 	return items, nil
@@ -283,13 +294,17 @@ func validateCustomID(customID string, lineNo int) error {
 	return nil
 }
 
-// validateBatchBody checks one request body and returns the concrete build
-// model plus the body with "model" rewritten to it. defaultModel is the inline
-// form's top-level model and is empty for the file form, where every line
-// carries its own.
-func validateBatchBody(body json.RawMessage, defaultModel string, lineNo int, resolveModel modelResolver) (string, []byte, error) {
+// validateBatchBody checks one request body and returns the name the consumer
+// asked for, the concrete build model it resolves to, and the body with "model"
+// rewritten to that build id. defaultModel is the inline form's top-level model
+// and is empty for the file form, where every line carries its own.
+//
+// The requested name is returned alongside the resolved one because the
+// per-key model allow-list is checked against what the consumer typed — the
+// build id is a coordinator-internal name a consumer never puts on a key.
+func validateBatchBody(body json.RawMessage, defaultModel string, lineNo int, resolveModel modelResolver) (string, string, []byte, error) {
 	if len(body) == 0 {
-		return "", nil, batchErr("invalid_line", "body", "line %d: body is required", lineNo)
+		return "", "", nil, batchErr("invalid_line", "body", "line %d: body is required", lineNo)
 	}
 	// Decode with UseNumber so an integer like "seed" is kept as its exact
 	// json.Number text rather than round-tripped through float64, which loses
@@ -299,28 +314,28 @@ func validateBatchBody(body json.RawMessage, defaultModel string, lineNo int, re
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	if err := dec.Decode(&parsed); err != nil {
-		return "", nil, batchErr("invalid_line", "body", "line %d: body is not a JSON object", lineNo)
+		return "", "", nil, batchErr("invalid_line", "body", "line %d: body is not a JSON object", lineNo)
 	}
 
 	if stream, ok := parsed["stream"].(bool); ok && stream {
-		return "", nil, batchErr("invalid_line", "stream",
+		return "", "", nil, batchErr("invalid_line", "stream",
 			"line %d: stream must be false — batch results are delivered as files", lineNo)
 	}
 	if n, ok := parsed["n"]; ok && n != nil {
 		num, ok := n.(json.Number)
 		if !ok {
-			return "", nil, batchErr("invalid_line", "n", "line %d: n must be a number", lineNo)
+			return "", "", nil, batchErr("invalid_line", "n", "line %d: n must be a number", lineNo)
 		}
 		count, err := num.Float64()
 		if err != nil {
-			return "", nil, batchErr("invalid_line", "n", "line %d: n must be a number", lineNo)
+			return "", "", nil, batchErr("invalid_line", "n", "line %d: n must be a number", lineNo)
 		}
 		if count > 1 {
-			return "", nil, batchErr("invalid_line", "n", "line %d: n must be 1 or absent", lineNo)
+			return "", "", nil, batchErr("invalid_line", "n", "line %d: n must be 1 or absent", lineNo)
 		}
 	}
 	if err := validateTextOnlyContent(parsed, lineNo); err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 
 	requested := defaultModel
@@ -328,23 +343,23 @@ func validateBatchBody(body json.RawMessage, defaultModel string, lineNo int, re
 		requested = strings.TrimSpace(m)
 	}
 	if requested == "" {
-		return "", nil, batchErr("invalid_line", "model", "line %d: model is required", lineNo)
+		return "", "", nil, batchErr("invalid_line", "model", "line %d: model is required", lineNo)
 	}
 	resolved, ok := resolveModel(requested)
 	if !ok {
-		return "", nil, batchErr("model_not_found", "model",
+		return "", "", nil, batchErr("model_not_found", "model",
 			"line %d: model is not available for batch", lineNo)
 	}
 
 	if current, _ := parsed["model"].(string); current == resolved {
-		return resolved, append([]byte(nil), body...), nil
+		return requested, resolved, append([]byte(nil), body...), nil
 	}
 	parsed["model"] = resolved
 	rewritten, err := json.Marshal(parsed)
 	if err != nil {
-		return "", nil, batchErr("invalid_line", "body", "line %d: body could not be re-encoded", lineNo)
+		return "", "", nil, batchErr("invalid_line", "body", "line %d: body could not be re-encoded", lineNo)
 	}
-	return resolved, rewritten, nil
+	return requested, resolved, rewritten, nil
 }
 
 // validateTextOnlyContent rejects image, audio, video, and file content parts.

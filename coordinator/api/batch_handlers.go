@@ -47,6 +47,17 @@ const (
 
 	defaultBatchListLimit = 20
 	maxBatchListLimit     = 100
+
+	// maxInlineResults bounds the results array a single GET /v1/batches/{id}
+	// assembles inline. An inline batch may hold maxInlineRequests (10 000)
+	// items, and every succeeded one costs a sealed-blob open, a decrypt and a
+	// JSON re-encode on the request goroutine — so an unbounded assembly turns
+	// one poll into ten thousand disk reads, and a poll loop into a
+	// self-inflicted denial of service. Past this bound the response carries
+	// the first maxInlineResults results plus results_truncated, and the
+	// consumer reads the rest from output_file_id / error_file_id, which is the
+	// complete record either way.
+	maxInlineResults = 1000
 )
 
 // createBatchRequest is the union of the OpenAI and OpenRouter create bodies.
@@ -65,6 +76,12 @@ type createBatchRequest struct {
 
 // inlineResult is one element of the results array an inline batch returns
 // once it reaches a terminal state (OpenRouter shape).
+//
+// The array is capped at maxInlineResults. When a batch has more results than
+// that, GET /v1/batches/{id} carries the first maxInlineResults in line order
+// and sets "results_truncated": true; the COMPLETE set is always in the
+// assembled files the same response names in output_file_id and error_file_id,
+// which is where a consumer with a batch that large should be reading from.
 type inlineResult struct {
 	CustomID string         `json:"custom_id"`
 	Response *itemResponse  `json:"response"`
@@ -105,6 +122,17 @@ func (s *Server) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 
 	items, source, inputFileID, err := s.parseCreateBatch(accountID, blobs, &req)
 	if err != nil {
+		s.writeBatchError(w, err)
+		return
+	}
+	// Per-key model allow-list, checked on the CONSUMER-REQUESTED name (alias or
+	// raw build id) exactly as parseInferencePrelude checks an online request.
+	// It is enforced here rather than per item at dispatch because dispatch only
+	// ever sees the resolved build id, which is a coordinator-internal name no
+	// consumer ever puts on a key: checking there would deny every alias-scoped
+	// key its own batches. The dispatch-time check still runs (batch_dispatch.go
+	// loads the real key record), so a key revoked mid-batch still stops it.
+	if err := s.checkBatchModelsAllowed(r, items); err != nil {
 		s.writeBatchError(w, err)
 		return
 	}
@@ -180,8 +208,15 @@ func (s *Server) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 		ResultPublicKey:  resultKey,
 		SealedTo:         sealedTo,
 		Source:           source,
-		Model:            req.Model,
-		Metadata:         req.Metadata,
+		// The RESOLVED build id, not the alias the consumer typed. The
+		// dispatcher stamps this on every item it runs; storing the alias meant
+		// re-resolving it at dispatch, up to 24 hours later, so an alias that
+		// moved in the meantime silently rerouted a half-finished batch onto a
+		// different build. batchObject echoes RequestedModel back, so the wire
+		// shape the consumer sees is unchanged.
+		Model:          batchResolvedModel(items, req.Model),
+		RequestedModel: req.Model,
+		Metadata:       req.Metadata,
 	}
 	if err := s.store.CreateBatch(batch, records); err != nil {
 		s.rollbackItemBlobs(blobs, written)
@@ -292,6 +327,44 @@ func (s *Server) parseCreateBatch(accountID string, blobs *sealedblob.Store, req
 	}
 	items, err := parseBatchJSONL(strings.NewReader(string(content)), endpoint, maxFileLines, s.batchModelResolver())
 	return items, batchSourceFile, fileID, err
+}
+
+// checkBatchModelsAllowed enforces the submitting key's AllowedModels against
+// every DISTINCT requested model name in the batch. It answers with the same
+// 403 model_not_allowed an online request gets, naming the model the consumer
+// used, so the two lanes are indistinguishable from a consumer's side.
+func (s *Server) checkBatchModelsAllowed(r *http.Request, items []parsedItem) error {
+	seen := make(map[string]struct{}, 4)
+	for _, it := range items {
+		if it.RequestedModel == "" {
+			continue
+		}
+		if _, done := seen[it.RequestedModel]; done {
+			continue
+		}
+		seen[it.RequestedModel] = struct{}{}
+		if !s.keyModelAllowed(r.Context(), it.RequestedModel) {
+			return &batchError{
+				Status: http.StatusForbidden, Type: "invalid_request_error",
+				Code: "model_not_allowed", Param: "model",
+				Message: fmt.Sprintf("this API key is not permitted to use model %q", it.RequestedModel),
+			}
+		}
+	}
+	return nil
+}
+
+// batchResolvedModel is the build id an inline batch dispatches on. Every inline
+// item resolved from the same top-level model, so the first item's resolution is
+// the batch's; the fallback keeps a batch with no items (impossible past
+// validation) from silently losing its model.
+func batchResolvedModel(items []parsedItem, requested string) string {
+	for _, it := range items {
+		if it.Model != "" {
+			return it.Model
+		}
+	}
+	return requested
 }
 
 // parseResultPublicKey validates the optional consumer sealing key. It is
@@ -405,15 +478,22 @@ func (s *Server) handleBatchGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var results []inlineResult
+	var (
+		results   []inlineResult
+		truncated bool
+	)
 	if b.Source == batchSourceInline && batchIsTerminal(b.Status) {
 		var err error
-		if results, err = s.inlineBatchResults(b); err != nil {
+		if results, truncated, err = s.inlineBatchResults(b); err != nil {
 			s.writeBatchError(w, s.internalBatchError(err, "batch_id", b.ID))
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, batchObject(b, results))
+	obj := batchObject(b, results)
+	if truncated {
+		obj["results_truncated"] = true
+	}
+	writeJSON(w, http.StatusOK, obj)
 }
 
 // handleBatchCancel handles POST /v1/batches/{id}/cancel. It moves the batch to
@@ -506,7 +586,12 @@ func batchObject(b *store.Batch, results []inlineResult) map[string]any {
 	obj["completed_at"] = unixOrNil(b.CompletedAt)
 	obj["cancelled_at"] = unixOrNil(b.CancelledAt)
 	if b.Source == batchSourceInline {
-		obj["model"] = b.Model
+		// Echo the name the consumer asked for. b.Model holds the resolved build
+		// id the dispatcher runs on, which is a coordinator-internal name.
+		obj["model"] = b.RequestedModel
+		if obj["model"] == "" {
+			obj["model"] = b.Model
+		}
 		if results != nil {
 			obj["results"] = results
 		}

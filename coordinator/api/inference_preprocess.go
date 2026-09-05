@@ -163,7 +163,7 @@ func (s *Server) parseInferencePrelude(w http.ResponseWriter, r *http.Request) (
 
 	// Per-key model allow-list enforcement (phase 3). Checked on the
 	// consumer-requested name (alias or raw id) before alias resolution.
-	if !s.keyModelAllowed(r.Context(), model) {
+	if !s.laneModelAllowed(r.Context(), model) {
 		writeJSON(w, http.StatusForbidden, errorResponse("model_not_allowed",
 			fmt.Sprintf("this API key is not permitted to use model %q", model), withParam("model")))
 		return inferencePrelude{}, false

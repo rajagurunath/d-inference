@@ -546,12 +546,25 @@ func estimateRequestedMaxTokens(parsed map[string]any) int {
 	return 256
 }
 
-// stripProviderRoutingFields drops the retired consumer-side serial allowlist.
-// Stable hardware identity is coordinator-private and must never be forwarded
-// to a provider in the encrypted inference payload.
+// stripProviderRoutingFields drops the coordinator-private routing fields from
+// the body that will be sealed for a provider.
+//
+//   - provider_serial / provider_serials: the retired consumer-side serial
+//     allowlist. Stable hardware identity is coordinator-private and must never
+//     be forwarded to a provider in the encrypted inference payload.
+//   - service_tier: the lane selector (docs/design/tidal-batch-lane.md §3.6).
+//     resolveRequestLane has already read it in parseInferencePrelude, so by the
+//     time a body is prepared for a provider the field has done its whole job
+//     here. Forwarding it would tell the provider that this request is
+//     discounted batch work — exactly the thing phase 1 promises it cannot
+//     learn (the provider serves batch and online identically) — and would
+//     invite a provider binary to treat the two differently.
+//
+// Both callers run AFTER parseInferencePrelude, so nothing downstream of this
+// point needs to re-read the lane off the body.
 func stripProviderRoutingFields(parsed map[string]any) bool {
 	changed := false
-	for _, key := range []string{"provider_serial", "provider_serials"} {
+	for _, key := range []string{"provider_serial", "provider_serials", "service_tier"} {
 		if _, ok := parsed[key]; ok {
 			delete(parsed, key)
 			changed = true

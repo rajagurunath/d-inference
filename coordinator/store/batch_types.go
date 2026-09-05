@@ -102,26 +102,37 @@ type Batch struct {
 	// to online work. json:"-" is deliberate: the OpenAI batch object has no
 	// such field and batchObject builds the wire shape explicitly, so this is
 	// belt-and-braces against the row ever being marshalled directly.
-	APIKeyID         string            `json:"-"`
-	InputFileID      string            `json:"input_file_id"`
-	Endpoint         string            `json:"endpoint"`
-	Status           BatchStatus       `json:"status"`
-	CompletionWindow string            `json:"completion_window"` // "24h"
-	CreatedAt        time.Time         `json:"created_at"`
-	ExpiresAt        time.Time         `json:"expires_at"`
-	InProgressAt     *time.Time        `json:"in_progress_at,omitempty"`
-	CompletedAt      *time.Time        `json:"completed_at,omitempty"`
-	CancelledAt      *time.Time        `json:"cancelled_at,omitempty"`
-	CountsTotal      int               `json:"counts_total"`
-	CountsCompleted  int               `json:"counts_completed"`
-	CountsFailed     int               `json:"counts_failed"`
-	OutputFileID     *string           `json:"output_file_id,omitempty"`
-	ErrorFileID      *string           `json:"error_file_id,omitempty"`
-	ResultPublicKey  string            `json:"result_public_key,omitempty"` // base64 X25519, validated as 32 bytes at creation
-	SealedTo         string            `json:"sealed_to"`                   // "coordinator" | "consumer"
-	Source           string            `json:"source"`                      // "file" | "inline"
-	Model            string            `json:"model,omitempty"`             // inline form only
-	Metadata         map[string]string `json:"metadata,omitempty"`
+	APIKeyID         string      `json:"-"`
+	InputFileID      string      `json:"input_file_id"`
+	Endpoint         string      `json:"endpoint"`
+	Status           BatchStatus `json:"status"`
+	CompletionWindow string      `json:"completion_window"` // "24h"
+	CreatedAt        time.Time   `json:"created_at"`
+	ExpiresAt        time.Time   `json:"expires_at"`
+	InProgressAt     *time.Time  `json:"in_progress_at,omitempty"`
+	CompletedAt      *time.Time  `json:"completed_at,omitempty"`
+	CancelledAt      *time.Time  `json:"cancelled_at,omitempty"`
+	CountsTotal      int         `json:"counts_total"`
+	CountsCompleted  int         `json:"counts_completed"`
+	CountsFailed     int         `json:"counts_failed"`
+	OutputFileID     *string     `json:"output_file_id,omitempty"`
+	ErrorFileID      *string     `json:"error_file_id,omitempty"`
+	ResultPublicKey  string      `json:"result_public_key,omitempty"` // base64 X25519, validated as 32 bytes at creation
+	SealedTo         string      `json:"sealed_to"`                   // "coordinator" | "consumer"
+	Source           string      `json:"source"`                      // "file" | "inline"
+	// Model is the RESOLVED build id for an inline batch, written once at
+	// creation. The dispatcher stamps it on every item it runs, so an alias that
+	// moves between submission and dispatch — hours later, inside a 24-hour
+	// window — can never silently reroute a batch onto a different build. Empty
+	// for the file form, where each line carries its own model and the resolved
+	// id is already rewritten into the item's stored body.
+	Model string `json:"model,omitempty"`
+	// RequestedModel is the name the CONSUMER asked for (alias or raw build id),
+	// kept beside the resolved id because it is what the batch object echoes
+	// back and what the per-key model allow-list was checked against at
+	// creation. Empty for the file form, for the same reason Model is.
+	RequestedModel string            `json:"requested_model,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
 }
 
 // BatchItem is one request line. BlobRef and ResultBlobRef are sealedblob keys
