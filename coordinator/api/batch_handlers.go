@@ -47,6 +47,17 @@ const (
 
 	defaultBatchListLimit = 20
 	maxBatchListLimit     = 100
+
+	// maxInlineResults bounds the results array a single GET /v1/batches/{id}
+	// assembles inline. An inline batch may hold maxInlineRequests (10 000)
+	// items, and every succeeded one costs a sealed-blob open, a decrypt and a
+	// JSON re-encode on the request goroutine — so an unbounded assembly turns
+	// one poll into ten thousand disk reads, and a poll loop into a
+	// self-inflicted denial of service. Past this bound the response carries
+	// the first maxInlineResults results plus results_truncated, and the
+	// consumer reads the rest from output_file_id / error_file_id, which is the
+	// complete record either way.
+	maxInlineResults = 1000
 )
 
 // createBatchRequest is the union of the OpenAI and OpenRouter create bodies.
@@ -65,6 +76,12 @@ type createBatchRequest struct {
 
 // inlineResult is one element of the results array an inline batch returns
 // once it reaches a terminal state (OpenRouter shape).
+//
+// The array is capped at maxInlineResults. When a batch has more results than
+// that, GET /v1/batches/{id} carries the first maxInlineResults in line order
+// and sets "results_truncated": true; the COMPLETE set is always in the
+// assembled files the same response names in output_file_id and error_file_id,
+// which is where a consumer with a batch that large should be reading from.
 type inlineResult struct {
 	CustomID string         `json:"custom_id"`
 	Response *itemResponse  `json:"response"`
@@ -461,15 +478,22 @@ func (s *Server) handleBatchGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var results []inlineResult
+	var (
+		results   []inlineResult
+		truncated bool
+	)
 	if b.Source == batchSourceInline && batchIsTerminal(b.Status) {
 		var err error
-		if results, err = s.inlineBatchResults(b); err != nil {
+		if results, truncated, err = s.inlineBatchResults(b); err != nil {
 			s.writeBatchError(w, s.internalBatchError(err, "batch_id", b.ID))
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, batchObject(b, results))
+	obj := batchObject(b, results)
+	if truncated {
+		obj["results_truncated"] = true
+	}
+	writeJSON(w, http.StatusOK, obj)
 }
 
 // handleBatchCancel handles POST /v1/batches/{id}/cancel. It moves the batch to

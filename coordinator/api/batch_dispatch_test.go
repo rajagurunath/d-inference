@@ -13,6 +13,7 @@ import (
 
 	"github.com/eigeninference/d-inference/coordinator/internal/e2e"
 	"github.com/eigeninference/d-inference/coordinator/protocol"
+	"github.com/eigeninference/d-inference/coordinator/ratelimit"
 	"github.com/eigeninference/d-inference/coordinator/registry"
 	"github.com/eigeninference/d-inference/coordinator/store"
 	"nhooyr.io/websocket"
@@ -465,5 +466,78 @@ func TestBatchWithARestrictedKeyFailsItsItems(t *testing.T) {
 	final, _ := st.GetBatch("admin", open.ID)
 	if final.CountsFailed != 1 || final.CountsCompleted != 0 {
 		t.Fatalf("counts completed=%d failed=%d, want 0/1", final.CountsCompleted, final.CountsFailed)
+	}
+}
+
+// TestDispatchBatchItemAppliesThePerKeyRPMLimit is the S5 regression. The
+// per-key RPM override is enforced by the rate-limit MIDDLEWARE, which a batch
+// item never passes through — DispatchBatchItem calls handleChatCompletions
+// directly. A key throttled to a few requests a minute online was therefore
+// unthrottled the moment its traffic arrived on the batch lane.
+//
+// The throttled item must come back as no_capacity, not request_failed: it
+// never reached a provider, so the dispatcher releases the claim without
+// charging one of the item's three attempts.
+func TestDispatchBatchItemAppliesThePerKeyRPMLimit(t *testing.T) {
+	const model = "test-model"
+	srv, reg, st, ctx, _ := batchFakeProviderWithStore(t, model,
+		protocol.UsageInfo{PromptTokens: 1, CompletionTokens: 1}, "Hello batch")
+	srv.SetKeyLimiters(ratelimit.New(ratelimit.Config{RPS: 1, Burst: 1}), nil)
+
+	// One request per minute: applyKeyRPMLimit drives the bucket from the KEY's
+	// own rate, so the limiter's own config rate is irrelevant here.
+	rpm := int64(1)
+	_, key, err := st.CreateAPIKey("admin", store.APIKeyCreate{Name: "batch-rpm", RPMLimit: &rpm})
+	if err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+
+	body := []byte(`{"model":"ignored","messages":[{"role":"user","content":"hi"}]}`)
+	first, err := srv.DispatchBatchItem(ctx, "admin", key.ID, model, body)
+	if err != nil {
+		t.Fatalf("DispatchBatchItem (first): %v", err)
+	}
+	if first.ErrCode != "" {
+		t.Fatalf("first item ErrCode=%q body=%s, want success", first.ErrCode, first.ResponseBody)
+	}
+
+	// The fixture's provider answers exactly one request, so close the fleet to
+	// the batch lane: every dispatch from here on refuses PROMPTLY, and the two
+	// refusals below are told apart by their error code alone.
+	for _, id := range reg.ProviderIDs() {
+		p := reg.GetProvider(id)
+		p.Mu().Lock()
+		p.BackendCapacity = &protocol.BackendCapacity{
+			TotalMemoryGB: 64,
+			Slots: []protocol.BackendSlotCapacity{
+				{Model: model, State: "running", NumRunning: 0, NumWaiting: 1},
+			},
+		}
+		p.Mu().Unlock()
+	}
+
+	second, err := srv.DispatchBatchItem(ctx, "admin", key.ID, model, body)
+	if err != nil {
+		t.Fatalf("DispatchBatchItem (second): %v", err)
+	}
+	if second.ErrCode != batchNoCapacityCode {
+		t.Fatalf("second item ErrCode=%q body=%s, want %q — a throttled item must be re-offered, not failed",
+			second.ErrCode, second.ResponseBody, batchNoCapacityCode)
+	}
+	if code := responseErrorCode(second.ResponseBody); code != "rate_limit_exceeded" {
+		t.Fatalf("error.code=%q body=%s, want rate_limit_exceeded — the key's RPM limit was bypassed",
+			code, second.ResponseBody)
+	}
+
+	// Control: with the per-key limiter disabled the same key on the same
+	// fixture is refused by CAPACITY instead, so the refusal above is the key's
+	// own rate limit and not the closed fleet.
+	srv.SetKeyLimiters(nil, nil)
+	third, err := srv.DispatchBatchItem(ctx, "admin", key.ID, model, body)
+	if err != nil {
+		t.Fatalf("DispatchBatchItem (third): %v", err)
+	}
+	if code := responseErrorCode(third.ResponseBody); code != batchNoCapacityCode {
+		t.Fatalf("control error.code=%q body=%s, want %q", code, third.ResponseBody, batchNoCapacityCode)
 	}
 }

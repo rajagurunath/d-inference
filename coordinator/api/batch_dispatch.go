@@ -173,6 +173,25 @@ func (s *Server) DispatchBatchItem(
 	req = req.WithContext(rctx)
 
 	rec := httptest.NewRecorder()
+	// The per-key RPM override lives in the rate-limit MIDDLEWARE
+	// (rateLimitWithTier -> applyKeyRPMLimit), which a batch item never passes
+	// through: DispatchBatchItem calls the handler directly. Without this the
+	// per-key requests-per-minute cap was silently exempt on the batch lane —
+	// a key throttled to 10 RPM online could have the dispatcher run it at the
+	// fleet's whole batch allowance. Applying the same function against the
+	// same synthetic request keeps ONE implementation of the limit.
+	//
+	// A throttled item comes back as no_capacity, not request_failed: it never
+	// reached a provider and nothing about it was proven, so the dispatcher
+	// must release the claim WITHOUT charging one of its three attempts and
+	// re-offer it on a later tick, which is exactly what the key's own rate
+	// limit is asking for.
+	if !s.applyKeyRPMLimit(rec, req) {
+		return BatchOutcome{
+			ResponseBody: rec.Body.Bytes(),
+			ErrCode:      batchNoCapacityCode,
+		}, nil
+	}
 	s.handleChatCompletions(rec, req)
 	result := rec.Result()
 	defer result.Body.Close()

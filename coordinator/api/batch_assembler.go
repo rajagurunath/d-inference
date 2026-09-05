@@ -340,22 +340,33 @@ func (s *Server) discardAssembledFile(blobs *sealedblob.Store, fileID *string, n
 // inlineBatchResults renders the OpenRouter inline results array for a
 // terminal inline batch. It reads the same result blobs the output file is
 // assembled from, so both surfaces agree.
-func (s *Server) inlineBatchResults(batch *store.Batch) ([]inlineResult, error) {
+//
+// It stops at maxInlineResults and reports truncated=true, because every
+// succeeded item costs a blob open, a decrypt and a re-encode on the request
+// goroutine: a 10 000-item batch would otherwise turn one poll into 10 000 disk
+// reads. The full set is always in the assembled output and error files, which
+// the same batch object names.
+func (s *Server) inlineBatchResults(batch *store.Batch) ([]inlineResult, bool, error) {
 	blobs := s.batchBlobs
 	if blobs == nil {
-		return nil, errors.New("batch: the batch lane is not configured")
+		return nil, false, errors.New("batch: the batch lane is not configured")
 	}
 	items, err := s.store.ListItems(batch.ID)
 	if err != nil {
-		return nil, fmt.Errorf("batch: list items: %w", err)
+		return nil, false, fmt.Errorf("batch: list items: %w", err)
 	}
-	results := make([]inlineResult, 0, len(items))
+	results := make([]inlineResult, 0, min(len(items), maxInlineResults))
+	truncated := false
 	for _, it := range items {
+		if len(results) >= maxInlineResults {
+			truncated = true
+			break
+		}
 		switch it.State {
 		case store.ItemSucceeded:
 			body, err := s.readItemResult(blobs, batch, it)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			results = append(results, inlineResult{
 				ID:       it.ID,
@@ -374,7 +385,7 @@ func (s *Server) inlineBatchResults(batch *store.Batch) ([]inlineResult, error) 
 			})
 		}
 	}
-	return results, nil
+	return results, truncated, nil
 }
 
 // PurgeExpiredBatchFiles deletes the sealed bytes of every batch file past its

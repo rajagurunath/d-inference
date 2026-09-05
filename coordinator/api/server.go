@@ -2799,13 +2799,17 @@ func (s *Server) routes() {
 	// coordinator stops accepting new work, then auth, then the consumer
 	// limiter, then sealedTransport so an upload or an inline batch can be
 	// sealed in transit and re-sealed per item without ever hitting disk in the
-	// clear. Retrieval routes are cheap reads and skip the limiter.
+	// clear. The retrieval routes take the limiter too: none of them is a cheap
+	// read. A file download streams up to the 16 MiB input cap off disk, and a
+	// terminal inline batch's GET decrypts and re-encodes up to
+	// maxInlineResults sealed blobs — an unmetered poll loop on either is a
+	// straightforward way to make one account monopolize the coordinator.
 	s.mux.HandleFunc("POST /v1/files", s.drainGate(s.requireAuth(s.rateLimitConsumer(s.sealedTransport(s.handleBatchFileUpload)))))
-	s.mux.HandleFunc("GET /v1/files/{id}", s.requireAuth(s.handleBatchFileGet))
-	s.mux.HandleFunc("GET /v1/files/{id}/content", s.requireAuth(s.handleBatchFileContent))
+	s.mux.HandleFunc("GET /v1/files/{id}", s.requireAuth(s.rateLimitConsumer(s.handleBatchFileGet)))
+	s.mux.HandleFunc("GET /v1/files/{id}/content", s.requireAuth(s.rateLimitConsumer(s.handleBatchFileContent)))
 	s.mux.HandleFunc("POST /v1/batches", s.drainGate(s.requireAuth(s.rateLimitConsumer(s.sealedTransport(s.handleBatchCreate)))))
-	s.mux.HandleFunc("GET /v1/batches", s.requireAuth(s.handleBatchList))
-	s.mux.HandleFunc("GET /v1/batches/{id}", s.requireAuth(s.handleBatchGet))
+	s.mux.HandleFunc("GET /v1/batches", s.requireAuth(s.rateLimitConsumer(s.handleBatchList)))
+	s.mux.HandleFunc("GET /v1/batches/{id}", s.requireAuth(s.rateLimitConsumer(s.handleBatchGet)))
 	s.mux.HandleFunc("POST /v1/batches/{id}/cancel", s.drainGate(s.requireAuth(s.rateLimitConsumer(s.handleBatchCancel))))
 	// Dedicated OpenRouter provider feed — pure OpenRouter schema, no Darkbloom metadata.
 	s.mux.HandleFunc("GET /v1/models/openrouter", s.requireAuth(s.handleListModelsOpenRouter))
