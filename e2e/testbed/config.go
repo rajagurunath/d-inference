@@ -108,21 +108,6 @@ func ResolveKVBackend(explicit string) string {
 // sealed inputs for.
 const DevRestartMnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
-// ResolveDatabaseURL returns the Postgres URL a non-memory suite should attach
-// to: the explicit value when set, else EIGENINFERENCE_DATABASE_URL, else ""
-// (provision an ephemeral instance and drop it on Stop).
-//
-// A non-empty result changes the store's LIFECYCLE, not just its address: the
-// testbed neither creates nor removes that database, so its rows — batches,
-// items, API keys — survive a Stop/Start and the batch lane's own
-// requeue-after-restart path becomes reachable from the dev loop.
-func ResolveDatabaseURL(explicit string) string {
-	if explicit != "" {
-		return explicit
-	}
-	return os.Getenv("EIGENINFERENCE_DATABASE_URL")
-}
-
 // ResolveEncryptionMnemonic returns the BIP39 mnemonic the suite's coordinator
 // derives its sender-encryption and batch-store keys from: the explicit value
 // when set, else the same MNEMONIC / EIGENINFERENCE_MNEMONIC pair
@@ -352,14 +337,21 @@ type SuiteConfig struct {
 	// exercising the `.auto` default sets only the expectation.
 	ExpectKVBackend string
 	// DatabaseURL attaches a non-memory suite to an EXISTING Postgres
-	// instead of provisioning an ephemeral one. Empty falls back to
-	// EIGENINFERENCE_DATABASE_URL (see ResolveDatabaseURL) and, failing that,
-	// to the ephemeral container/initdb the testbed owns and removes on Stop.
+	// instead of provisioning an ephemeral one. Empty provisions the
+	// ephemeral container/initdb the testbed owns and removes on Stop.
 	//
 	// The testbed does not create, migrate away or drop a database named
 	// here — only Suite.Stop's ephemeral path removes anything — so a dev
 	// stack restarted against the same URL sees the rows the previous
 	// process left behind.
+	//
+	// DELIBERATELY has no environment fallback. The obvious candidate,
+	// EIGENINFERENCE_DATABASE_URL, is WRITTEN by the testbed itself:
+	// deps.PostgresLifecycle.SetEnv exports the ephemeral instance's URL into
+	// the process. A suite that read it back would, on the second suite in a
+	// test binary, attach to the first suite's already-removed database. Only
+	// a caller that knows it owns a database sets this field —
+	// e2e/cmd/devstack resolves the developer-facing variable itself.
 	DatabaseURL string
 	// APIKey asks the suite to reuse an already-issued raw key for Users[0]
 	// instead of minting a fresh one. Empty always mints.

@@ -238,7 +238,7 @@ func (s *Suite) Stop() {
 	if s.Pg != nil {
 		s.Pg.Stop()
 	} else if s.pgPersistent {
-		s.Logger.Info("persistent postgres left in place (EIGENINFERENCE_DATABASE_URL)")
+		s.Logger.Info("persistent postgres left in place (SuiteConfig.DatabaseURL)")
 	}
 }
 
@@ -266,7 +266,7 @@ func (s *Suite) startPostgres() error {
 		return nil
 	}
 
-	databaseURL := ResolveDatabaseURL(s.Config.DatabaseURL)
+	databaseURL := s.Config.DatabaseURL
 	if databaseURL != "" {
 		// A database the caller owns. The testbed neither provisions nor
 		// drops it, so its rows outlive Stop and a restarted stack can pick

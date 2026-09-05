@@ -15,24 +15,17 @@ import (
 // (`--postgres` named EIGENINFERENCE_DATABASE_URL in its help and nothing in
 // e2e/ read it).
 
-func TestResolveDatabaseURLPrefersExplicitThenEnv(t *testing.T) {
-	t.Setenv("EIGENINFERENCE_DATABASE_URL", "postgres://env/db")
+// SuiteConfig.DatabaseURL must be the ONLY way a suite attaches to a database
+// it does not own. deps.PostgresLifecycle.SetEnv exports an ephemeral
+// instance's URL into EIGENINFERENCE_DATABASE_URL, so a package-level env
+// fallback would make the second suite in a test binary attach to the first
+// suite's already-removed database. This test fails if one is reintroduced.
+func TestSuiteIgnoresTheEnvironmentDatabaseURL(t *testing.T) {
+	t.Setenv("EIGENINFERENCE_DATABASE_URL", "postgres://leaked-from-a-previous-suite/db")
 
-	if got := ResolveDatabaseURL("postgres://explicit/db"); got != "postgres://explicit/db" {
-		t.Fatalf("explicit value not preferred: %q", got)
-	}
-	if got := ResolveDatabaseURL(""); got != "postgres://env/db" {
-		t.Fatalf("env fallback = %q, want postgres://env/db", got)
-	}
-}
-
-// An unset variable must keep the historical behaviour: no URL means the suite
-// provisions (and drops) its own ephemeral instance.
-func TestResolveDatabaseURLEmptyWithoutEnv(t *testing.T) {
-	t.Setenv("EIGENINFERENCE_DATABASE_URL", "")
-
-	if got := ResolveDatabaseURL(""); got != "" {
-		t.Fatalf("ResolveDatabaseURL = %q, want \"\" (ephemeral)", got)
+	s := NewSuite(SuiteConfig{UseMemoryStore: false})
+	if s.Config.DatabaseURL != "" {
+		t.Fatalf("DatabaseURL picked up from the environment: %q", s.Config.DatabaseURL)
 	}
 }
 

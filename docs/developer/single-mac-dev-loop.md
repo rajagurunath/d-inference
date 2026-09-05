@@ -1,6 +1,6 @@
 # Single-Mac dev loop
 
-> Last updated: 2026-09-05 · commit `6a7000ee4`
+> Last updated: 2026-09-05 · commit `897e32333`
 
 Run a coordinator and one provider on one Mac for manual testing, without
 touching the shared dev environment or writing a throwaway launch script. For
@@ -91,16 +91,25 @@ from-source build), `--model <id>` (default: `DARKBLOOM_TESTBED_MODEL`),
 `--api-key <sk-db-…>` (default: `DARKBLOOM_DEV_KEY`; reuse a key the store
 already holds instead of minting one).
 
-`--postgres` has two modes:
+`--postgres` has two modes, chosen by the first of these that is set:
 
-| `EIGENINFERENCE_DATABASE_URL` | Store | Lifecycle |
+| Variable (read only under `--postgres`) | Store | Lifecycle |
 |---|---|---|
-| unset (default) | an ephemeral instance the harness provisions via Docker or a native `initdb`/`postgres` (`e2e/testbed/deps/postgres.go`) | created at start, **removed** at stop — batches, items and keys are gone |
-| set | the database it names | the stack neither creates nor drops it; migrations run on connect, and every row survives a stop |
+| neither (default) | an ephemeral instance the harness provisions via Docker or a native `initdb`/`postgres` (`e2e/testbed/deps/postgres.go`) | created at start, **removed** at stop — batches, items and keys are gone |
+| `DARKBLOOM_DEVSTACK_DATABASE_URL` | the database it names | the stack neither creates nor drops it; migrations run on connect, and every row survives a stop |
+| `EIGENINFERENCE_DATABASE_URL` | same, second choice | same |
 
-Only the second mode makes restart resilience observable, because all three
-of the database, the API key and the batch seal key have to survive together
-— see [Restart test](#restart-test).
+Prefer `DARKBLOOM_DEVSTACK_DATABASE_URL`. `EIGENINFERENCE_DATABASE_URL` is
+accepted because it is the name a coordinator already reads, but the testbed
+*writes* that variable when it provisions an ephemeral instance
+(`deps.PostgresLifecycle.SetEnv`), so it is not a reliable statement of intent
+inside a process that makes databases of its own. Resolution therefore happens
+in `e2e/cmd/devstack/main.go`; `testbed.SuiteConfig.DatabaseURL` has no
+environment fallback at all, and the startup log names the variable it used.
+
+Only the persistent modes make restart resilience observable, because all
+three of the database, the API key and the batch seal key have to survive
+together — see [Restart test](#restart-test).
 
 ### 2. Run the smoke script
 
@@ -243,15 +252,16 @@ and the key the blobs are sealed with — so the recipe sets all three:
 
 ```bash
 createdb dinf_devstack        # once
-export EIGENINFERENCE_DATABASE_URL='postgres://localhost:5432/dinf_devstack?sslmode=disable'
+export DARKBLOOM_DEVSTACK_DATABASE_URL='postgres://localhost:5432/dinf_devstack?sslmode=disable'
 export EIGENINFERENCE_BATCH_BLOB_DIR=/tmp/dinf-devstack-blobs   # a FIXED dir, not mktemp -d
 unset EIGENINFERENCE_BATCH_DEV_INSECURE_KEY                     # would seal with a random key
 export DEVSTACK_ARGS=--postgres
 make dev-stack
 ```
 
-The stack logs `using persistent postgres store (not provisioned or dropped by
-the testbed)` and, because no `MNEMONIC` is set, a WARN that it is sealing with
+The stack logs `persistent postgres store source=DARKBLOOM_DEVSTACK_DATABASE_URL`
+and `using persistent postgres store (not provisioned or dropped by the
+testbed)` and, because no `MNEMONIC` is set, a WARN that it is sealing with
 the fixed dev mnemonic — a publicly known BIP39 test vector, chosen so the seal
 key is *derived* (the production path, `sealedblob.DeriveKey`) instead of
 random. Set `MNEMONIC` yourself to override it; never run a deployment on the
@@ -287,8 +297,8 @@ otherwise WARNs and mints a fresh one. Take the key from the first run's
 banner.
 
 Clean up with `dropdb dinf_devstack` and `rm -rf /tmp/dinf-devstack-blobs`;
-without `EIGENINFERENCE_DATABASE_URL` the stack is back to the ephemeral store
-that is thrown away on every stop.
+with neither URL variable set the stack is back to the ephemeral store that is
+thrown away on every stop.
 
 ## Measured on this loop
 
