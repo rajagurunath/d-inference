@@ -1,6 +1,6 @@
 # Batch lane
 
-> Last updated: 2026-09-05 · commit `b5eb17ed4`
+> Last updated: 2026-09-05 · commit `faae05cd4`
 
 The batch lane sells the slot capacity the online quality cap already leaves
 empty. A 1 Hz dispatcher inside the coordinator claims 24-hour batch items and
@@ -38,8 +38,10 @@ Motivation and measurements: [`../design/tidal-batch-lane.md`](../design/tidal-b
 | Process wiring | `coordinator/cmd/coordinator/batch_lane.go` | `startBatchDispatcher` |
 
 `batchlane` imports `store` and `registry` and never `api`; `api` imports
-`batchlane`. The adapters between them live in `main`, the only package that
-may import both.
+`batchlane`. There are no adapters between them: `api.DispatchBatchItem` IS a
+`batchlane.DispatchFn` and `api.RefundBatchItem` IS `Config.RefundItem`, so
+`main` — the only package that may import both — wires the methods straight
+into the config.
 
 ## Mechanism: one tick
 
@@ -199,7 +201,7 @@ it does online ([`security/encryption.md`](security/encryption.md)).
 | Provider terminal | `ErrCode: "request_failed"`; retried to `DefaultMaxAttempts`, then the item is `failed` with the fixed message "The request could not be completed by any provider." |
 | Permanent fault (unusable API key, unreadable body, unsealable result) | Failed on the first outcome instead of burning the attempt budget |
 | Coordinator restart mid-flight | `RequeueInflightItems` moves in-flight rows back to `pending`; the in-memory retry tally is forgotten, costing at most `MaxAttempts − 1` extra attempts per item and never losing one |
-| Batch cancelled while items run | The batch's context is cancelled, `CancelOpenItems` runs immediately, and a late result lands on a non-in-flight item and is ignored |
+| Batch cancelled while items run | The batch's context is cancelled, `CancelOpenItems` runs immediately, and a late result lands on a non-in-flight item: the result is ignored **and the item is refunded** (`Config.RefundItem` → `api.RefundBatchItem`), so a consumer is never charged for an answer the coordinator threw away |
 | 24 h elapsed with items open | `ExpireOpenItems`, batch → `expired`, error file lists them with code `batch_expired` |
 | Crash between sealing an item body and committing its rows | The orphan sweep finds the blob (no row references it, older than retention) and deletes it |
 
