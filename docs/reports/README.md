@@ -1,6 +1,6 @@
 # Reports — dated records
 
-> Last updated: 2026-09-05 · commit `2838c3fbf`
+> Last updated: 2026-09-05 · commit `9611f8771`
 
 Frozen records: incident analyses, measurements, experiment results, and
 migration records. Each file describes the code **as it was on its date**; none
@@ -46,6 +46,7 @@ freshness stamp carries its own date, not the current one.
 | 2026-08-30 | [mlx-upstream-comparison](2026-08-30-mlx-upstream-comparison.md) | Fork vs upstream MLX comparison |
 | 2026-08-31 | [pr686-resident-prefix-cache-review](2026-08-31-pr686-resident-prefix-cache-review.md) | Review of PR #686 (resident prefix cache) |
 | 2026-09-04 | [batch-coserve-benchmark](2026-09-04-batch-coserve-benchmark.md) | What the Tidal batch lane harvests from idle capacity on one Mac, and what it costs online latency |
+| 2026-09-05 | [batch-coserve-benchmark-rerun](2026-09-05-batch-coserve-benchmark-rerun.md) | The same benchmark rerun on the shipped head `9611f8771`; both gates still PASS |
 
 Plans and decision memos live in [`../design/`](../design/README.md).
 

@@ -110,8 +110,10 @@ e2e-benchmark: ## go test ./e2e/... -run TestBenchmark (load benchmarks)
 # The batch lane is opt-in: without a key the coordinator never wires it and
 # every batch route answers 503. The test defaults the dev escape hatch on when
 # neither variable is exported, so this target needs only the provider binary
-# and a local checkpoint. COSERVE_REPORT_PATH writes the rendered markdown.
-e2e-coserve: ## go test ./e2e/ -run TestBenchmarkBatchCoServe (batch co-serving benchmark, ~12 min)
+# and a local checkpoint. The target leaves COSERVE_REPORT_PATH unset, so the
+# rendered markdown appears only in the -v test log; set COSERVE_REPORT_PATH=<file>
+# to keep the report on disk.
+e2e-coserve: ## go test ./e2e/ -run TestBenchmarkBatchCoServe (batch co-serving benchmark, ~9 min)
 	GOTOOLCHAIN=auto go test ./e2e/ -run TestBenchmarkBatchCoServe -v -timeout 30m -count=1
 
 e2e: e2e-integration ## Run the integration suite

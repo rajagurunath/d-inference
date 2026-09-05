@@ -102,7 +102,7 @@ func main() {
 	}
 	if persistentDB {
 		fmt.Printf("\nPersistent store (%s): this database is kept on exit. Restart with\n", urlSource)
-		fmt.Printf("  DARKBLOOM_DEV_KEY=%s make dev-stack   # same EIGENINFERENCE_DATABASE_URL and blob dir\n",
+		fmt.Printf("  DARKBLOOM_DEV_KEY=%s make dev-stack   # same DARKBLOOM_DEVSTACK_DATABASE_URL and blob dir\n",
 			devUserKey(suite))
 		fmt.Printf("to resume open batches with the same key.\n")
 	}
