@@ -1,6 +1,6 @@
 # Batch lane
 
-> Last updated: 2026-09-05 · commit `2838c3fbf`
+> Last updated: 2026-09-05 · commit `6a7000ee4`
 
 The batch lane sells the slot capacity the online quality cap already leaves
 empty. A 1 Hz dispatcher inside the coordinator claims 24-hour batch items and
@@ -174,6 +174,17 @@ it does online ([`security/encryption.md`](security/encryption.md)).
 - With no mnemonic and no dev key the lane is off: `NewBatchBlobStore` returns
   nil, every batch route answers `503` `batch_unavailable`, and
   `startBatchDispatcher` does not start.
+- The online first-content deadline is, for a non-streaming request, a
+  deadline on the *whole* generation. The coordinator hashes and SE-signs a
+  completion before releasing it, so a non-streaming response reaches the
+  client as one frame and no content exists to satisfy the deadline until the
+  last token is decoded. A long online completion can therefore be rejected
+  with `429` `rate_limit_exceeded` ("all providers at capacity … timeout
+  waiting for first response") while the same request on the batch lane, which
+  has no first-content deadline, returns a full answer. This is pre-existing
+  coordinator behaviour that the lane neither introduced nor changed; it is
+  recorded here because it makes an online-vs-batch comparison at large
+  `max_tokens` measure the deadline rather than the lanes.
 
 ## Failure modes
 
