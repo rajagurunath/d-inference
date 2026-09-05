@@ -1,6 +1,6 @@
 # Batch lane
 
-> Last updated: 2026-09-05 · commit `6a7000ee4`
+> Last updated: 2026-09-05 · commit `4796db242`
 
 The batch lane sells the slot capacity the online quality cap already leaves
 empty. A 1 Hz dispatcher inside the coordinator claims 24-hour batch items and
@@ -31,7 +31,7 @@ Motivation and measurements: [`../design/tidal-batch-lane.md`](../design/tidal-b
 | Output assembly, retention | `coordinator/api/batch_assembler.go` | `FinalizeBatchIfDone`, `PurgeExpiredBatchFiles` |
 | Metadata persistence | `coordinator/store/batch_types.go`, `memory_batch.go`, `postgres_batch.go` | `BatchStore`, `BatchItemStore`, `BatchFileStore` |
 | Sealed blobs on disk | `coordinator/store/sealedblob/` | `Store.PutPlain`, `PutTo`, `Open`, `Raw` |
-| Lane trait and reservation filter | `coordinator/registry/request_traits.go`, `coordinator/registry/batch_lane.go`, `coordinator/registry/scheduler.go` | `LaneBatch`, `BatchRowsAllowed`, `buildCandidateGateLocked` |
+| Lane trait and reservation filter | `coordinator/registry/request_traits.go`, `coordinator/registry/batch_lane.go`, `coordinator/registry/scheduler.go` | `LaneBatch`, `BatchSlots`, `buildCandidateGateLocked` |
 | Dispatch entry, `service_tier` | `coordinator/api/batch_dispatch.go`, `coordinator/api/inference_preprocess.go` | `DispatchBatchItem`, `resolveRequestLane` |
 | Control loop | `coordinator/batchlane/` | `Dispatcher.Tick`, `AIMD.Update`, `Laxity` |
 | Metering | `coordinator/payments/pricing.go`, `coordinator/api/provider.go` | `LaneMultiplier`, `CalculateCostForLane` |
@@ -53,7 +53,7 @@ the start of the next tick, and nothing in the package calls `time.Now()`.
 | observe | EWMA the decode rate and KV pressure per slot; `Waiting` is read raw | `EWMAAlpha = 0.5` |
 | AIMD | Per-slot target: halve on pressure, `+1` when there is provable room, hold between the watermarks. Fleet budget is `Σtarget − inflight` | `KVHigh = 0.85`, `KVLow = 0.70` |
 | laxity | Rank open batches: `laxity = (expires_at − now) − remaining/rate`, `urgency = clamp(1 − laxity/6h, 0, 1)`, `priority = round(100 − urgency×99)` | `EscalationHorizon = 6h`, `PriorityMax = 100`, `PriorityMin = 1` |
-| claim | Spend the budget highest priority first, `line_no` order within a batch, only from `in_progress` batches that are not past their window | `completionWindow = 24h` |
+| claim | Spend the budget highest priority first, each batch capped at its own model's headroom, `line_no` order within a batch, only from `in_progress` batches that are not past their window | `completionWindow = 24h` |
 | dispatch | One goroutine per claimed item under the batch's `CancelFunc`, through `DispatchBatchItem` | `BatchFirstContentBase = 120s` |
 | settle | Seal the result, `FinishItem`, `FinalizeBatchIfDone` | `DefaultMaxAttempts = 3` |
 | sweep | Expire batches past their window, drain cancelled ones, run retention | `DefaultPurgeInterval = 1m`, `DefaultOrphanInterval = 1h` |
@@ -74,14 +74,17 @@ per-batch token bucket at `FloorItemsPerSec = 0.2` grants it one item anyway.
 The floor does not raise the AIMD target: the reservation path still refuses a
 slot with no headroom, so the floor can only spend capacity that exists.
 
-The budget is fleet-wide, not per slot. The dispatcher decides **how many**
-batch rows may be in flight; **where** each lands is the reservation path's
-decision.
+The budget is not per slot: the per-slot AIMD targets are summed into a
+per-model headroom and a fleet-wide total. A batch that declares a model (the
+inline form) is capped at its own model's headroom; a file-form batch, whose
+lines each carry their own model, is capped at the fleet total. The dispatcher
+still decides only **how many** batch rows may be in flight; **where** each
+lands is the reservation path's decision.
 
 ## Invariants
 
 1. **One row of every slot is reserved for online.**
-   `Registry.BatchRowsAllowed` is the router's own resolved admission cap for
+   `BatchSlot.BatchRowsAllowed` is the router's own resolved admission cap for
    the (provider, model) pair minus one, floored at zero — not a second
    capacity formula (`coordinator/registry/batch_lane.go`,
    `batchRowsAllowedLocked` calling
@@ -122,6 +125,7 @@ decision.
 | TTFT calibration and the TTFT admission shadow | `coordinator/registry/scheduler.go`, `coordinator/registry/dispatch_plan.go`, `coordinator/registry/ttft_shadow.go` |
 | Capacity cooldowns, budget clamp, capacity-503 window, breakers | `coordinator/api/consumer.go` (`noteInferenceError`), `coordinator/api/provider.go` |
 | OpenRouter uptime series and `inference.request_outcome` | `coordinator/api/or_uptime.go` |
+| Half-open capacity probe (`claimCapacityProbeLocked`) | `coordinator/registry/scheduler.go`, `coordinator/registry/dispatch_plan.go` |
 
 A closed batch slot is reported with its own gate reason,
 `GateBatchHeadroom` (`"batch_headroom"`), so co-serving telemetry can tell it
