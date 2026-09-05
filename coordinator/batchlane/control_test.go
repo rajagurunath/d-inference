@@ -140,16 +140,16 @@ func TestAIMDHoldsBetweenWatermarks(t *testing.T) {
 	}
 }
 
-func TestAIMDNeverBelowFloorOrAboveMax(t *testing.T) {
-	// Decrease cannot go below the floor.
-	a := AIMD{Target: 4, Floor: 3}
+func TestAIMDNeverBelowZeroOrAboveMax(t *testing.T) {
+	// Decrease bottoms out at zero and stays there.
+	a := AIMD{Target: 1}
 	sig := healthySignal(8)
 	sig.KV = 0.90
-	if got := a.Update(sig); got != 3 {
-		t.Fatalf("target = %d, want the floor 3", got)
+	if got := a.Update(sig); got != 0 {
+		t.Fatalf("target = %d, want 0", got)
 	}
-	if got := a.Update(sig); got != 3 {
-		t.Fatalf("target after a second decrease = %d, want the floor 3", got)
+	if got := a.Update(sig); got != 0 {
+		t.Fatalf("target after a second decrease = %d, want 0", got)
 	}
 
 	// Increase cannot go above the slot's batch row allowance.
@@ -158,23 +158,11 @@ func TestAIMDNeverBelowFloorOrAboveMax(t *testing.T) {
 		t.Fatalf("target = %d, want MaxPerSlot 2", got)
 	}
 
-	// A pair with no batch allowance at all is pinned to zero, floor included.
-	c := AIMD{Target: 4, Floor: 2}
+	// A pair with no batch allowance at all is pinned to zero: nothing in the
+	// lane can manufacture a row the router would not admit.
+	c := AIMD{Target: 4}
 	if got := c.Update(healthySignal(0)); got != 0 {
 		t.Fatalf("target on a zero-allowance slot = %d, want 0", got)
-	}
-}
-
-func TestAIMDSetFloorRaisesTargetImmediately(t *testing.T) {
-	a := AIMD{Target: 0}
-	a.SetFloor(2)
-	if a.Target != 2 {
-		t.Fatalf("Target after SetFloor(2) = %d, want 2", a.Target)
-	}
-	// Lowering the floor never drops the target; the control law walks it back.
-	a.SetFloor(0)
-	if a.Target != 2 {
-		t.Fatalf("Target after SetFloor(0) = %d, want 2 (unchanged)", a.Target)
 	}
 }
 

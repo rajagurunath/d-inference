@@ -448,8 +448,12 @@ func (r *Registry) ReserveNextFromPlan(pr *PendingRequest, plan *DispatchPlan, e
 		pr.ProviderID = p.ID
 		p.addPendingLocked(pr)
 		// Half-open capacity probe claim: identical to the primary reservation
-		// path (the r.mu write lock held across this loop serializes claims).
-		r.claimCapacityProbeLocked(p.ID, model, time.Now())
+		// path (the r.mu write lock held across this loop serializes claims),
+		// including the LaneBatch skip — batch never consumes the probe (see
+		// reserveProvider).
+		if pr.Traits.Lane != LaneBatch {
+			r.claimCapacityProbeLocked(p.ID, model, time.Now())
+		}
 		if p.Status != StatusUntrusted && p.Status != StatusOffline {
 			p.Status = StatusServing
 		}

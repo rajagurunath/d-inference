@@ -131,7 +131,7 @@ type routingSnapshot struct {
 	pendingBytesKnown        bool
 	backendRunning           int
 	backendWaiting           int
-	// batchRowsAllowed is Registry.BatchRowsAllowed for this (provider, model)
+	// batchRowsAllowed is batchRowsAllowedLocked for this (provider, model)
 	// pair, captured under the same p.mu as backendRunning/backendWaiting so the
 	// batch-lane candidate filter compares the allowance against exactly the live
 	// slot state the online reservation is scored on. Filled ONLY for a batch-lane
@@ -747,7 +747,14 @@ func (r *Registry) commitProviderReservation(
 
 	pr.ProviderID = p.ID
 	p.addPendingLocked(pr)
-	r.claimCapacityProbeLocked(p.ID, model, time.Now())
+	// Invariant 4: a batch attempt feeds no online signal. The half-open probe
+	// is the router's single re-admission test for a cooled-down pair, and a
+	// batch terminal returns early from every outcome site, so a batch claim
+	// would close the pair to online traffic for capacityProbeOutcomeWindow
+	// and never resolve it. Batch reservations leave the probe unclaimed.
+	if pr.Traits.Lane != LaneBatch {
+		r.claimCapacityProbeLocked(p.ID, model, time.Now())
+	}
 	if p.Status != StatusUntrusted && p.Status != StatusOffline {
 		p.Status = StatusServing
 	}

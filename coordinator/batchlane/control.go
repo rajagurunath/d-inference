@@ -65,7 +65,7 @@ func (e *EWMA) Initialized() bool { return e.init }
 
 // SlotSignal is one provider·slot's live state for a single control step. It is
 // assembled by a RegistryView from the provider's heartbeat capacity report;
-// MaxPerSlot is (*registry.Registry).BatchRowsAllowed for the pair, i.e. the
+// MaxPerSlot is registry.BatchSlot.BatchRowsAllowed for the pair, i.e. the
 // router's own admission cap minus the row reserved for online traffic.
 type SlotSignal struct {
 	// Waiting is the slot's NumWaiting — rows queued in the provider's own
@@ -111,12 +111,12 @@ type AIMDConfig struct {
 // the dispatcher has never seen contributes nothing until it has been observed
 // healthy for a tick.
 //
-// Floor is the deadline-escalation guarantee (design §3.4 step 3): once a batch
-// crosses floorUrgency it is granted a minimum concurrency so a busy online
-// tenant cannot starve it past its 24-hour window.
+// There is no per-slot floor. The deadline-escalation guarantee (design §3.4
+// step 3) is a per-BATCH token bucket in the dispatcher's claim step, which
+// grants one item without raising any slot's target — a floor here would have
+// manufactured rows the reservation path would refuse anyway.
 type AIMD struct {
 	Target int
-	Floor  int
 
 	cfg AIMDConfig
 }
@@ -150,35 +150,15 @@ func (a *AIMD) Update(sig SlotSignal) int {
 	return a.Target
 }
 
-// SetFloor sets the deadline-driven minimum concurrency. Raising it takes
-// effect immediately; lowering it never drops the current target, which the
-// control law walks back down on its own so a released floor cannot produce a
-// step change.
-func (a *AIMD) SetFloor(f int) {
-	if f < 0 {
-		f = 0
-	}
-	a.Floor = f
-	if a.Target < a.Floor {
-		a.Target = a.Floor
-	}
-}
-
-// clamp bounds n to [Floor, max], where max is the slot's batch row allowance
+// clamp bounds n to [0, max], where max is the slot's batch row allowance
 // narrowed by any configured global ceiling. A slot with no allowance is pinned
-// to zero — the floor cannot manufacture a row the router would not admit.
+// to zero: the lane can never manufacture a row the router would not admit.
 func (a *AIMD) clamp(n, maxPerSlot int) int {
 	if maxPerSlot < 0 {
 		maxPerSlot = 0
 	}
 	if a.cfg.MaxPerSlot > 0 && a.cfg.MaxPerSlot < maxPerSlot {
 		maxPerSlot = a.cfg.MaxPerSlot
-	}
-	if n > maxPerSlot {
-		n = maxPerSlot
-	}
-	if n < a.Floor {
-		n = a.Floor
 	}
 	if n > maxPerSlot {
 		n = maxPerSlot

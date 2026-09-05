@@ -20,15 +20,16 @@ package registry
 // makes the NEXT online request wait. A pair whose cap is 1 therefore has no
 // batch allowance at all.
 
-// BatchRowsAllowed reports how many concurrent rows the batch lane may occupy on
+// batchRowsAllowed reports how many concurrent rows the batch lane may occupy on
 // p's slot for model: the router's own quality-concurrency admission cap for the
 // pair minus one, floored at zero.
 //
-// Exported so the batch dispatcher (coordinator/batchlane) and the reservation
-// filter share one number rather than each computing their own. Takes r.mu (read)
-// and then p.mu, the established lock order; callers that already hold both use
-// batchRowsAllowedLocked.
-func (r *Registry) BatchRowsAllowed(p *Provider, model string) int {
+// It takes r.mu (read) and then p.mu, the established lock order; callers that
+// already hold both use batchRowsAllowedLocked, which is what the two production
+// paths do — the reservation filter (buildCandidateGateLocked) and BatchSlots,
+// through whose BatchRowsAllowed field the batch dispatcher reads the number.
+// Nothing outside the package computes its own.
+func (r *Registry) batchRowsAllowed(p *Provider, model string) int {
 	if r == nil || p == nil {
 		return 0
 	}
@@ -39,7 +40,7 @@ func (r *Registry) BatchRowsAllowed(p *Provider, model string) int {
 	return r.batchRowsAllowedLocked(p, model)
 }
 
-// batchRowsAllowedLocked is BatchRowsAllowed for a caller that already holds
+// batchRowsAllowedLocked is batchRowsAllowed for a caller that already holds
 // r.mu and p.mu (the routing snapshot path).
 func (r *Registry) batchRowsAllowedLocked(p *Provider, model string) int {
 	allowed := r.effectiveMaxConcurrencyForModelResolvedLocked(p, model) - 1
@@ -72,7 +73,7 @@ type BatchSlot struct {
 	// provider that does not report one, in which case there is no KV signal.
 	ActiveTokenBudgetUsed int64
 	ActiveTokenBudgetMax  int64
-	// BatchRowsAllowed is BatchRowsAllowed for the pair, resolved under the same
+	// BatchRowsAllowed is batchRowsAllowed for the pair, resolved under the same
 	// lock as the counters above so the allowance and the state it is compared
 	// against are from the same instant.
 	BatchRowsAllowed int
