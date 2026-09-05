@@ -1267,6 +1267,67 @@ func TestFinishItemErrorReOffersTheItem(t *testing.T) {
 	}
 }
 
+// committingFinishStore commits the finish and THEN reports an error, the way a
+// transaction whose COMMIT landed but whose acknowledgement was lost does.
+type committingFinishStore struct {
+	store.Store
+
+	mu        sync.Mutex
+	remaining int
+}
+
+func (c *committingFinishStore) FinishItem(r store.ItemResult, at time.Time) (bool, error) {
+	ok, err := c.Store.FinishItem(r, at)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.remaining > 0 && err == nil {
+		c.remaining--
+		return ok, errors.New("store: connection reset after commit")
+	}
+	return ok, err
+}
+
+// A FinishItem error is not proof the finish did not land. When the commit
+// really did happen the row is already `succeeded` and points at the result
+// blob, so the settle must NOT delete it: ReleaseItem returns false (nothing
+// inflight to re-offer), and that false is the signal to keep the blob. The
+// pre-fix code deleted it unconditionally and left a succeeded item pointing at
+// a file that no longer existed.
+func TestFinishItemErrorAfterCommitKeepsTheResultBlob(t *testing.T) {
+	ctx := context.Background()
+	committing := &committingFinishStore{Store: store.NewMemory(store.Config{}), remaining: 1}
+	h := newHarnessOn(t, batchlane.Config{MaxAttempts: 3}, committing)
+	idleSlot(h.view, 4)
+	h.dispatch.Respond = func(int, string, []byte) (batchlane.Outcome, error) {
+		return batchlane.Outcome{ResponseBody: []byte(`{"choices":[]}`)}, nil
+	}
+	seedBatch(t, h.st, h.blobs, "batch_finishcommit", 1, testStart.Add(24*time.Hour))
+	items, _ := h.st.ListItems("batch_finishcommit")
+	ref := batchlane.ResultBlobRef(items[0].ID)
+
+	h.tick(t, ctx, testStart)                  // claim + dispatch
+	h.tick(t, ctx, testStart.Add(time.Second)) // drain: FinishItem commits, then errors
+
+	items, _ = h.st.ListItems("batch_finishcommit")
+	if items[0].State != store.ItemSucceeded {
+		t.Fatalf("state = %s, want succeeded — the finish committed", items[0].State)
+	}
+	if items[0].ResultBlobRef != ref {
+		t.Fatalf("result blob ref = %q, want %q", items[0].ResultBlobRef, ref)
+	}
+	if _, err := h.blobs.Raw(ref); err != nil {
+		t.Fatalf("the committed item's result blob was deleted: %v", err)
+	}
+	// The item is terminal, so nothing re-dispatches it and the batch closes.
+	h.tick(t, ctx, testStart.Add(2*time.Second))
+	if h.dispatch.Len() != 1 {
+		t.Fatalf("dispatch calls = %d, want 1 — a committed item must not be re-run", h.dispatch.Len())
+	}
+	if !h.finalize.Called("batch_finishcommit") {
+		t.Fatal("finalize was never offered the batch after the committed finish")
+	}
+}
+
 // One orphan pass is bounded on the store probes it makes, not only on the
 // blobs it deletes: a directory whose blobs all still have rows produces no
 // deletes at all, and without a scan bound it would issue one query per blob,

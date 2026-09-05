@@ -721,16 +721,31 @@ func (d *Dispatcher) settleSuccess(res itemOutcome, claimable bool, now time.Tim
 		ResultBlobRef:    ref,
 	}, now)
 	if err != nil {
-		// The item is still inflight in the store and the result blob it points
-		// at is already on disk. Release the claim and drop the blob so the next
-		// tick re-claims the item instead of leaving it stranded until the batch
-		// expires. The dispatch is repeated, which costs one provider call; the
-		// alternative costs the consumer the whole item.
+		// A FinishItem error does NOT prove the finish did not land: an error
+		// raised at commit (or on the way back from one) can follow a
+		// transaction that already committed, leaving a succeeded row pointing
+		// at this ref. ReleaseItem is the discriminator — it moves an INFLIGHT
+		// row back to pending and returns true only then. Only a true release
+		// proves nothing references the blob, and only then may it be dropped
+		// so the next tick re-dispatches cleanly. A false release means the
+		// finish may have committed, so the blob stays: an orphan blob costs
+		// disk until the sweep, a deleted one costs the consumer the result.
 		d.logger.Error("batch lane: could not finish an item",
 			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
-		if _, rerr := d.st.ReleaseItem(res.itemID); rerr != nil {
+		released, rerr := d.st.ReleaseItem(res.itemID)
+		if rerr != nil {
 			d.logger.Error("batch lane: could not re-offer an unfinishable item",
 				"batch_id", res.batchID, "item_id", res.itemID, "error", rerr)
+		}
+		if !released {
+			// The item was not inflight any more, so the finish may have
+			// committed. Keep the blob, drop the retry tally with the item, and
+			// give finalize its chance in case that commit closed the batch.
+			d.logger.Warn("batch lane: keeping a result blob for an item that could not be re-offered",
+				"batch_id", res.batchID, "item_id", res.itemID)
+			d.forgetAttempts(res.itemID)
+			d.runFinalize(res.batchID, now)
+			return
 		}
 		if derr := d.blob.Delete(ref); derr != nil && !errors.Is(derr, sealedblob.ErrNotFound) {
 			d.logger.Error("batch lane: could not drop an unfinished result blob",
