@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/eigeninference/d-inference/e2e/testbed"
@@ -26,11 +27,19 @@ import (
 
 const devstackListenAddr = "127.0.0.1:18080"
 
+// realChallengesEnv is the environment default for --real-challenges. Off means
+// the stack keeps the testbed's skip-challenge posture; the coordinator
+// auto-refreshes challenge freshness in that mode, so an idle stack stays
+// routable past the 16-minute liveness window either way. Turn it on to
+// exercise the real attestation challenge/response path.
+const realChallengesEnv = "DARKBLOOM_DEVSTACK_REAL_CHALLENGES"
+
 func main() {
 	usePostgres := flag.Bool("postgres", false, "use a real Postgres store instead of the in-memory store: an ephemeral instance the stack provisions and drops on exit, or — when DARKBLOOM_DEVSTACK_DATABASE_URL (or, failing that, EIGENINFERENCE_DATABASE_URL) names one — that database, kept across restarts")
 	model := flag.String("model", "", "model ID to serve (default: DARKBLOOM_TESTBED_MODEL env, then the testbed default)")
 	providerBinary := flag.String("provider-binary", "", "path to a prebuilt provider binary (default: DARKBLOOM_PROVIDER_BINARY env, else build from source via testbed.BuildProvider)")
 	apiKey := flag.String("api-key", os.Getenv("DARKBLOOM_DEV_KEY"), "reuse this already-issued key for the printed user instead of minting one (default: DARKBLOOM_DEV_KEY env). Only a key the store already holds can be reused — see the WARN it logs otherwise")
+	realChallenges := flag.Bool("real-challenges", envBool(realChallengesEnv), "run the production attestation-challenge loop instead of skipping challenges (default: "+realChallengesEnv+" env). Off keeps the testbed's skip posture, with challenge freshness auto-refreshed so the stack stays routable")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -46,6 +55,7 @@ func main() {
 		UseMemoryStore: !*usePostgres,
 		ListenAddr:     devstackListenAddr,
 		APIKey:         *apiKey,
+		RealChallenges: *realChallenges,
 	}
 	if *model != "" {
 		cfg.ModelSpecs = []testbed.ModelSpec{{ModelID: *model, NumProviders: 1}}
@@ -86,6 +96,7 @@ func main() {
 		"listen_addr", devstackListenAddr,
 		"postgres", *usePostgres,
 		"persistent_db", persistentDB,
+		"real_challenges", *realChallenges,
 		"model", cfg.PrimaryModelID())
 	if err := suite.Start(ctx); err != nil {
 		logger.Error("dev stack failed to start", "error", err)
@@ -143,6 +154,15 @@ func resolveDatabaseURL(usePostgres bool) (url, source string) {
 		return u, "EIGENINFERENCE_DATABASE_URL"
 	}
 	return "", ""
+}
+
+// envBool reads a boolean flag default from the environment. Anything
+// strconv.ParseBool rejects — including an unset or empty variable — is false,
+// so a typo can only leave the default posture in place, never silently enable
+// something.
+func envBool(name string) bool {
+	v, err := strconv.ParseBool(os.Getenv(name))
+	return err == nil && v
 }
 
 // devUserKey is the raw key for the printed user, or a placeholder when the

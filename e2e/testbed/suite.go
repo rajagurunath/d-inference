@@ -376,8 +376,9 @@ func (s *Suite) startCoordinator() error {
 	}
 	srv.SetAdminKey("testbed-admin-key")
 	srv.SetRuntimeManifest(&api.RuntimeManifest{})
-	srv.SetChallengeInterval(1 * time.Hour)
-	srv.SetSkipChallenge(true)
+	skipChallenge, challengeInterval := s.Config.challengePosture()
+	srv.SetChallengeInterval(challengeInterval)
+	srv.SetSkipChallenge(skipChallenge)
 	srv.SetAllowDuplicateProviderSerialsForTesting(true)
 
 	ledger := payments.NewLedger(s.PgStore)
