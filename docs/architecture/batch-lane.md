@@ -31,7 +31,7 @@ Motivation and measurements: [`../design/tidal-batch-lane.md`](../design/tidal-b
 | Output assembly, retention | `coordinator/api/batch_assembler.go` | `FinalizeBatchIfDone`, `PurgeExpiredBatchFiles` |
 | Metadata persistence | `coordinator/store/batch_types.go`, `memory_batch.go`, `postgres_batch.go` | `BatchStore`, `BatchItemStore`, `BatchFileStore` |
 | Sealed blobs on disk | `coordinator/store/sealedblob/` | `Store.PutPlain`, `PutTo`, `Open`, `Raw` |
-| Lane trait and reservation filter | `coordinator/registry/request_traits.go`, `coordinator/registry/batch_lane.go`, `coordinator/registry/scheduler.go` | `LaneBatch`, `BatchSlots`, `buildCandidateGateLocked` |
+| Lane trait and reservation filter | `coordinator/registry/request_traits.go`, `coordinator/registry/batch_lane.go`, `coordinator/registry/scheduler.go` | `LaneBatch`, `BatchSlots`, `buildCandidateInto` |
 | Dispatch entry, `service_tier` | `coordinator/api/batch_dispatch.go`, `coordinator/api/inference_preprocess.go` | `DispatchBatchItem`, `resolveRequestLane` |
 | Control loop | `coordinator/batchlane/` | `Dispatcher.Tick`, `AIMD.Update`, `Laxity` |
 | Metering | `coordinator/payments/pricing.go`, `coordinator/api/provider.go` | `LaneMultiplier`, `CalculateCostForLane` |
@@ -91,7 +91,7 @@ lands is the reservation path's decision.
    `effectiveMaxConcurrencyForModelResolvedLocked`). A pair whose cap is 1 has
    no batch allowance at all.
 2. **Batch takes only warm, quiet, under-cap slots.** The gate in
-   `buildCandidateGateLocked` (`coordinator/registry/scheduler.go`) refuses a
+   `buildCandidateInto` (`coordinator/registry/scheduler.go`) refuses a
    `LaneBatch` candidate unless the model is already resident on the slot,
    `NumWaiting == 0`, and live occupancy is below the allowance. Occupancy is
    `batchSlotOccupancy` — `max(pendingLoadForModelLocked, backendRunning)` —
@@ -125,7 +125,7 @@ lands is the reservation path's decision.
 | TTFT calibration and the TTFT admission shadow | `coordinator/registry/scheduler.go`, `coordinator/registry/dispatch_plan.go`, `coordinator/registry/ttft_shadow.go` |
 | Capacity cooldowns, budget clamp, capacity-503 window, breakers | `coordinator/api/consumer.go` (`noteInferenceError`), `coordinator/api/provider.go` |
 | OpenRouter uptime series and `inference.request_outcome` | `coordinator/api/or_uptime.go` |
-| Half-open capacity probe (`claimCapacityProbeLocked`) | `coordinator/registry/scheduler.go`, `coordinator/registry/dispatch_plan.go` |
+| Half-open capacity probe (`tryClaimCapacityProbe`) | `coordinator/registry/scheduler.go`, `coordinator/registry/dispatch_plan.go` |
 
 A closed batch slot is reported with its own gate reason,
 `GateBatchHeadroom` (`"batch_headroom"`), so co-serving telemetry can tell it
@@ -236,7 +236,7 @@ Known gaps, each tracked as a follow-up in the design record:
 |---|---|
 | Lane trait | `coordinator/registry/request_traits.go` (`Lane`, `LaneBatch`) |
 | Row allowance, slot snapshot, decode floor | `coordinator/registry/batch_lane.go` (`BatchRowsAllowed`, `BatchSlots`, `QualityCapFloorTPS`) |
-| Reservation filter | `coordinator/registry/scheduler.go` (`buildCandidateGateLocked`, `batchSlotOccupancy`) |
+| Reservation filter | `coordinator/registry/scheduler.go` (`buildCandidateInto`, `batchSlotOccupancy`) |
 | Gate reason | `coordinator/registry/gate_reason.go` (`GateBatchHeadroom`) |
 | Control law | `coordinator/batchlane/control.go` (`EWMA`, `AIMD`, `TokenBucket`) |
 | Deadline math | `coordinator/batchlane/laxity.go` (`Laxity`, `Urgency`, `Priority`, `ObservedRate`) |

@@ -2,16 +2,20 @@ package registry
 
 import (
 	"testing"
-	"time"
 )
 
 // capacityProbeClaimedFor reports whether the pair's half-open probe has been
-// claimed. Keyed through faultKeyLocked, exactly as the production maps are.
-func capacityProbeClaimedFor(r *Registry, providerID, modelID string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	e, ok := r.capacityCooldowns[capacityRejectKey{ProviderID: r.faultKeyLocked(providerID), ModelID: modelID}]
-	return ok && !e.probeAt.IsZero()
+// claimed. Read under the identity's gate.mu, where the cooldown entries live.
+func capacityProbeClaimedFor(r *Registry, providerID, modelID string) (claimed bool) {
+	readGateForSession(r, providerID, func(g *gateState) {
+		if g == nil {
+			return
+		}
+		if e, ok := g.capacityCooldowns[modelID]; ok {
+			claimed = !e.probeAt.IsZero()
+		}
+	})
+	return claimed
 }
 
 // halfOpenCapacityCooldown trips the pair's capacity cooldown and rewinds its
@@ -25,16 +29,10 @@ func halfOpenCapacityCooldown(t *testing.T, r *Registry, providerID, modelID str
 	if !r.CapacityCooldownActive(providerID, modelID) {
 		t.Fatalf("fixture: cooldown for %s/%s did not trip", providerID, modelID)
 	}
-	r.mu.Lock()
-	e, ok := r.capacityCooldowns[capacityRejectKey{ProviderID: r.faultKeyLocked(providerID), ModelID: modelID}]
-	if ok {
-		e.expiry = time.Now().Add(-time.Second)
-		e.probeAt = time.Time{}
-	}
-	r.mu.Unlock()
-	if !ok {
+	if capacityCooldownEntryOf(r, providerID, modelID) == nil {
 		t.Fatalf("fixture: no cooldown entry for %s/%s", providerID, modelID)
 	}
+	expireCapacityCooldown(r, providerID, modelID)
 	if r.CapacityCooldownActive(providerID, modelID) {
 		t.Fatalf("fixture: %s/%s not half-open after the TTL lapsed", providerID, modelID)
 	}

@@ -463,7 +463,8 @@ type Server struct {
 
 	// dd is the Datadog integration client for DogStatsD metrics and
 	// Logs API event forwarding. Nil when DD is not configured.
-	dd *datadog.Client
+	dd          *datadog.Client
+	queueGauges queueGaugeState
 
 	// apiKeyCache memoizes ValidateKeyFull results so repeated requests
 	// with the same API key skip the DB round trip. Entries expire after
@@ -893,6 +894,12 @@ func NewServer(reg *registry.Registry, st store.Store, cfg ServerConfig, logger 
 		s.trustReplayInFlight = make(map[string]struct{})
 	}
 	reg.SetRuntimeCapabilitiesPromotedHook(s.handleRuntimeCapabilitiesPromoted)
+	// The per-identity gate locks that replaced the request-path registry
+	// write lock (registry/gate_state.go) report any acquisition wait above
+	// 1 ms here, tagged by recorder site, so the new locks stay observable.
+	reg.SetGateWaitObserver(func(site string, wait time.Duration) {
+		s.ddHistogram("registry.gate.wait_ms", float64(wait.Microseconds())/1000, []string{"site:" + site})
+	})
 	s.profiler = newProfilerFromEnv(s)
 	s.registerDefaultGauges()
 	s.routes()
@@ -981,7 +988,16 @@ func (s *Server) Close() {
 		s.promptArtifacts.Close()
 	}
 	if s.routeTelemetry != nil {
-		s.routeTelemetry.close()
+		// Bounded flush: buffered route rows are written before main's deferred
+		// store Close (registered earlier, so it runs after this) tears down the
+		// pool. A stuck store cannot hold shutdown past the deadline; whatever
+		// is still unwritten then is counted as dropped by the sink.
+		if !s.routeTelemetry.closeAndWait(telemetrySinkShutdownFlush) && s.logger != nil {
+			s.logger.Warn("routing telemetry sink did not finish flushing before the shutdown deadline",
+				"deadline", telemetrySinkShutdownFlush,
+				"dropped_total", s.routeTelemetry.dropped.Load(),
+			)
+		}
 	}
 	s.trustAuthorityMu.Lock()
 	if s.trustAuthority != nil {
@@ -1313,6 +1329,15 @@ func (s *Server) invalidateCatalogCache() {
 			s.readCache.Invalidate(modelCatalogCacheKey(typeFilter, includeAliases))
 		}
 	}
+	// /v1/models entry memo + list bodies (both include_builds values) and the
+	// OpenRouter feed are derived from the same catalog; drop them too so an
+	// admin alias/registry change is visible on the next request instead of
+	// after their 2s/5s TTLs (which remain the bound for out-of-band DB edits).
+	for _, includeBuilds := range []bool{false, true} {
+		s.readCache.Invalidate(modelEntriesCacheKey(includeBuilds))
+		s.readCache.Invalidate(modelListBodyCacheKey(includeBuilds))
+	}
+	s.readCache.Invalidate(openRouterFeedCacheKey)
 	// stats:v1 is deliberately NOT evicted here: the stats refresher recomputes
 	// it every minute, and evicting it made every concurrent /v1/stats request
 	// rerun the multi-second usage analytics statements.
@@ -3068,9 +3093,12 @@ func (s *Server) StartDDGaugeLoop(ctx context.Context) {
 				enforced = 1.0
 			}
 			s.ddGauge("attestation.code_enforced", enforced, nil)
-			for model, count := range s.registry.ModelProviderSnapshot() {
+			perModel := s.registry.ModelProviderSnapshot()
+			for model, count := range perModel {
 				s.ddGauge("providers.per_model", float64(count), []string{"model:" + model})
 			}
+			// Per-model queue depth/age (fleet_gauges.go).
+			s.emitPerModelQueueGauges(perModel)
 			for ver, count := range s.registry.ProviderCountByVersion() {
 				s.ddGauge("providers.per_version", float64(count), []string{"version:" + ver})
 			}
@@ -3092,6 +3120,7 @@ func (s *Server) StartDDGaugeLoop(ctx context.Context) {
 				s.ddGauge("request_queue.depth", float64(q.TotalSize()), nil)
 			}
 			s.emitExactCacheDDGauges()
+			s.emitStoreCacheGauges()
 			// Network utilization — demand/capacity across the warm-serving and
 			// token-budget axes, plus a per-model breakdown.
 			util := s.registry.NetworkUtilizationSnapshot()
