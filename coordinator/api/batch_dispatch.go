@@ -206,6 +206,45 @@ func (s *Server) DispatchBatchItem(
 	return outcome, nil
 }
 
+// laneModelAllowed is the per-key model allow-list check the request prelude
+// runs, plus the one equivalence the batch lane needs.
+//
+// An ONLINE request is checked on the name the consumer typed, which is also
+// the name they put on the key. A batch item cannot be: by the time it reaches
+// the funnel, DispatchBatchItem has already replaced the body's model with the
+// RESOLVED build id (deliberately — re-resolving an alias hours after
+// submission would silently reroute a half-finished batch onto a different
+// build). Comparing that build id against an alias-scoped allow-list would deny
+// every alias-scoped key its own batches.
+//
+// So on the coordinator-stamped batch lane — laneFromContext, which only
+// DispatchBatchItem sets, never a consumer's own service_tier — an allow-list
+// entry also matches the build id it resolves to. This never WIDENS a key: the
+// requested name was already checked against the same allow-list at
+// handleBatchCreate, so a key holding only build ids still cannot run a batch
+// that asks for an alias. It only stops the coordinator's own internal rename
+// from denying work the key was granted.
+func (s *Server) laneModelAllowed(ctx context.Context, model string) bool {
+	if s.keyModelAllowed(ctx, model) {
+		return true
+	}
+	if laneFromContext(ctx) != registry.LaneBatch {
+		return false
+	}
+	k := apiKeyFromContext(ctx)
+	if k == nil {
+		// Unreachable: keyModelAllowed already allows a keyless request.
+		return false
+	}
+	resolve := s.batchModelResolver()
+	for _, allowed := range k.AllowedModels {
+		if build, ok := resolve(allowed); ok && build == model {
+			return true
+		}
+	}
+	return false
+}
+
 // batchUsageFromResponse reads the provider-reported usage back off an assembled
 // non-streaming response. A body without a usage object yields zeros rather than
 // an error: the attempt succeeded, and the batch item records what it was told.
