@@ -5384,6 +5384,43 @@ func (r *Registry) RecordChallengeSuccess(providerID string) bool {
 	return recovered
 }
 
+// ChallengeFreshnessMaxAge is the age at which the routing liveness gate stops
+// trusting a provider's last verified attestation challenge and derouts it
+// (GateChallengeStale). Exported so the coordinator's challenge scheduler can
+// keep its cadence comfortably inside the window instead of hard-coding a
+// second copy of the number.
+func ChallengeFreshnessMaxAge() time.Duration { return challengeFreshnessMaxAge }
+
+// RefreshChallengeFreshnessSkipped restamps a provider's challenge-freshness
+// clock WITHOUT any attestation having been verified. It has exactly one
+// caller: a coordinator running with skipChallenge (testing only), which never
+// sends a challenge at all.
+//
+// It exists because skipping the challenge must not be equivalent to failing
+// it: the routing liveness gate derouts any provider whose
+// LastChallengeVerified is older than challengeFreshnessMaxAge, so a
+// skip-challenge coordinator that never restamps drops every provider out of
+// routing, the capacity feed and the warm pool 16 minutes after registration.
+//
+// Deliberately NOT RecordChallengeSuccess: nothing was proven, so this records
+// no reputation event, never recovers a transiently-untrusted provider and does
+// not set ChallengeVerifiedSIP. It only moves the freshness clock (and persists
+// it, exactly as a real challenge would).
+func (r *Registry) RefreshChallengeFreshnessSkipped(providerID string) {
+	r.mu.RLock()
+	p, ok := r.providers[providerID]
+	r.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	p.mu.Lock()
+	p.LastChallengeVerified = time.Now()
+	p.mu.Unlock()
+
+	r.persistProviderNow(p)
+}
+
 // recoverIfTransientlyUntrusted promotes a transiently-untrusted provider back
 // to online, mirroring markUntrusted's bookkeeping in reverse. Returns true iff
 // a transition occurred. It acquires r.mu (write) then p.mu — the same order as
