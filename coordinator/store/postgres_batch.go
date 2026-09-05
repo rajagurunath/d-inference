@@ -33,7 +33,7 @@ const batchItemColumns = `id, batch_id, custom_id, line_no, state, attempts, las
 const batchColumns = `id, account_id, api_key_id, input_file_id, endpoint, status, completion_window,
 	created_at, expires_at, in_progress_at, completed_at, cancelled_at,
 	counts_total, counts_completed, counts_failed, output_file_id, error_file_id,
-	result_public_key, sealed_to, source, model, metadata_json`
+	result_public_key, sealed_to, source, model, requested_model, metadata_json`
 
 // marshalBatchMetadata encodes a batch's metadata map for the JSONB column. A
 // nil map becomes {} rather than JSON null so a round trip always returns a
@@ -68,7 +68,7 @@ func scanBatch(row pgx.Row) (*Batch, error) {
 	err := row.Scan(&b.ID, &b.AccountID, &b.APIKeyID, &b.InputFileID, &b.Endpoint, &b.Status, &b.CompletionWindow,
 		&b.CreatedAt, &b.ExpiresAt, &b.InProgressAt, &b.CompletedAt, &b.CancelledAt,
 		&b.CountsTotal, &b.CountsCompleted, &b.CountsFailed, &b.OutputFileID, &b.ErrorFileID,
-		&b.ResultPublicKey, &b.SealedTo, &b.Source, &b.Model, &metadata)
+		&b.ResultPublicKey, &b.SealedTo, &b.Source, &b.Model, &b.RequestedModel, &metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -217,10 +217,12 @@ func (s *PostgresStore) CreateBatch(b *Batch, items []*BatchItem) error {
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO batches (id, account_id, api_key_id, input_file_id, endpoint, status, completion_window,
-			created_at, expires_at, counts_total, result_public_key, sealed_to, source, model, metadata_json)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+			created_at, expires_at, counts_total, result_public_key, sealed_to, source, model,
+			requested_model, metadata_json)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
 		b.ID, b.AccountID, b.APIKeyID, b.InputFileID, b.Endpoint, BatchValidating, b.CompletionWindow,
-		createdAt, b.ExpiresAt, b.CountsTotal, b.ResultPublicKey, b.SealedTo, b.Source, b.Model, metadata,
+		createdAt, b.ExpiresAt, b.CountsTotal, b.ResultPublicKey, b.SealedTo, b.Source, b.Model,
+		b.RequestedModel, metadata,
 	); err != nil {
 		return fmt.Errorf("store: insert batch %q: %w", b.ID, err)
 	}
