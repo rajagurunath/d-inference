@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/batchlane"
 	"github.com/eigeninference/d-inference/coordinator/internal/e2e"
 	"github.com/eigeninference/d-inference/coordinator/registry"
 	"github.com/eigeninference/d-inference/coordinator/store"
@@ -594,12 +595,12 @@ func (e *batchEnv) claimAll(batchID string) []*store.BatchItem {
 // item id, before the item is settled) and then finishes the item.
 func (e *batchEnv) settleSucceeded(item *store.BatchItem, body []byte) {
 	e.t.Helper()
-	if err := e.srv.BatchBlobs().PutPlain(BatchItemResultRef(item.ID), body); err != nil {
+	if err := e.srv.BatchBlobs().PutPlain(batchlane.ResultBlobRef(item.ID), body); err != nil {
 		e.t.Fatalf("write result blob: %v", err)
 	}
 	ok, err := e.st.FinishItem(store.ItemResult{
 		ItemID: item.ID, Succeeded: true, RequestID: "req_" + item.ID,
-		ResultBlobRef: BatchItemResultRef(item.ID), PromptTokens: 3, CompletionTokens: 5,
+		ResultBlobRef: batchlane.ResultBlobRef(item.ID), PromptTokens: 3, CompletionTokens: 5,
 	}, time.Now().UTC())
 	if err != nil || !ok {
 		e.t.Fatalf("finish item: ok=%v err=%v", ok, err)
@@ -666,14 +667,14 @@ func TestResultPublicKeyIsStrict(t *testing.T) {
 	// the store cannot read it while assembly still carries it verbatim.
 	items := env.claimAll(batchID)
 	plain := []byte(`{"id":"chatcmpl-secret"}`)
-	if err := env.srv.BatchBlobs().PutTo(BatchItemResultRef(items[0].ID), plain, consumer.PublicKey); err != nil {
+	if err := env.srv.BatchBlobs().PutTo(batchlane.ResultBlobRef(items[0].ID), plain, consumer.PublicKey); err != nil {
 		t.Fatalf("seal to consumer: %v", err)
 	}
-	if _, err := env.srv.BatchBlobs().Open(BatchItemResultRef(items[0].ID)); err == nil {
+	if _, err := env.srv.BatchBlobs().Open(batchlane.ResultBlobRef(items[0].ID)); err == nil {
 		t.Fatal("the coordinator must not be able to open a consumer-sealed result")
 	}
 	ok, err := env.st.FinishItem(store.ItemResult{
-		ItemID: items[0].ID, Succeeded: true, ResultBlobRef: BatchItemResultRef(items[0].ID),
+		ItemID: items[0].ID, Succeeded: true, ResultBlobRef: batchlane.ResultBlobRef(items[0].ID),
 	}, time.Now().UTC())
 	if err != nil || !ok {
 		t.Fatalf("finish: ok=%v err=%v", ok, err)

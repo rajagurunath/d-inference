@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/batchlane"
 	"github.com/eigeninference/d-inference/coordinator/store"
 	"github.com/eigeninference/d-inference/coordinator/store/sealedblob"
 )
@@ -40,10 +41,6 @@ var batchItemErrorMessages = map[string]string{
 	batchItemErrorExpired:   "The batch expired before this request was processed.",
 	batchItemErrorCancelled: "The batch was cancelled before this request was processed.",
 }
-
-// BatchOutputRetention is how long an assembled output or error file, and the
-// result blobs behind it, survive after the batch completes.
-const BatchOutputRetention = 7 * 24 * time.Hour
 
 // FinalizeResult reports what a finalize pass did. It is nil when the batch was
 // not ready (or not open), which is the common case on a busy tick.
@@ -239,7 +236,7 @@ func (s *Server) assembleBatchFiles(blobs *sealedblob.Store, batch *store.Batch,
 func (s *Server) readItemResult(blobs *sealedblob.Store, batch *store.Batch, it *store.BatchItem) (json.RawMessage, error) {
 	ref := it.ResultBlobRef
 	if ref == "" {
-		ref = BatchItemResultRef(it.ID)
+		ref = batchlane.ResultBlobRef(it.ID)
 	}
 	var (
 		raw []byte
@@ -400,7 +397,7 @@ func (s *Server) PurgeExpiredBatchFiles(now time.Time) (int, error) {
 	if blobs == nil {
 		return 0, nil
 	}
-	files, err := s.store.ListPurgeableFiles(now.Add(-BatchOutputRetention))
+	files, err := s.store.ListPurgeableFiles(now.Add(-batchlane.DefaultOutputRetention))
 	if err != nil {
 		return 0, fmt.Errorf("batch: list purgeable files: %w", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/batchlane"
 	"github.com/eigeninference/d-inference/coordinator/ratelimit"
 	"github.com/eigeninference/d-inference/coordinator/store"
 )
@@ -85,7 +86,7 @@ func TestInlineResultsAreCapped(t *testing.T) {
 	// dispatcher does, so the GET has real blobs to open.
 	blobs := e.srv.BatchBlobs()
 	for _, it := range items {
-		if err := blobs.PutPlain(BatchItemResultRef(it.ID),
+		if err := blobs.PutPlain(batchlane.ResultBlobRef(it.ID),
 			[]byte(`{"id":"`+it.ID+`","choices":[{"message":{"content":"ok"}}]}`)); err != nil {
 			t.Fatalf("seal result: %v", err)
 		}
@@ -93,7 +94,7 @@ func TestInlineResultsAreCapped(t *testing.T) {
 			t.Fatalf("ClaimPendingItems: %v", err)
 		}
 		if ok, err := e.st.FinishItem(store.ItemResult{
-			ItemID: it.ID, Succeeded: true, ResultBlobRef: BatchItemResultRef(it.ID),
+			ItemID: it.ID, Succeeded: true, ResultBlobRef: batchlane.ResultBlobRef(it.ID),
 		}, now); err != nil || !ok {
 			t.Fatalf("FinishItem(%s): ok=%v err=%v", it.ID, ok, err)
 		}
@@ -160,7 +161,7 @@ func (e *batchEnv) smallTerminalInlineBatch(t *testing.T, n int) string {
 	}
 	blobs := e.srv.BatchBlobs()
 	for _, it := range items {
-		if err := blobs.PutPlain(BatchItemResultRef(it.ID),
+		if err := blobs.PutPlain(batchlane.ResultBlobRef(it.ID),
 			[]byte(`{"id":"`+it.ID+`","choices":[{"message":{"content":"ok"}}]}`)); err != nil {
 			t.Fatalf("seal result: %v", err)
 		}
@@ -168,7 +169,7 @@ func (e *batchEnv) smallTerminalInlineBatch(t *testing.T, n int) string {
 			t.Fatalf("ClaimPendingItems: %v", err)
 		}
 		if ok, err := e.st.FinishItem(store.ItemResult{
-			ItemID: it.ID, Succeeded: true, ResultBlobRef: BatchItemResultRef(it.ID),
+			ItemID: it.ID, Succeeded: true, ResultBlobRef: batchlane.ResultBlobRef(it.ID),
 		}, now); err != nil || !ok {
 			t.Fatalf("FinishItem: ok=%v err=%v", ok, err)
 		}

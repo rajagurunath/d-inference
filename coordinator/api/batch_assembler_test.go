@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/batchlane"
 	"github.com/eigeninference/d-inference/coordinator/store"
 )
 
@@ -346,7 +347,7 @@ func TestFinalizeCancelsWithALateResultIgnored(t *testing.T) {
 	// The dispatch that was still out reports back. It is ignored.
 	ok, err := env.st.FinishItem(store.ItemResult{
 		ItemID: items[2].ID, Succeeded: true, RequestID: "req_late",
-		ResultBlobRef: BatchItemResultRef(items[2].ID),
+		ResultBlobRef: batchlane.ResultBlobRef(items[2].ID),
 	}, now.Add(time.Second))
 	if err != nil {
 		t.Fatalf("late finish: %v", err)
@@ -460,7 +461,7 @@ func TestPurgeExpiredBatchFiles(t *testing.T) {
 	}
 
 	// Past the horizon the content goes and the metadata stays.
-	future := time.Now().UTC().Add(BatchOutputRetention + time.Hour)
+	future := time.Now().UTC().Add(batchlane.DefaultOutputRetention + time.Hour)
 	purged, err := env.srv.PurgeExpiredBatchFiles(future)
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
@@ -481,7 +482,7 @@ func TestPurgeExpiredBatchFiles(t *testing.T) {
 	// The item's result blob is not a file row and is swept by the batch
 	// dispatcher (PR3b), not by this pass; assert it is the only leftover so a
 	// future change that widens the sweep has a failing expectation to update.
-	if names := blobFiles(t, env.blobDir); len(names) != 1 || names[0] != BatchItemResultRef(items[0].ID) {
+	if names := blobFiles(t, env.blobDir); len(names) != 1 || names[0] != batchlane.ResultBlobRef(items[0].ID) {
 		t.Fatalf("unexpected blobs left after the sweep: %v", names)
 	}
 

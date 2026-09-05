@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/batchlane"
 	"github.com/eigeninference/d-inference/coordinator/registry"
 )
 
@@ -21,10 +22,11 @@ import (
 const (
 	// batchNoCapacityCode is the bounded error/rejection code a batch-lane
 	// request gets when no provider slot has headroom for it. It is also the
-	// ErrCode BatchOutcome carries, so the batch dispatcher can tell "nothing
+	// ErrCode the Outcome carries, so the batch dispatcher can tell "nothing
 	// free right now, re-offer me next tick" apart from a real failure without
-	// parsing prose.
-	batchNoCapacityCode = "no_capacity"
+	// parsing prose. Defined AS the dispatcher's own constant: the HTTP error
+	// body and the settle vocabulary must never drift apart.
+	batchNoCapacityCode = batchlane.ErrCodeNoCapacity
 	// batchNoCapacityRetryAfterSec is the Retry-After the batch lane advertises
 	// on that 429. It matches the dispatcher's 1 Hz tick scale: a few seconds is
 	// long enough for online traffic to drain a slot and short enough that a
@@ -33,39 +35,9 @@ const (
 	batchNoCapacityRetryAfterSec = 5
 )
 
-// BatchOutcome is the result of running one batch item through the dispatch
-// funnel. Exactly one of a delivered response or an ErrCode is meaningful:
-// ErrCode is empty on success, batchNoCapacityCode ("no_capacity") when no
-// provider slot had batch headroom, batchCancelledCode ("cancelled") when the
-// CALLER'S OWN context ended before the attempt finished, and "request_failed"
-// for every other non-success terminal — the same bounded vocabulary the batch
-// output/error files use (docs/design/tidal-batch-lane.md §3.6).
-type BatchOutcome struct {
-	// RequestID is the coordinator-owned inference job id of the attempt that
-	// committed, echoed from the X-Inference-Job-ID header. Empty when nothing
-	// reached a provider.
-	RequestID string
-	// PromptTokens / CompletionTokens are the provider-reported usage of the
-	// committed attempt, read back from the assembled response body.
-	PromptTokens, CompletionTokens int
-	// ResponseBody is the complete non-streaming OpenAI response body on
-	// success, and the OpenAI-shaped error body otherwise.
-	ResponseBody []byte
-	// ErrCode is "" on success, and otherwise one of:
-	//   "no_capacity"    no provider slot had batch headroom. Release the claim
-	//                    WITHOUT counting an attempt and re-offer the item next tick.
-	//   "cancelled"      the caller's context was cancelled or timed out
-	//                    (shutdown, batch cancellation). Release the claim
-	//                    WITHOUT counting an attempt — nothing about the
-	//                    provider or the item was proven.
-	//   "request_failed" a real terminal. Count an attempt and retry up to
-	//                    maxAttempts.
-	ErrCode string
-}
-
 // batchRequestFailedCode is the bounded error code for a batch attempt that
 // reached a terminal that is not a capacity refusal.
-const batchRequestFailedCode = "request_failed"
+const batchRequestFailedCode = batchlane.ErrCodeRequestFailed
 
 // batchCancelledCode is the bounded error code for an attempt that ended
 // because the CALLER'S context did, not because anything went wrong with the
@@ -74,7 +46,7 @@ const batchRequestFailedCode = "request_failed"
 // cancelling the batch mid-flight says nothing about whether the item can be
 // served, and charging an attempt for it would retire a perfectly good item
 // after three restarts.
-const batchCancelledCode = "cancelled"
+const batchCancelledCode = batchlane.ErrCodeCancelled
 
 // errBatchAPIKeyUnusable is returned when the attributing key ID does not
 // resolve to a live key owned by accountID: unknown, revoked, disabled, expired
@@ -85,8 +57,10 @@ var errBatchAPIKeyUnusable = errors.New("batch dispatch: api key is not usable")
 
 // DispatchBatchItem runs one batch request through the standard consumer
 // dispatch funnel on registry.LaneBatch and waits for it to complete, returning
-// the assembled non-streaming response. It is the single entry point the batch
-// dispatcher (coordinator/batchlane, PR3b) uses; nothing about the request
+// the assembled non-streaming response. Its signature IS batchlane.DispatchFn,
+// so cmd/coordinator wires the method value straight into the dispatcher with
+// no adapter. It is the single entry point the batch
+// dispatcher (coordinator/batchlane) uses; nothing about the request
 // reaches a provider differently from an online one — only the lane differs,
 // and the lane is what restricts placement to headroom slots, suppresses the
 // wait queue and the hedge, and keeps the attempt out of reputation and TTFT
@@ -114,16 +88,16 @@ func (s *Server) DispatchBatchItem(
 	ctx context.Context,
 	accountID, apiKeyID, model string,
 	body []byte,
-) (BatchOutcome, error) {
+) (batchlane.Outcome, error) {
 	if s == nil {
-		return BatchOutcome{}, errors.New("nil server")
+		return batchlane.Outcome{}, errors.New("nil server")
 	}
 	if model == "" {
-		return BatchOutcome{}, errors.New("batch dispatch: model is required")
+		return batchlane.Outcome{}, errors.New("batch dispatch: model is required")
 	}
 	parsed, err := decodeInferenceJSONObject(body)
 	if err != nil {
-		return BatchOutcome{}, fmt.Errorf("batch dispatch: %w", err)
+		return batchlane.Outcome{}, fmt.Errorf("batch dispatch: %w", err)
 	}
 	parsed["model"] = model
 	// A batch item is assembled from CompleteCh, never relayed as SSE. Deleting
@@ -131,7 +105,7 @@ func (s *Server) DispatchBatchItem(
 	delete(parsed, "stream")
 	itemBody, err := marshalForwardBody(parsed)
 	if err != nil {
-		return BatchOutcome{}, fmt.Errorf("batch dispatch: %w", err)
+		return batchlane.Outcome{}, fmt.Errorf("batch dispatch: %w", err)
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(itemBody))
@@ -157,15 +131,15 @@ func (s *Server) DispatchBatchItem(
 	if apiKeyID != "" {
 		keyRec, err := s.store.GetAPIKeyByID(accountID, apiKeyID)
 		if err != nil || keyRec == nil {
-			return BatchOutcome{ErrCode: batchRequestFailedCode},
+			return batchlane.Outcome{ErrCode: batchRequestFailedCode},
 				fmt.Errorf("%w: %q: %v", errBatchAPIKeyUnusable, apiKeyID, err)
 		}
 		if keyRec.Disabled {
-			return BatchOutcome{ErrCode: batchRequestFailedCode},
+			return batchlane.Outcome{ErrCode: batchRequestFailedCode},
 				fmt.Errorf("%w: %q is revoked", errBatchAPIKeyUnusable, apiKeyID)
 		}
 		if keyRec.ExpiresAt != nil && time.Now().After(*keyRec.ExpiresAt) {
-			return BatchOutcome{ErrCode: batchRequestFailedCode},
+			return batchlane.Outcome{ErrCode: batchRequestFailedCode},
 				fmt.Errorf("%w: %q is expired", errBatchAPIKeyUnusable, apiKeyID)
 		}
 		rctx = context.WithValue(rctx, ctxKeyAPIKey, keyRec)
@@ -187,7 +161,7 @@ func (s *Server) DispatchBatchItem(
 	// re-offer it on a later tick, which is exactly what the key's own rate
 	// limit is asking for.
 	if !s.applyKeyRPMLimit(rec, req) {
-		return BatchOutcome{
+		return batchlane.Outcome{
 			ResponseBody: rec.Body.Bytes(),
 			ErrCode:      batchNoCapacityCode,
 		}, nil
@@ -197,7 +171,7 @@ func (s *Server) DispatchBatchItem(
 	defer result.Body.Close()
 	respBody := rec.Body.Bytes()
 
-	outcome := BatchOutcome{
+	outcome := batchlane.Outcome{
 		RequestID:    result.Header.Get("X-Inference-Job-ID"),
 		ResponseBody: respBody,
 	}
