@@ -1,6 +1,6 @@
 # Batch API
 
-> Last updated: 2026-09-04 · commit `a0a03dca8`
+> Last updated: 2026-09-05 · commit `2838c3fbf`
 
 Send a large set of chat completions on a 24-hour deadline instead of one at a
 time. Batch work runs only on provider slots the online quality cap is already
@@ -208,7 +208,7 @@ request in memory while it routes it.
 | `completion_window` | must be `"24h"` | `parseCreateBatch` |
 | `endpoint` | `/v1/chat/completions` or `/v1/completions` | `batchEndpoints` |
 | `stream` | absent or `false` | `validateBatchBody` |
-| `n` | absent or `1` | `validateBatchBody` |
+| `n` | must be a number if present; `n` greater than `1` is rejected | `validateBatchBody` |
 | Content parts | text only — image, audio, video and file parts are refused | `validateTextOnlyContent` |
 | `model` | must resolve through the alias table **and** be in the catalog | `batchModelResolver` (`coordinator/api/batch_files.go`) |
 | Completion window | 24 h from creation; open items then become `expired` | `batchCompletionWindowDuration` |

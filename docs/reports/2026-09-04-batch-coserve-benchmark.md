@@ -1,6 +1,6 @@
 # Batch co-serving benchmark
 
-> Last updated: 2026-09-06 · commit `b911a0d86`
+> Last updated: 2026-09-04 · commit `b911a0d86`
 
 What one Mac gives back when the Tidal batch lane fills the gaps between online requests, and what that costs the online requests. Produced by `TestBenchmarkBatchCoServe` (`e2e/batch_coserve_test.go`) against a real coordinator, a real Swift provider and real MLX inference.
 

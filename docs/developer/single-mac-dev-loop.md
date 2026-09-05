@@ -1,6 +1,6 @@
 # Single-Mac dev loop
 
-> Last updated: 2026-09-04 · commit `1a541c33b`
+> Last updated: 2026-09-05 · commit `2838c3fbf`
 
 Run a coordinator and one provider on one Mac for manual testing, without
 touching the shared dev environment or writing a throwaway launch script. For
@@ -99,7 +99,7 @@ In a second terminal, using the API key printed in step 1:
 ```bash
 DARKBLOOM_DEV_KEY=<the printed key> \
 DARKBLOOM_TESTBED_MODEL=mlx-community/Qwen3.5-0.8B-MLX-4bit \
-scripts/dev-smoke-batch.sh
+scripts/dev-smoke-chat.sh
 ```
 
 The script POSTs a streaming chat completion and exits 0 once an SSE `data:`
@@ -153,7 +153,7 @@ Dev stack ready.
 ```bash
 # 2. Terminal B — chat path
 export DARKBLOOM_DEV_KEY=<the key terminal A printed>
-./scripts/dev-smoke-batch.sh
+./scripts/dev-smoke-chat.sh
 ```
 
 Expect exit 0 and:
@@ -226,7 +226,7 @@ hand-built `mlx.metallib`, model `mlx-community/Qwen3.5-0.8B-MLX-4bit`:
 |---|---|
 | provider spawn → `providers registered` | 14.0 s |
 | weight hash (10 files) | 0.5 s |
-| `dev-smoke-batch.sh` first SSE `data:` line | 4 s (cold, includes the lazy model load) |
+| `dev-smoke-chat.sh` first SSE `data:` line | 4 s (cold, includes the lazy model load) |
 | first cold chat completion | 3564 ms for 27 completion tokens |
 | warm streaming, 81 completion tokens | 1273–1280 ms → 62–64 tok/s |
 | warm streaming, 128 completion tokens | 1989 ms → 64.4 tok/s |
@@ -253,7 +253,7 @@ operator-facing surface for the model-load verdict.
 
 - `make dev-stack` prints `Dev stack ready.` with a base URL, an API key, and
   at least one `Provider PID:` line.
-- `scripts/dev-smoke-batch.sh` prints `OK: first SSE data line arrived after
+- `scripts/dev-smoke-chat.sh` prints `OK: first SSE data line arrived after
   <N>s` and exits 0.
 
 ## Troubleshooting

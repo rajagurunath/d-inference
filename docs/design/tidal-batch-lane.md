@@ -1,6 +1,6 @@
 # Tidal batch lane: co-serving online and batch traffic on the idle fleet
 
-> Last updated: 2026-09-04 · commit `a0a03dca8`
+> Last updated: 2026-09-05 · commit `2838c3fbf`
 
 **Status: In progress** — 2026-09-05. The store, the sealed blob store, the
 Batch API, the lane trait and reservation filter, the 1 Hz dispatcher and the
@@ -8,6 +8,11 @@ half-price metering have landed; the co-serving benchmark has not. As-built
 description:
 [`../architecture/batch-lane.md`](../architecture/batch-lane.md); consumer
 how-to: [`../consumer/batch-api.md`](../consumer/batch-api.md).
+
+As-built deviation from §3.3: scrub triggers were not added to the batch
+tables; the accepted mitigation is `T-052` in
+[`../threat-model.yaml`](../threat-model.yaml) — the three tables carry no
+content column at all, asserted by `TestNoContentColumnsInBatchTables`.
 
 Original status: **Proposed** — 2026-09-05; evidence: fleet utilization of 12–19% and a
 99.94% free token budget recorded in [`routing-v2.md`](routing-v2.md), and the
