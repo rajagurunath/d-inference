@@ -176,7 +176,15 @@ func (s *Server) DispatchBatchItem(
 		RequestID:    result.Header.Get("X-Inference-Job-ID"),
 		ResponseBody: respBody,
 	}
-	if result.StatusCode/100 == 2 {
+	// A served item is a 2xx WITH a body. The dispatch funnel can also return
+	// having written nothing at all — its outcomeClientGone exits (the caller's
+	// context fired while parked for a routing-scan slot, or while queued) refund
+	// the reservation and, by contract, produce no response body — and an
+	// httptest.ResponseRecorder reports that as a default 200 with an empty body.
+	// Accepting it here would settle a CANCELLED item as a completed one with
+	// zero tokens, so an empty response falls through to the cancellation check
+	// below (and, if the context is fine, to request_failed).
+	if result.StatusCode/100 == 2 && len(respBody) > 0 {
 		outcome.PromptTokens, outcome.CompletionTokens = batchUsageFromResponse(respBody)
 		return outcome, nil
 	}

@@ -1,6 +1,6 @@
 # Batch lane
 
-> Last updated: 2026-09-05 · commit `b5eb17ed4`
+> Last updated: 2026-09-05 · commit `faae05cd4`
 
 The batch lane sells the slot capacity the online quality cap already leaves
 empty. A 1 Hz dispatcher inside the coordinator claims 24-hour batch items and
@@ -31,15 +31,17 @@ Motivation and measurements: [`../design/tidal-batch-lane.md`](../design/tidal-b
 | Output assembly, retention | `coordinator/api/batch_assembler.go` | `FinalizeBatchIfDone`, `PurgeExpiredBatchFiles` |
 | Metadata persistence | `coordinator/store/batch_types.go`, `memory_batch.go`, `postgres_batch.go` | `BatchStore`, `BatchItemStore`, `BatchFileStore` |
 | Sealed blobs on disk | `coordinator/store/sealedblob/` | `Store.PutPlain`, `PutTo`, `Open`, `Raw` |
-| Lane trait and reservation filter | `coordinator/registry/request_traits.go`, `coordinator/registry/batch_lane.go`, `coordinator/registry/scheduler.go` | `LaneBatch`, `BatchSlots`, `buildCandidateGateLocked` |
+| Lane trait and reservation filter | `coordinator/registry/request_traits.go`, `coordinator/registry/batch_lane.go`, `coordinator/registry/scheduler.go` | `LaneBatch`, `BatchSlots`, `buildCandidateInto` |
 | Dispatch entry, `service_tier` | `coordinator/api/batch_dispatch.go`, `coordinator/api/inference_preprocess.go` | `DispatchBatchItem`, `resolveRequestLane` |
 | Control loop | `coordinator/batchlane/` | `Dispatcher.Tick`, `AIMD.Update`, `Laxity` |
 | Metering | `coordinator/payments/pricing.go`, `coordinator/api/provider.go` | `LaneMultiplier`, `CalculateCostForLane` |
 | Process wiring | `coordinator/cmd/coordinator/batch_lane.go` | `startBatchDispatcher` |
 
 `batchlane` imports `store` and `registry` and never `api`; `api` imports
-`batchlane`. The adapters between them live in `main`, the only package that
-may import both.
+`batchlane`. There are no adapters between them: `api.DispatchBatchItem` IS a
+`batchlane.DispatchFn` and `api.RefundBatchItem` IS `Config.RefundItem`, so
+`main` — the only package that may import both — wires the methods straight
+into the config.
 
 ## Mechanism: one tick
 
@@ -91,7 +93,7 @@ lands is the reservation path's decision.
    `effectiveMaxConcurrencyForModelResolvedLocked`). A pair whose cap is 1 has
    no batch allowance at all.
 2. **Batch takes only warm, quiet, under-cap slots.** The gate in
-   `buildCandidateGateLocked` (`coordinator/registry/scheduler.go`) refuses a
+   `buildCandidateInto` (`coordinator/registry/scheduler.go`) refuses a
    `LaneBatch` candidate unless the model is already resident on the slot,
    `NumWaiting == 0`, and live occupancy is below the allowance. Occupancy is
    `batchSlotOccupancy` — `max(pendingLoadForModelLocked, backendRunning)` —
@@ -125,7 +127,7 @@ lands is the reservation path's decision.
 | TTFT calibration and the TTFT admission shadow | `coordinator/registry/scheduler.go`, `coordinator/registry/dispatch_plan.go`, `coordinator/registry/ttft_shadow.go` |
 | Capacity cooldowns, budget clamp, capacity-503 window, breakers | `coordinator/api/consumer.go` (`noteInferenceError`), `coordinator/api/provider.go` |
 | OpenRouter uptime series and `inference.request_outcome` | `coordinator/api/or_uptime.go` |
-| Half-open capacity probe (`claimCapacityProbeLocked`) | `coordinator/registry/scheduler.go`, `coordinator/registry/dispatch_plan.go` |
+| Half-open capacity probe (`tryClaimCapacityProbe`) | `coordinator/registry/scheduler.go`, `coordinator/registry/dispatch_plan.go` |
 
 A closed batch slot is reported with its own gate reason,
 `GateBatchHeadroom` (`"batch_headroom"`), so co-serving telemetry can tell it
@@ -199,7 +201,7 @@ it does online ([`security/encryption.md`](security/encryption.md)).
 | Provider terminal | `ErrCode: "request_failed"`; retried to `DefaultMaxAttempts`, then the item is `failed` with the fixed message "The request could not be completed by any provider." |
 | Permanent fault (unusable API key, unreadable body, unsealable result) | Failed on the first outcome instead of burning the attempt budget |
 | Coordinator restart mid-flight | `RequeueInflightItems` moves in-flight rows back to `pending`; the in-memory retry tally is forgotten, costing at most `MaxAttempts − 1` extra attempts per item and never losing one |
-| Batch cancelled while items run | The batch's context is cancelled, `CancelOpenItems` runs immediately, and a late result lands on a non-in-flight item and is ignored |
+| Batch cancelled while items run | The batch's context is cancelled, `CancelOpenItems` runs immediately, and a late result lands on a non-in-flight item: the result is ignored **and the item is refunded** (`Config.RefundItem` → `api.RefundBatchItem`), so a consumer is never charged for an answer the coordinator threw away |
 | 24 h elapsed with items open | `ExpireOpenItems`, batch → `expired`, error file lists them with code `batch_expired` |
 | Crash between sealing an item body and committing its rows | The orphan sweep finds the blob (no row references it, older than retention) and deletes it |
 
@@ -236,7 +238,7 @@ Known gaps, each tracked as a follow-up in the design record:
 |---|---|
 | Lane trait | `coordinator/registry/request_traits.go` (`Lane`, `LaneBatch`) |
 | Row allowance, slot snapshot, decode floor | `coordinator/registry/batch_lane.go` (`BatchRowsAllowed`, `BatchSlots`, `QualityCapFloorTPS`) |
-| Reservation filter | `coordinator/registry/scheduler.go` (`buildCandidateGateLocked`, `batchSlotOccupancy`) |
+| Reservation filter | `coordinator/registry/scheduler.go` (`buildCandidateInto`, `batchSlotOccupancy`) |
 | Gate reason | `coordinator/registry/gate_reason.go` (`GateBatchHeadroom`) |
 | Control law | `coordinator/batchlane/control.go` (`EWMA`, `AIMD`, `TokenBucket`) |
 | Deadline math | `coordinator/batchlane/laxity.go` (`Laxity`, `Urgency`, `Priority`, `ObservedRate`) |

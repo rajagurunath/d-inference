@@ -154,7 +154,7 @@ Ledger semantics, reservations and payouts: [`../architecture/billing.md`](../ar
 
 | Method | Path | Handler | Auth | Notes |
 |---|---|---|---|---|
-| GET | `/v1/stats` | `handleStats` (`coordinator/api/stats.go`) | `—` | Network statistics; refresh every minute; retain a successful body up to 5 min on refresh failure; 503 `service_unavailable` without an unexpired success |
+| GET | `/v1/stats` | `handleStats` (`coordinator/api/stats.go`) | `—` | Refresh every 30 s; preserve the UTC source observation time in `snapshot_at` (`time.RFC3339Nano`). Retain a successful body up to 5 min on refresh failure; 503 `service_unavailable` without an unexpired success |
 | GET | `/v1/leaderboard` | `handleLeaderboard` (`coordinator/api/leaderboard.go`) | `—` | Cached 5 min (full) / 1 min (recent window) |
 | GET | `/v1/network/totals` | `handleNetworkTotals` (`coordinator/api/network_totals.go`) | `—` | Totals refreshed every minute with the same 5 min safety TTL; 503 `service_unavailable` without an unexpired success; canonical windows `24h`, `7d`, `30d`, `all` (`1d` → `24h`, empty/`lifetime` → `all`) |
 | GET | `/v1/network/series` | `handleNetworkSeries` (`coordinator/api/network_series.go`) | `—` | Time series, cached 1 min; 503 `service_unavailable` on a store error after a miss, with no failed result cached |

@@ -26,7 +26,7 @@ package registry
 //
 // It takes r.mu (read) and then p.mu, the established lock order; callers that
 // already hold both use batchRowsAllowedLocked, which is what the two production
-// paths do — the reservation filter (buildCandidateGateLocked) and BatchSlots,
+// paths do — the reservation filter (buildCandidateInto) and BatchSlots,
 // through whose BatchRowsAllowed field the batch dispatcher reads the number.
 // Nothing outside the package computes its own.
 func (r *Registry) batchRowsAllowed(p *Provider, model string) int {
@@ -149,7 +149,11 @@ func (r *Registry) QualityCapFloorTPS() float64 {
 // reports no MaxConcurrency, and that fallback cannot see rows the provider is
 // running on its own. Batch is the lane that must never be the request that
 // pushes a slot past its cap, so it takes the larger of the two views.
-func batchSlotOccupancy(snap routingSnapshot) int {
+//
+// Takes the snapshot by pointer: the fleet scan fills routingSnapshot in place
+// on an arena slot (buildCandidateInto), so a by-value read here would copy the
+// whole struct once per candidate on the hot path.
+func batchSlotOccupancy(snap *routingSnapshot) int {
 	occupancy := snap.batchPendingLoad
 	if snap.backendRunning > occupancy {
 		occupancy = snap.backendRunning

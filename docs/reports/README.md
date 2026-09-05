@@ -56,6 +56,17 @@ Plans and decision memos live in [`../design/`](../design/README.md).
 | 2026-07-04 | [provider-trust-reliability](2026-07-04-provider-trust-reliability.md) | Why ~11% of the fleet stalled at `self_signed`, and the per-connection MDM fix |
 | 2026-07-17 | [eigencloud-to-gcp-migration](2026-07-17-eigencloud-to-gcp-migration.md) | Record of the prod move from EigenCloud to a GCP Confidential VM (complete) |
 
+## Coordinator performance program (2026-09)
+
+| Date | Report | One line |
+|---|---|---|
+| 2026-09-02 | [coordinator-performance-program](2026-09-02-coordinator-performance-program.md) | First-principles pass over every coordinator operation with a measurable cost: fleet-scale benchmarks, store cache, route batching, relay coalescing, parse-once bodies |
+| 2026-09-02 | [coordinator-performance-pr-body](2026-09-02-coordinator-performance-pr-body.md) | Original PR body of the 75-commit program branch, kept as the record |
+| 2026-09-03 | [perf-pr-a-body](2026-09-03-perf-pr-a-body.md) | Landing the store/api half of the program on master (read-through cache, batched route sink, parse-once bodies, relay coalescing) |
+| 2026-09-03 | [perf-pr-b-body](2026-09-03-perf-pr-b-body.md) | PR description for the routing-scan landing (PR B): per-model provider index, in-place snapshots, TPS median caches, version memos, heartbeat swap-plan coalescing; before/after benchmarks and the `scanned` semantics change |
+| 2026-09-03 | [perf-pr-c-tier3-body](2026-09-03-perf-pr-c-tier3-body.md) | PR description for the Tier 3 lock restructure (PR C, stacked on PR B): per-identity `gateState` fault trackers off the global write lock, the reservation commit under `r.mu.RLock` + `p.mu`, the `EIGENINFERENCE_RESERVE_COMMIT_MODE` kill switch; invariants, benchmarks and the review follow-ups |
+| 2026-09-03 | [perf-pr-cd-body](2026-09-03-perf-pr-cd-body.md) | Wave fixes following the A+B base: WebSocket fragmentation, bounded queue drains, restart/drain/cancel lifecycle and telemetry |
+
 ## Raw benchmark outputs
 
 Machine-generated; kept as evidence for the reports above.

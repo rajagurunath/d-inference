@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — stats location refresh
+
+- Restore public stats refreshes on large usage tables by aggregating locations per provider before combining location totals. Preserve distinct-provider and token counts and request-weighted coordinates without sorting every usage row. Keep the selective cutoff's query plan local to the analytics transaction.
+
+## Unreleased — coordinator performance Tiers 2 and 3
+
+- Cache repeated user and model lookups, batch route telemetry writes, and credit balances in one database statement. Invalidate model caches without allowing older in-flight reads to republish stale entries.
+- Coalesce streaming output within a byte cap and parse request bodies once.
+- Reduce routing scan work with per-model provider indexes, maintained medians, reusable snapshots, bounded version memoization, and coalesced swap and queue-drain planning.
+- Commit reservations under the registry read lock and the selected provider's lock. Keep fault tracking on per-identity gates, with validated rebind and sweep handling; retain `EIGENINFERENCE_RESERVE_COMMIT_MODE=global` as the reservation rollback switch.
+- Preserve newer rejection state when capacity-accept bookkeeping arrives late.
+- Make scheduler, attestation timestamp, and reputation persistence test fixtures deterministic.
+
+## Unreleased — provider lifecycle and bounded coordinator work
+
+- Keep genuine provider 502 faults across version changes; only coordinator-marked disconnect flushes are eligible for reset. Count first-scan TTFT rejections in request outcome telemetry.
+- Evict capped zombie tracker entries in constant time, preserving recent activity without per-insertion full-map scans.
+- Fragment large provider WebSocket messages, bound queue-drain work, and keep control traffic responsive.
+- Fence typed draining refusals at ingress before releasing the request slot; preserve newer recovery heartbeats. Graceful restarts remain health-neutral, and late disconnect errors follow identity enrichment without re-quarantining an upgraded provider.
+- Correlate cancel sends and terminals atomically, bound version history and telemetry tags, and retain MLX metrics on HTTP-only Datadog deployments.
+
+## Unreleased (2026-09-04) — console redesign
+
+- Provider onboarding specifies macOS 26 or later.
+- Added a Consumer/Provider entry page, dedicated `/chat` route, contextual workspace navigation, and public provider onboarding shared with the empty fleet. Linked providers return to their fleet and recorded earnings, including when their Macs are offline; failed discovery never implies an empty account.
+- Scoped fleet requests to the current account, cancelling late results on sign-out or account changes.
+- Redesigned console navigation, chat composition, searchable model discovery, settings, and API integration examples.
+- Redesigned network stats as one continuous overview: an explorable geography
+  map, side-by-side request and token charts, graphical model-capacity lanes,
+  linked silicon and memory charts, and an expandable provider directory.
+- Stats refresh every 30 seconds. Source timestamps survive cache hits; the
+  console proxy coalesces requests and bounds fresh caching to 30 seconds. The
+  coordinator retains successful snapshots for up to five minutes on refresh
+  failures; older source snapshots are marked stale. The page pauses refreshes
+  while hidden and distinguishes unknown capacity from zero.
+
 ## Unreleased — coordinator performance Tier 1
 
 - Bound recent in-process usage history with lazy allocation; aggregate dashboard earnings across every row in the rolling windows.
