@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eigeninference/d-inference/coordinator/internal/e2e"
 	"github.com/eigeninference/d-inference/coordinator/protocol"
 	"github.com/eigeninference/d-inference/coordinator/registry"
 	"github.com/eigeninference/d-inference/coordinator/store"
@@ -31,6 +32,17 @@ func batchFakeProvider(t *testing.T, model string, usage protocol.UsageInfo, con
 // back, for the tests that need to mint an API key against it.
 func batchFakeProviderWithStore(t *testing.T, model string, usage protocol.UsageInfo, content string) (
 	*Server, *registry.Registry, *store.MemoryStore, context.Context, <-chan struct{},
+) {
+	srv, reg, st, ctx, done, _ := batchFakeProviderCapturingBody(t, model, usage, content)
+	return srv, reg, st, ctx, done
+}
+
+// batchFakeProviderCapturingBody is batchFakeProviderWithStore plus the channel
+// the fake provider publishes the DECRYPTED inference body on, for the tests
+// that assert on what actually reached the provider rather than on what the
+// consumer sent.
+func batchFakeProviderCapturingBody(t *testing.T, model string, usage protocol.UsageInfo, content string) (
+	*Server, *registry.Registry, *store.MemoryStore, context.Context, <-chan struct{}, <-chan []byte,
 ) {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -70,6 +82,8 @@ func batchFakeProviderWithStore(t *testing.T, model string, usage protocol.Usage
 	warmSlotForBatch(t, reg, model)
 
 	done := make(chan struct{})
+	// Buffered so a test that never reads the body never wedges the provider.
+	providerBody := make(chan []byte, 1)
 	go func() {
 		defer close(done)
 		var inferReq protocol.InferenceRequestMessage
@@ -93,6 +107,24 @@ func batchFakeProviderWithStore(t *testing.T, model string, usage protocol.Usage
 			}
 			break
 		}
+		// Publish the plaintext the provider actually received. Decryption uses
+		// the provider's own private key, so this is the real sealed frame and
+		// not a copy of what the handler intended to send.
+		if inferReq.EncryptedBody != nil {
+			if value, ok := testProviderKeys.Load(pubKey); ok {
+				keypair := value.(testProviderKeyPair)
+				plaintext, err := e2e.DecryptWithPrivateKey(&e2e.EncryptedPayload{
+					EphemeralPublicKey: inferReq.EncryptedBody.EphemeralPublicKey,
+					Ciphertext:         inferReq.EncryptedBody.Ciphertext,
+				}, keypair.private)
+				if err == nil {
+					select {
+					case providerBody <- plaintext:
+					default:
+					}
+				}
+			}
+		}
 		writeEncryptedTestChunk(t, ctx, conn, inferReq, pubKey,
 			`data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"`+content+`"}}]}`+"\n\n")
 		complete := protocol.InferenceCompleteMessage{
@@ -104,7 +136,7 @@ func batchFakeProviderWithStore(t *testing.T, model string, usage protocol.Usage
 		conn.Write(ctx, websocket.MessageText, completeData)
 	}()
 
-	return srv, reg, st, ctx, done
+	return srv, reg, st, ctx, done, providerBody
 }
 
 // warmSlotForBatch stamps the provider-reported slot the batch lane requires:

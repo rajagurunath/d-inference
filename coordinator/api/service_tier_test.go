@@ -163,3 +163,49 @@ func TestServiceTierBatchServesFromHeadroom(t *testing.T) {
 		}
 	}
 }
+
+// TestServiceTierNeverReachesTheProvider is the S1 regression. service_tier is
+// a coordinator-private lane selector: resolveRequestLane consumes it in the
+// request prelude and stripProviderRoutingFields must then delete it, so the
+// sealed frame a provider decrypts carries no hint that this request is
+// discounted batch work. Asserted on the DECRYPTED frame — the provider's own
+// private key opens it — for the batch value and for a non-batch value, since
+// stripping only the one that selects the lane would still leak the field.
+func TestServiceTierNeverReachesTheProvider(t *testing.T) {
+	for _, tier := range []string{serviceTierBatch, "flex"} {
+		t.Run(tier, func(t *testing.T) {
+			const model = "test-model"
+			srv, _, _, ctx, _, providerBody := batchFakeProviderCapturingBody(t, model,
+				protocol.UsageInfo{PromptTokens: 9, CompletionTokens: 3}, "Hello tier")
+			ts := httptest.NewServer(srv.Handler())
+			defer ts.Close()
+
+			resp := postServiceTierChat(t, ctx, ts,
+				`{"model":"test-model","service_tier":"`+tier+`","messages":[{"role":"user","content":"hi"}]}`)
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status=%d body=%s, want 200", resp.StatusCode, body)
+			}
+
+			var sealed []byte
+			select {
+			case sealed = <-providerBody:
+			case <-ctx.Done():
+				t.Fatal("the provider never received a sealed inference body")
+			}
+			var forwarded map[string]any
+			if err := json.Unmarshal(sealed, &forwarded); err != nil {
+				t.Fatalf("provider frame is not a JSON object: %v", err)
+			}
+			if _, leaked := forwarded["service_tier"]; leaked {
+				t.Fatalf("service_tier reached the provider in the sealed frame: %s", sealed)
+			}
+			// Control: the rest of the request did survive the strip, so the
+			// assertion above is the field being deleted and not an empty frame.
+			if _, ok := forwarded["messages"]; !ok {
+				t.Fatalf("the sealed frame lost its messages: %s", sealed)
+			}
+		})
+	}
+}
