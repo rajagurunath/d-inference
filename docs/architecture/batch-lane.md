@@ -1,6 +1,6 @@
 # Batch lane
 
-> Last updated: 2026-09-04 · commit `a0a03dca8`
+> Last updated: 2026-09-05 · commit `2838c3fbf`
 
 The batch lane sells the slot capacity the online quality cap already leaves
 empty. A 1 Hz dispatcher inside the coordinator claims 24-hour batch items and
@@ -61,9 +61,13 @@ the start of the next tick, and nothing in the package calls `time.Now()`.
 The AIMD decrease fires on `Waiting > 0`, or a measured `DecodeTPS` below the
 router's own quality floor (`Registry.QualityCapFloorTPS`, 15 tok/s by
 default), or `KV > KVHigh`. An **unmeasured** decode rate (0) is not read as a
-slow one, and a slot reporting no KV budget reads as the middle of the hold
-band rather than as idle — both would otherwise pin the lane at zero or drive
-it up forever.
+slow one, which would otherwise pin every fresh provider's target at the floor
+and the lane would never start. A slot that publishes no KV budget at all
+(`KVKnown` false) is treated as below `KVLow` and takes the additive increase:
+the remaining terms are enough backpressure on their own — a slot running out
+of KV starts queueing, and `Waiting` is not smoothed — so the lane still starts
+and still backs off on a fleet that publishes no budget
+(`coordinator/batchlane/control.go`, `AIMD.Update`).
 
 When a batch's urgency reaches `FloorUrgency = 0.9` and the budget is zero, a
 per-batch token bucket at `FloorItemsPerSec = 0.2` grants it one item anyway.
@@ -137,7 +141,7 @@ temp-file + `fsync` + rename.
 | Item request body (`bitem_…-in`) | batch-store key | when the batch finalizes (`FinalizeBatchIfDone`) |
 | Item result (`bitem_…`) | batch-store key, or the consumer's `result_public_key` | `BatchOutputRetention` = 7 days after the batch leaves the open list |
 | Assembled output / error file (`file-…`) | batch-store key | `PurgeExpiredBatchFiles`, 7 days after creation, swept once a minute |
-| Orphan item blobs (no row references them) | — | hourly sweep, only when older than the retention window, ≤ 1 000 per pass |
+| Orphan item blobs (no row references them) | — | hourly sweep, only when older than the retention window; a pass stops at `maxOrphanDeletes = 1000` unlinks or `maxOrphanScan = 2000` store probes, whichever comes first, and the next pass continues |
 
 Plaintext exists only inside `runItem` (`coordinator/batchlane/dispatcher.go`)
 for the duration of one dispatch: the body is opened, handed to
@@ -161,7 +165,12 @@ it does online ([`security/encryption.md`](security/encryption.md)).
   mnemonic, after which existing blobs are unreadable.
 - `EIGENINFERENCE_BATCH_DEV_INSECURE_KEY=true` substitutes a process-local
   random key for local development, logged as a WARN. Blobs written under it
-  are unreadable after a restart.
+  are unreadable after a restart. Its only gate is the absence of a mnemonic:
+  `NewBatchBlobStore` (`coordinator/api/batch_config.go`) reaches that branch
+  solely on `ErrNoMnemonic`, so a configured mnemonic makes the flag a no-op
+  and nothing else — no build tag, no environment check — stops a
+  mnemonic-less production deployment from setting it. Accepted residual on
+  `T-052` in [`../threat-model.yaml`](../threat-model.yaml).
 - With no mnemonic and no dev key the lane is off: `NewBatchBlobStore` returns
   nil, every batch route answers `503` `batch_unavailable`, and
   `startBatchDispatcher` does not start.
@@ -184,10 +193,6 @@ Known gaps, each tracked as a follow-up in the design record:
 - The result-blob deletion schedule is in memory. After a restart those blobs
   stay on disk until a store read for terminal batches is added; the assembled
   files still expire, because their rows carry the timestamp.
-- `store.Batch` has no `api_key_id`, so dispatcher-driven items are attributed
-  to the account, not to a key: a key-scoped model allow-list or spend cap does
-  not constrain them. A synchronous `service_tier: "batch"` request does carry
-  its key and is constrained normally.
 - The balance reservation taken before dispatch is still computed at the full
   online price; the batch multiplier applies at settlement and the excess is
   refunded. A batch therefore holds more of a consumer's balance than it will
