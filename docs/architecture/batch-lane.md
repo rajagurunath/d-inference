@@ -1,6 +1,6 @@
 # Batch lane
 
-> Last updated: 2026-09-05 · commit `4796db242`
+> Last updated: 2026-09-05 · commit `b5eb17ed4`
 
 The batch lane sells the slot capacity the online quality cap already leaves
 empty. A 1 Hz dispatcher inside the coordinator claims 24-hour batch items and
@@ -212,6 +212,23 @@ Known gaps, each tracked as a follow-up in the design record:
   online price; the batch multiplier applies at settlement and the excess is
   refunded. A batch therefore holds more of a consumer's balance than it will
   finally cost ([`../reference/pricing-model.md#batch-lane`](../reference/pricing-model.md#batch-lane)).
+- **The dispatch entry drives the HTTP handler in process.** `DispatchBatchItem`
+  builds a synthetic `POST /v1/chat/completions` request and runs
+  `handleChatCompletions` against an `httptest.ResponseRecorder`, then reads the
+  outcome back off the recorded status, headers and body. It is not the shape
+  the lane wants — a testing package is linked into the coordinator binary, and
+  a batch item pays for one marshal and one buffer it does not need — but it is
+  the shape that makes the guarantee the lane is built on cheap to verify: a
+  batch item is parsed, alias-resolved, allow-list checked, token-admitted,
+  balance-reserved, routed, dispatched, relayed and settled by *exactly* the
+  same code as an online one, with the lane trait as the only difference. The
+  alternative is to extract that ~640-line prelude and the non-streaming
+  assembly into helpers both callers share; every branch of it writes its
+  terminal through the `http.ResponseWriter` and records its rejection against
+  the `*http.Request`, and the dispatch state machine behind it holds both, so
+  the extraction reaches the whole consumer request path. A partial copy would
+  be precisely the drift a shared funnel exists to prevent. Tracked as a
+  follow-up with a written plan; online behaviour is unaffected either way.
 
 ## Code map
 

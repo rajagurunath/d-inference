@@ -426,10 +426,11 @@ func (s *Suite) startCoordinator() error {
 // testbed's in-process coordinator the same way
 // coordinator/cmd/coordinator/batch_lane.go wires it into the production
 // binary. It lives here (not in coordinator/cmd/coordinator) for the same
-// reason that file gives: batchlane must never import api (api imports
-// batchlane), so the api.BatchOutcome -> batchlane.Outcome adapter has to
-// live in a package that imports both — main for the real coordinator,
-// e2e/testbed for the dev stack and e2e suites.
+// reason that file gives: the wiring is the one place that holds both the api
+// server and the dispatcher — main for the real coordinator, e2e/testbed for
+// the dev stack and e2e suites. The import direction is one-way (api imports
+// batchlane), so api speaks the dispatcher's own vocabulary and neither hook
+// below needs an adapter.
 func startTestbedBatchDispatcher(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -445,16 +446,8 @@ func startTestbedBatchDispatcher(
 		st,
 		blobs,
 		batchlane.NewRegistryView(reg),
-		func(ctx context.Context, accountID, apiKeyID, model string, body []byte) (batchlane.Outcome, error) {
-			out, err := srv.DispatchBatchItem(ctx, accountID, apiKeyID, model, body)
-			return batchlane.Outcome{
-				RequestID:        out.RequestID,
-				PromptTokens:     out.PromptTokens,
-				CompletionTokens: out.CompletionTokens,
-				ResponseBody:     out.ResponseBody,
-				ErrCode:          out.ErrCode,
-			}, err
-		},
+		// DispatchBatchItem's signature IS batchlane.DispatchFn — no adapter.
+		srv.DispatchBatchItem,
 		func(batchID string, now time.Time) error {
 			_, err := srv.FinalizeBatchIfDone(batchID, now)
 			return err
@@ -464,6 +457,11 @@ func startTestbedBatchDispatcher(
 			MaxAttempts:     batchlane.DefaultMaxAttempts,
 			OutputRetention: batchlane.DefaultOutputRetention,
 			Purge:           srv.PurgeExpiredBatchFiles,
+			// Same hook the production binary wires: a successful item whose
+			// result the dispatcher discards was already charged by the
+			// funnel, so the dev stack and the co-serving benchmark exercise
+			// the refund rather than pocketing it.
+			RefundItem: srv.RefundBatchItem,
 		},
 		logger,
 	)

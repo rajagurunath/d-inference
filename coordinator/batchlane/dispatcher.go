@@ -46,9 +46,10 @@ import (
 )
 
 // Outcome is the result of running one batch item through the dispatch funnel.
-// It mirrors api.BatchOutcome field for field; batchlane must not import api
-// (api imports batchlane), so the api layer adapts one to the other when it
-// builds the DispatchFn.
+// It is the ONE type both sides speak: api imports batchlane and returns this
+// directly from DispatchBatchItem, so there is no mirrored api struct and no
+// adapter between them. The import direction is one-way — batchlane must never
+// import api.
 type Outcome struct {
 	RequestID                      string
 	PromptTokens, CompletionTokens int
@@ -95,8 +96,8 @@ type Config struct {
 	AIMD AIMDConfig
 	// OutputRetention is how long an item's sealed result blob survives after
 	// its batch finalizes. <= 0 means DefaultOutputRetention. The wiring passes
-	// api.BatchOutputRetention so the item blobs and the assembled files expire
-	// on one boundary.
+	// DefaultOutputRetention, which api's assembler reads too, so the item
+	// blobs and the assembled files expire on one boundary.
 	OutputRetention time.Duration
 	// PurgeInterval is how often the sweep runs Purge. <= 0 means
 	// DefaultPurgeInterval.
@@ -109,6 +110,12 @@ type Config struct {
 	// is a Config field rather than a New parameter to keep New's signature the
 	// one the plan specifies. nil skips the pass.
 	Purge func(now time.Time) (int, error)
+	// RefundItem returns the money for a SUCCESSFUL item whose result the
+	// dispatcher then discarded — the batch went terminal under it, or the
+	// sweep had already closed the item. The attempt reached a provider and the
+	// funnel charged the account for it, so dropping the response without a
+	// refund charges a consumer for tokens they can never read. nil is a no-op.
+	RefundItem func(accountID, requestID string, promptTokens, completionTokens int) error
 }
 
 const (
@@ -117,8 +124,10 @@ const (
 	// DefaultMaxAttempts is the spec's maxAttempts.
 	DefaultMaxAttempts = 3
 	// DefaultOutputRetention is how long an item's sealed result blob survives
-	// after its batch finalizes. It mirrors api.BatchOutputRetention, which the
-	// wiring passes in; batchlane cannot import api to read the constant.
+	// after its batch finalizes. It is the single retention boundary: api's
+	// assembler reads this constant for the files it writes, and the wiring
+	// passes it back in as Config.OutputRetention for the item blobs behind
+	// them, so there is one number rather than two that must agree.
 	DefaultOutputRetention = 7 * 24 * time.Hour
 	// DefaultPurgeInterval is how often the sweep runs the file retention pass.
 	// Retention is a 7-day boundary, so a minute of slack costs nothing and
@@ -154,10 +163,9 @@ const (
 	resultBuffer = 1024
 )
 
-// ResultBlobRef is the sealed blob key one item's result is written under. It
-// MUST equal api.BatchItemResultRef, which the assembler falls back to when an
-// item row carries no ref; api/batch_ref_agreement_test.go pins the two
-// together, because batchlane cannot import api to share the function.
+// ResultBlobRef is the sealed blob key one item's result is written under. The
+// assembler calls this function directly when an item row carries no ref, so
+// there is one derivation of the key rather than two to keep in agreement.
 //
 // The item's sealed REQUEST body lives under a different ref (api's
 // BatchItemInputRef), which the dispatcher never derives: it reads the ref off

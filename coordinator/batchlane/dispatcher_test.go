@@ -1662,3 +1662,113 @@ func TestTickLogsNoPromptOrCustomID(t *testing.T) {
 		t.Fatalf("a log line carries a custom_id:\n%s", transcript)
 	}
 }
+
+// refundRecorder records the calls the dispatcher makes into Config.RefundItem.
+type refundRecorder struct {
+	mu    sync.Mutex
+	calls []refundCall
+	err   error
+}
+
+type refundCall struct {
+	accountID, requestID           string
+	promptTokens, completionTokens int
+}
+
+func (r *refundRecorder) fn() func(string, string, int, int) error {
+	return func(accountID, requestID string, promptTokens, completionTokens int) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.calls = append(r.calls, refundCall{accountID, requestID, promptTokens, completionTokens})
+		return r.err
+	}
+}
+
+func (r *refundRecorder) snapshot() []refundCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]refundCall(nil), r.calls...)
+}
+
+// A SUCCESS that lands after its batch has gone terminal is thrown away — the
+// blob is never written and the item is already cancelled — but the funnel has
+// already charged the account for it. The dispatcher must hand the money back.
+func TestDiscardedSuccessOnACancelledBatchIsRefunded(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory(store.Config{})
+	blobs := testBlobs(t)
+	view := batchlanetest.NewFakeView()
+	idleSlot(view, 4)
+
+	dispatched := make(chan struct{})
+	release := make(chan struct{})
+	// A late SUCCESS carrying the funnel's request id and the tokens it billed:
+	// the provider answered just as the sweep closed the batch.
+	dispatch := func(context.Context, string, string, string, []byte) (batchlane.Outcome, error) {
+		close(dispatched)
+		<-release
+		return batchlane.Outcome{
+			RequestID:        "req_late",
+			PromptTokens:     120,
+			CompletionTokens: 34,
+			ResponseBody:     []byte(`{"ok":true}`),
+		}, nil
+	}
+
+	refunds := &refundRecorder{}
+	seedBatch(t, st, blobs, "batch_refund", 1, testStart.Add(24*time.Hour))
+
+	d := batchlane.New(st, blobs, view, dispatch, (&batchlanetest.FakeFinalize{}).Fn(),
+		batchlane.Config{MaxAttempts: 3, RefundItem: refunds.fn()}, testLogger())
+
+	d.Tick(ctx, testStart)
+	<-dispatched
+
+	if ok, err := st.SetBatchStatus("batch_refund", store.BatchInProgress, store.BatchCancelling,
+		testStart.Add(time.Second)); err != nil || !ok {
+		t.Fatalf("cancel: ok=%v err=%v", ok, err)
+	}
+	d.Tick(ctx, testStart.Add(2*time.Second)) // sweep: item cancelled, batch cancelled
+	close(release)
+	d.AwaitDispatch()
+
+	d.Tick(ctx, testStart.Add(3*time.Second)) // drain the late success
+	d.AwaitDispatch()
+
+	calls := refunds.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("refund calls = %d, want 1 (%+v)", len(calls), calls)
+	}
+	want := refundCall{accountID: testAccount, requestID: "req_late", promptTokens: 120, completionTokens: 34}
+	if calls[0] != want {
+		t.Fatalf("refund call = %+v, want %+v", calls[0], want)
+	}
+}
+
+// The control: a success on a batch that is still claimable is kept, so nothing
+// is refunded. A refund here would credit a consumer for a result they can read.
+func TestSuccessOnALiveBatchIsNotRefunded(t *testing.T) {
+	ctx := context.Background()
+	refunds := &refundRecorder{}
+	h := newHarness(t, batchlane.Config{MaxAttempts: 3, RefundItem: refunds.fn()})
+	idleSlot(h.view, 4)
+	h.dispatch.Respond = func(int, string, []byte) (batchlane.Outcome, error) {
+		return batchlane.Outcome{
+			RequestID:        "req_live",
+			PromptTokens:     120,
+			CompletionTokens: 34,
+			ResponseBody:     []byte(`{"ok":true}`),
+		}, nil
+	}
+	seedBatch(t, h.st, h.blobs, "batch_live", 1, testStart.Add(24*time.Hour))
+
+	h.tick(t, ctx, testStart)
+	h.tick(t, ctx, testStart.Add(time.Second)) // drain the success
+
+	if states := itemStates(t, h.st, "batch_live"); states[store.ItemSucceeded] != 1 {
+		t.Fatalf("item states = %v, want one succeeded", states)
+	}
+	if calls := refunds.snapshot(); len(calls) != 0 {
+		t.Fatalf("refund calls = %+v, want none", calls)
+	}
+}

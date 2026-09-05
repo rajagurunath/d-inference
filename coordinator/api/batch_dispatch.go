@@ -12,6 +12,7 @@ import (
 
 	"github.com/eigeninference/d-inference/coordinator/batchlane"
 	"github.com/eigeninference/d-inference/coordinator/registry"
+	"github.com/eigeninference/d-inference/coordinator/store"
 )
 
 // batch_dispatch.go is the api-layer surface of the batch lane
@@ -197,6 +198,98 @@ func (s *Server) DispatchBatchItem(
 	}
 	outcome.ErrCode = batchRequestFailedCode
 	return outcome, nil
+}
+
+// batchDiscardedRefundPrefix is the ledger reference prefix a discarded batch
+// item's refund is written under: "batch_discarded:<request id>". Distinct from
+// every other refund reference the funnel writes (reservation_refund,
+// provider_error, the settlement difference keyed on the bare request id) so a
+// ledger reader can tell the coordinator giving money back for a result it
+// threw away from the ordinary refunds a served request produces.
+const batchDiscardedRefundPrefix = "batch_discarded:"
+
+// RefundBatchItem returns the money for a batch item that reached a provider
+// and was charged for, but whose result the dispatcher then discarded — the
+// batch went terminal under it, or the sweep had already closed the item.
+// batchlane.Config.RefundItem is wired to this in cmd/coordinator; its
+// signature IS that hook, so there is no adapter.
+//
+// The amount is the cost the settlement actually debited for this request, read
+// back from the ledger's usage history rather than recomputed: the charge
+// resolves a provider's custom price, the platform price, the account's
+// wholesale role and the batch lane's 0.5 multiplier, and a second
+// implementation of that formula here would be one more thing to keep in
+// agreement. A refund is credited with the SAME primitive every other refund on
+// this path uses (store.Credit with store.LedgerRefund — see
+// refundReservedBalance and releaseInitialReservation), so it nets against the
+// charge exactly.
+//
+// What is deliberately NOT reversed is the provider's earning. The provider
+// served the request: it loaded the prompt, generated the tokens and reported
+// them. That the coordinator then dropped the answer — because the consumer
+// cancelled, or the item's batch expired mid-flight — is the coordinator's
+// doing, not the provider's, so the platform absorbs the difference rather than
+// clawing back a payout for work that was genuinely done.
+//
+// Errors are returned, never swallowed: the dispatcher logs them against the
+// batch and item ids, which is the only place both are known.
+func (s *Server) RefundBatchItem(accountID, requestID string, promptTokens, completionTokens int) error {
+	if s == nil {
+		return errors.New("nil server")
+	}
+	if accountID == "" || requestID == "" {
+		return fmt.Errorf("batch refund: account id and request id are required")
+	}
+	charged, ok := s.settledChargeMicroUSD(accountID, requestID)
+	if !ok {
+		// The settlement never recorded a usage entry for this request, so
+		// there is no charge to reverse and no amount that can be derived
+		// without re-deriving the price. Reported rather than silently skipped:
+		// it means either that the attempt was never billed (a zero-token
+		// completion, an owned-machine self-route, an uncollected charge) or
+		// that the entry aged out of the history, and only the second is a
+		// consumer left out of pocket.
+		return fmt.Errorf("batch refund: no settled charge recorded for request %q", requestID)
+	}
+	if charged <= 0 {
+		return nil // billed nothing, so there is nothing to give back
+	}
+	if err := s.store.Credit(accountID, charged, store.LedgerRefund, batchDiscardedRefundPrefix+requestID); err != nil {
+		s.ddIncr("billing.credit_failed", []string{"op:batch_discarded_refund"})
+		return fmt.Errorf("batch refund: credit %d micro-USD for request %q: %w", charged, requestID, err)
+	}
+	s.ddIncr("billing.batch_discarded_refunds", nil)
+	s.ddHistogram("billing.batch_discarded_refund_micro_usd", float64(charged), nil)
+	s.logger.Info("batch lane: refunded a discarded result",
+		"request_id", requestID, "refund_micro_usd", charged,
+		"prompt_tokens", promptTokens, "completion_tokens", completionTokens)
+	return nil
+}
+
+// settledChargeMicroUSD returns what the settlement charged accountID for
+// requestID, and whether an entry for it was found.
+//
+// The ledger's in-memory usage history is the source because it is the only
+// per-request record of the FINAL cost that is written synchronously, before
+// the completion is handed back to the caller (handleComplete records usage
+// ahead of closing CompleteCh), so it is already there by the time the
+// dispatcher settles the outcome one tick later. The persisted usage row is
+// written asynchronously and the ledger's own history is keyed on the
+// reservation's reference, not the request id, so neither answers this
+// question. The history is bounded per account (payments.usageHistoryLimit), so
+// a request that has since been pushed out reports not-found rather than a
+// wrong number.
+func (s *Server) settledChargeMicroUSD(accountID, requestID string) (int64, bool) {
+	if s.ledger == nil {
+		return 0, false
+	}
+	entries := s.ledger.Usage(accountID)
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].JobID == requestID {
+			return entries[i].CostMicroUSD, true
+		}
+	}
+	return 0, false
 }
 
 // laneModelAllowed is the per-key model allow-list check the request prelude
