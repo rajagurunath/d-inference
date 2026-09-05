@@ -15,7 +15,7 @@ import (
 // the online quality cap already leaves empty. A batch attempt therefore
 //
 //   - routes only to providers with an idle waiting queue and a running count
-//     below Registry.BatchRowsAllowed (the reservation filter in
+//     below the pair's batch row allowance (the reservation filter in
 //     buildCandidateGateLocked),
 //   - never enters the coordinator wait queue and never acquires a hedge, and
 //   - never feeds provider reputation, TTFT calibration, or the TTFT shadow,

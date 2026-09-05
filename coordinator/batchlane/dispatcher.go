@@ -5,10 +5,12 @@ package batchlane
 //
 //	drain   settle the outcomes the previous tick's dispatch goroutines reported
 //	observe smooth every slot's live signal with an EWMA
-//	control run the per-slot AIMD, producing a fleet-wide in-flight budget
+//	control run the per-slot AIMD, producing an in-flight budget per model and
+//	        fleet-wide
 //	rank    laxity → urgency → priority for every open batch
 //	claim   Σ(target − inflight) items, highest priority first, line order within
-//	        a batch, only from in_progress batches
+//	        a batch, only from in_progress batches, each capped at its own
+//	        model's headroom
 //	dispatch one goroutine per claimed item under its batch's context
 //	sweep   expire batches past their window, drain cancelled ones
 //
@@ -17,22 +19,24 @@ package batchlane
 // the whole loop by hand with no sleeping and no wall clock.
 //
 // Placement is NOT decided here. The dispatcher decides only HOW MANY batch
-// rows may be in flight fleet-wide; WHERE each one lands is the reservation
-// path's decision, which admits a LaneBatch request only to a slot with no
-// waiting row and running below its batch allowance (registry/scheduler.go).
+// rows may be in flight, per model and fleet-wide; WHERE each one lands is the
+// reservation path's decision, which admits a LaneBatch request only to a slot
+// with no waiting row and running below its batch allowance
+// (registry/scheduler.go).
+//
+// The settle half of the loop lives in settle.go, and the disk-hygiene passes
+// the sweep drives in retention.go.
 //
 // Privacy: nothing in this file logs a request body, a result, a custom_id or a
 // metadata value. Log fields are ids, counts, targets and bounded error codes.
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -178,14 +182,19 @@ type Dispatcher struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 
-	mu         sync.Mutex
-	slots      map[SlotKey]*slotState
-	batches    map[string]*batchState
-	attempts   map[string]int       // per item id, in memory (see settleFailure)
-	retire     map[string]time.Time // batch id -> when its result blobs may go
-	inflight   int
-	lastPurge  time.Time
-	lastOrphan time.Time
+	mu       sync.Mutex
+	slots    map[SlotKey]*slotState
+	batches  map[string]*batchState
+	attempts map[string]int       // per item id, in memory (see settleFailure)
+	retire   map[string]time.Time // batch id -> when its result blobs may go
+	inflight int
+	// inflightByModel is the fleet-wide count split by the model a batch
+	// declares, so a model's budget is spent only on that model's items. Only
+	// batches that carry a model are counted; a file-form batch declares none
+	// (its lines each carry their own) and spends the fleet budget.
+	inflightByModel map[string]int
+	lastPurge       time.Time
+	lastOrphan      time.Time
 	// orphanRunning guards the off-tick orphan pass, so a pass that outlives its
 	// own interval is never joined by a second one.
 	orphanRunning bool
@@ -222,6 +231,10 @@ type itemOutcome struct {
 	batch   *store.Batch
 	batchID string
 	itemID  string
+	// model is the batch's declared model, "" for the file form. It is the key
+	// the per-model in-flight count was charged under at claim time, carried
+	// back so settle credits the same one.
+	model   string
 	outcome Outcome
 	err     error
 }
@@ -280,6 +293,8 @@ func New(
 		batches:  map[string]*batchState{},
 		attempts: map[string]int{},
 		retire:   map[string]time.Time{},
+
+		inflightByModel: map[string]int{},
 	}
 	d.requeueAfterRestart()
 	return d
@@ -365,17 +380,59 @@ func (d *Dispatcher) Tick(ctx context.Context, now time.Time) {
 	d.retention(now)
 }
 
+// laneBudget is one tick's in-flight allowance. The AIMD runs per slot, so the
+// allowance a batch may actually use is the one its OWN model's slots produced:
+// a batch for model X that spent the fleet's budget would claim items no X slot
+// can take, and every one of them would run the full dispatch funnel — a fleet
+// scan under the registry's read lock — only to come back no_capacity and be
+// released. fleet is the sum over every slot, for the file form, whose lines
+// each carry their own model and which therefore has no single model to scope
+// to.
+type laneBudget struct {
+	fleet    int
+	perModel map[string]int
+}
+
+// forModel is the ceiling a batch declaring model may claim under. A batch with
+// no declared model (the file form) is bounded by the fleet budget alone.
+func (b laneBudget) forModel(model string) int {
+	if model == "" {
+		return b.fleet
+	}
+	if n := b.perModel[model]; n < b.fleet {
+		return n
+	}
+	return b.fleet
+}
+
+// spend debits a claim of n items from the fleet budget and, when the batch
+// declared a model, from that model's headroom. Neither goes below zero.
+func (b *laneBudget) spend(model string, n int) {
+	if b.fleet -= n; b.fleet < 0 {
+		b.fleet = 0
+	}
+	if model == "" {
+		return
+	}
+	if left := b.perModel[model] - n; left > 0 {
+		b.perModel[model] = left
+	} else {
+		b.perModel[model] = 0
+	}
+}
+
 // updateTargets folds each slot's fresh signal into its EWMAs, runs its AIMD
-// step, and returns the fleet-wide in-flight budget: Σtarget − items already
-// out. A slot the view no longer reports has disconnected and its controller
-// state is dropped.
-func (d *Dispatcher) updateTargets(now time.Time) int {
+// step, and returns the in-flight budget: Σtarget − items already out,
+// fleet-wide and per model. A slot the view no longer reports has disconnected
+// and its controller state is dropped.
+func (d *Dispatcher) updateTargets(now time.Time) laneBudget {
 	signals := d.view.Slots("")
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	total := 0
+	byModel := make(map[string]int, len(signals))
 	for key, sig := range signals {
 		st, ok := d.slots[key]
 		if !ok {
@@ -398,7 +455,9 @@ func (d *Dispatcher) updateTargets(now time.Time) int {
 		// Waiting is deliberately NOT smoothed: it is the backpressure signal,
 		// and an EWMA of it would both delay the backoff and never fully decay,
 		// leaving the target halved long after the online burst passed.
-		total += st.aimd.Update(sig)
+		target := st.aimd.Update(sig)
+		total += target
+		byModel[key.Model] += target
 	}
 	for key := range d.slots {
 		if _, ok := signals[key]; !ok {
@@ -406,9 +465,17 @@ func (d *Dispatcher) updateTargets(now time.Time) int {
 		}
 	}
 
-	budget := total - d.inflight
-	if budget < 0 {
-		budget = 0
+	budget := laneBudget{fleet: total - d.inflight, perModel: byModel}
+	if budget.fleet < 0 {
+		budget.fleet = 0
+	}
+	// A model whose in-flight items already meet its slots' targets has no
+	// headroom, and a model with no slots at all has none either — the map is
+	// keyed on the slots the view reported, so an absent model reads as 0.
+	for model := range byModel {
+		if byModel[model] -= d.inflightByModel[model]; byModel[model] < 0 {
+			byModel[model] = 0
+		}
 	}
 	return budget
 }
@@ -423,9 +490,10 @@ type batchPlan struct {
 
 // claimAndDispatch ranks the claimable batches by priority, spends the budget
 // across them highest priority first, and starts one goroutine per claimed
-// item. A batch whose slack has run out gets a token-bucket progress floor of
-// one item even when the budget is zero.
-func (d *Dispatcher) claimAndDispatch(ctx context.Context, batches []*store.Batch, budget int, now time.Time) {
+// item. Each batch is capped at its own model's headroom as well as at what is
+// left of the fleet budget. A batch whose slack has run out gets a token-bucket
+// progress floor of one item even when the budget is zero.
+func (d *Dispatcher) claimAndDispatch(ctx context.Context, batches []*store.Batch, budget laneBudget, now time.Time) {
 	plans := make([]batchPlan, 0, len(batches))
 	for _, b := range batches {
 		// Only in_progress batches are claimable, and never one already past
@@ -471,16 +539,19 @@ func (d *Dispatcher) claimAndDispatch(ctx context.Context, batches []*store.Batc
 	// consuming it.
 	floorGranted := false
 	for _, p := range plans {
+		model := p.batch.Model
 		want := p.pending
-		if want > budget {
-			want = budget
+		if headroom := budget.forModel(model); want > headroom {
+			want = headroom
 		}
 		if want == 0 && !floorGranted && p.urgency >= FloorUrgency {
 			// The deadline progress floor: one item, rate limited per batch to
 			// FloorItemsPerSec, so an urgent batch is never starved to expiry
 			// however busy the online lane is. It does NOT raise the AIMD
-			// target — the reservation path still refuses a slot with no
-			// headroom, so the floor can only use capacity that really exists.
+			// target — nor the model's headroom — because the reservation path
+			// still refuses a slot with no headroom, so the floor can only use
+			// capacity that really exists. One item per tick fleet-wide is the
+			// bound on what a floor grant for a model with no slots can cost.
 			bs := d.batchStateFor(ctx, p.batch.ID)
 			d.mu.Lock()
 			granted := bs.bucket.TryTake(now)
@@ -501,13 +572,10 @@ func (d *Dispatcher) claimAndDispatch(ctx context.Context, batches []*store.Batc
 		if len(claimed) == 0 {
 			continue
 		}
-		if n := len(claimed); n <= budget {
-			budget -= n
-		} else {
-			budget = 0
-		}
+		budget.spend(model, len(claimed))
 		d.logger.Debug("batch lane: claimed items",
-			"batch_id", p.batch.ID, "items", len(claimed), "priority", p.prio, "budget_left", budget)
+			"batch_id", p.batch.ID, "items", len(claimed), "priority", p.prio,
+			"budget_left", budget.fleet, "model_budget_left", budget.forModel(model))
 		for _, it := range claimed {
 			d.start(ctx, p.batch, it)
 		}
@@ -535,6 +603,9 @@ func (d *Dispatcher) start(ctx context.Context, b *store.Batch, it *store.BatchI
 
 	d.mu.Lock()
 	d.inflight++
+	if b.Model != "" {
+		d.inflightByModel[b.Model]++
+	}
 	bs.inflight++
 	itemCtx := bs.ctx
 	d.mu.Unlock()
@@ -552,6 +623,7 @@ func (d *Dispatcher) start(ctx context.Context, b *store.Batch, it *store.BatchI
 		batch:   b,
 		batchID: b.ID,
 		itemID:  itemID,
+		model:   batchModel,
 		outcome: Outcome{ErrCode: ErrCodeRequestFailed},
 		err:     errDispatchPanicked,
 	}
@@ -617,229 +689,6 @@ func modelOf(body []byte) (string, error) {
 		return "", errors.New("batch item body carries no model")
 	}
 	return envelope.Model, nil
-}
-
-// drainResults settles every outcome reported since the last tick.
-func (d *Dispatcher) drainResults(now time.Time) {
-	for {
-		select {
-		case res := <-d.results:
-			d.settle(res, now)
-		default:
-			return
-		}
-	}
-}
-
-// settle applies one outcome. A result for an item that is no longer inflight
-// (expired, cancelled, or already settled) is ignored: FinishItem and
-// ReleaseItem both return false and change nothing.
-func (d *Dispatcher) settle(res itemOutcome, now time.Time) {
-	d.mu.Lock()
-	d.inflight--
-	if d.inflight < 0 {
-		d.inflight = 0
-	}
-	bs := d.batches[res.batchID]
-	if bs != nil && bs.inflight > 0 {
-		bs.inflight--
-	}
-	claimable := bs != nil && bs.claimable
-	d.mu.Unlock()
-
-	switch {
-	case res.err == nil && res.outcome.ErrCode == "":
-		d.settleSuccess(res, claimable, now)
-	case res.outcome.ErrCode == ErrCodeNoCapacity || res.outcome.ErrCode == ErrCodeCancelled:
-		// Neither is the item's fault, so no attempt is charged. If the batch
-		// is no longer claimable its items belong to the sweep, which has
-		// already moved them to expired or cancelled.
-		if !claimable {
-			// The item is terminal now, so its retry tally goes with it —
-			// leaving the entry behind leaks one map slot per item for the life
-			// of the process.
-			d.forgetAttempts(res.itemID)
-			return
-		}
-		if _, err := d.st.ReleaseItem(res.itemID); err != nil {
-			d.logger.Error("batch lane: could not release a claim",
-				"batch_id", res.batchID, "item_id", res.itemID, "code", res.outcome.ErrCode, "error", err)
-		}
-	default:
-		// A non-nil error carrying ErrCodeRequestFailed is the funnel saying the
-		// failure is PERMANENT for this item — an unusable API key, a body it
-		// cannot parse, a blob it cannot open. Retrying would burn the batch's
-		// whole attempt budget on an outcome that cannot change.
-		permanent := res.err != nil && res.outcome.ErrCode == ErrCodeRequestFailed
-		d.settleFailure(res, claimable, permanent, now)
-	}
-}
-
-// settleSuccess seals the response and moves the item to succeeded.
-//
-// Two guards come before the blob is written, because a result blob written
-// under the wrong key — or written at all for an item that is already
-// terminal — is worse than no result:
-//
-//   - a settle with no batch row cannot know which key the consumer asked for,
-//     so it fails the item permanently rather than sealing to the coordinator's
-//     own key. Downgrading would hand the coordinator plaintext the consumer
-//     paid to keep from it;
-//   - a settle for a batch the sweep has already closed writes nothing at all.
-//     FinishItem would refuse the item anyway and the blob would be deleted on
-//     the next line; skipping the write is the same outcome without the round
-//     trip, and it leaves an expired batch with nothing on disk.
-func (d *Dispatcher) settleSuccess(res itemOutcome, claimable bool, now time.Time) {
-	if res.batch == nil {
-		d.logger.Error("batch lane: a settle arrived with no batch row",
-			"batch_id", res.batchID, "item_id", res.itemID)
-		d.settleFailure(res, claimable, true, now)
-		return
-	}
-	if !claimable {
-		d.forgetAttempts(res.itemID)
-		return
-	}
-
-	ref := ResultBlobRef(res.itemID)
-	if err := d.putResult(res.batch, ref, res.outcome.ResponseBody); err != nil {
-		d.logger.Error("batch lane: could not seal a result",
-			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
-		// The response cannot be stored, so it can never be assembled: retrying
-		// the dispatch would only reproduce the same failure at a provider's
-		// expense.
-		d.settleFailure(res, true, true, now)
-		return
-	}
-
-	ok, err := d.st.FinishItem(store.ItemResult{
-		ItemID:           res.itemID,
-		Succeeded:        true,
-		PromptTokens:     res.outcome.PromptTokens,
-		CompletionTokens: res.outcome.CompletionTokens,
-		RequestID:        res.outcome.RequestID,
-		ResultBlobRef:    ref,
-	}, now)
-	if err != nil {
-		// The item is still inflight in the store and the result blob it points
-		// at is already on disk. Release the claim and drop the blob so the next
-		// tick re-claims the item instead of leaving it stranded until the batch
-		// expires. The dispatch is repeated, which costs one provider call; the
-		// alternative costs the consumer the whole item.
-		d.logger.Error("batch lane: could not finish an item",
-			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
-		if _, rerr := d.st.ReleaseItem(res.itemID); rerr != nil {
-			d.logger.Error("batch lane: could not re-offer an unfinishable item",
-				"batch_id", res.batchID, "item_id", res.itemID, "error", rerr)
-		}
-		if derr := d.blob.Delete(ref); derr != nil && !errors.Is(derr, sealedblob.ErrNotFound) {
-			d.logger.Error("batch lane: could not drop an unfinished result blob",
-				"batch_id", res.batchID, "item_id", res.itemID, "error", derr)
-		}
-		return
-	}
-	if !ok {
-		// A late result for an item the sweep already closed. Drop the blob we
-		// just wrote so an expired batch leaves nothing behind.
-		if err := d.blob.Delete(ref); err != nil && !errors.Is(err, sealedblob.ErrNotFound) {
-			d.logger.Error("batch lane: could not drop a late result blob",
-				"batch_id", res.batchID, "item_id", res.itemID, "error", err)
-		}
-		d.forgetAttempts(res.itemID)
-		return
-	}
-
-	d.mu.Lock()
-	delete(d.attempts, res.itemID)
-	if bs := d.batches[res.batchID]; bs != nil {
-		bs.rate.Record(now)
-	}
-	d.mu.Unlock()
-
-	d.runFinalize(res.batchID, now)
-}
-
-// forgetAttempts drops one item's in-memory retry tally.
-func (d *Dispatcher) forgetAttempts(itemID string) {
-	d.mu.Lock()
-	delete(d.attempts, itemID)
-	d.mu.Unlock()
-}
-
-// putResult seals the response body to the consumer's key when the batch
-// carries one, and to the coordinator's own key otherwise. b is the row the
-// tick claimed the item from — never a re-read, so a batch that left the open
-// list mid-dispatch cannot silently downgrade a consumer-sealed result.
-func (d *Dispatcher) putResult(b *store.Batch, ref string, body []byte) error {
-	if b.ResultPublicKey != "" {
-		key, err := decodePublicKey(b.ResultPublicKey)
-		if err != nil {
-			return err
-		}
-		return d.blob.PutTo(ref, body, key)
-	}
-	return d.blob.PutPlain(ref, body)
-}
-
-// decodePublicKey parses a batch's base64 X25519 result key. The error never
-// quotes the value.
-func decodePublicKey(encoded string) ([32]byte, error) {
-	var key [32]byte
-	raw, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return key, errors.New("result_public_key is not valid base64")
-	}
-	if len(raw) != 32 {
-		return key, fmt.Errorf("result_public_key must be 32 bytes, got %d", len(raw))
-	}
-	copy(key[:], raw)
-	return key, nil
-}
-
-// settleFailure charges an attempt and either re-offers the item or settles it
-// as failed.
-//
-// The attempt tally is kept in memory rather than in the item row because the
-// store's only per-item requeue, ReleaseItem, un-counts the claim's attempt by
-// design (it exists for the no-capacity path), and the batch-wide
-// RequeueInflightItems would yank items that are genuinely still running. A
-// coordinator restart therefore forgets a partial retry budget, which costs at
-// most MaxAttempts-1 extra attempts per item and never loses one.
-func (d *Dispatcher) settleFailure(res itemOutcome, claimable, permanent bool, now time.Time) {
-	d.mu.Lock()
-	d.attempts[res.itemID]++
-	attempts := d.attempts[res.itemID]
-	d.mu.Unlock()
-
-	if !permanent && attempts < d.cfg.MaxAttempts && claimable {
-		if _, err := d.st.ReleaseItem(res.itemID); err != nil {
-			d.logger.Error("batch lane: could not re-offer a failed item",
-				"batch_id", res.batchID, "item_id", res.itemID, "attempts", attempts, "error", err)
-		}
-		return
-	}
-
-	d.mu.Lock()
-	delete(d.attempts, res.itemID)
-	d.mu.Unlock()
-
-	ok, err := d.st.FinishItem(store.ItemResult{
-		ItemID:    res.itemID,
-		Succeeded: false,
-		ErrorCode: ErrCodeRequestFailed,
-	}, now)
-	if err != nil {
-		d.logger.Error("batch lane: could not fail an item",
-			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
-		return
-	}
-	if !ok {
-		return // already terminal
-	}
-	d.logger.Info("batch lane: item failed",
-		"batch_id", res.batchID, "item_id", res.itemID,
-		"attempts", attempts, "permanent", permanent, "code", ErrCodeRequestFailed)
-	d.runFinalize(res.batchID, now)
 }
 
 // sweep expires batches past their completion window and drains cancelled ones.
@@ -969,153 +818,6 @@ func (d *Dispatcher) pruneBatchState(open []*store.Batch, now time.Time) {
 		if _, scheduled := d.retire[id]; !scheduled {
 			d.retire[id] = now.Add(d.cfg.OutputRetention)
 		}
-	}
-}
-
-// retention deletes the per-item result blobs of batches that finalized more
-// than OutputRetention ago, and runs the assembled-file retention pass.
-//
-// The results are redundant by then: finalize inlines every one of them into
-// the output file, whose own blob and row the Purge hook removes on the same
-// boundary. Only what the dispatcher itself finalized is on the schedule, so a
-// coordinator restart forgets the pending deletions and leaves those result
-// blobs on disk (the assembled files still expire, because their rows carry the
-// timestamp). Making that restart-safe needs a store read for terminal batches
-// past a cutoff, which is a store change and is tracked as a follow-up.
-func (d *Dispatcher) retention(now time.Time) {
-	d.mu.Lock()
-	due := make([]string, 0, len(d.retire))
-	for id, at := range d.retire {
-		if !now.Before(at) {
-			due = append(due, id)
-			delete(d.retire, id)
-		}
-	}
-	runPurge := d.cfg.Purge != nil && (d.lastPurge.IsZero() || !now.Before(d.lastPurge.Add(d.cfg.PurgeInterval)))
-	if runPurge {
-		d.lastPurge = now
-	}
-	// The orphan pass never runs on the very first tick: a coordinator that has
-	// just started has a cold store, a cold page cache and restart recovery
-	// still settling, and the condition the pass repairs (a crash between
-	// sealing an item body and committing its rows) has waited hours already. It
-	// can wait one OrphanInterval more. lastOrphan is therefore seeded with the
-	// first `now` the dispatcher sees rather than left zero.
-	runOrphan := false
-	switch {
-	case d.lastOrphan.IsZero():
-		d.lastOrphan = now
-	case !now.Before(d.lastOrphan.Add(d.cfg.OrphanInterval)) && !d.orphanRunning:
-		d.lastOrphan = now
-		d.orphanRunning = true
-		runOrphan = true
-	}
-	d.mu.Unlock()
-
-	sort.Strings(due)
-	for _, batchID := range due {
-		d.purgeItemResults(batchID)
-	}
-	if runPurge {
-		if _, err := d.cfg.Purge(now); err != nil {
-			d.logger.Error("batch lane: file retention pass failed", "error", err)
-		}
-	}
-	if runOrphan {
-		// A full directory listing plus a store probe per candidate is the most
-		// expensive thing the dispatcher does, and Tick is the 1 Hz control
-		// loop: run it off the tick so a slow disk or a slow store cannot delay
-		// a claim. It joins d.wg, so shutdown still waits for it.
-		d.wg.Add(1)
-		go func() {
-			defer d.wg.Done()
-			defer func() {
-				d.mu.Lock()
-				d.orphanRunning = false
-				d.mu.Unlock()
-			}()
-			defer saferun.Recover(d.logger, "batch_orphan_sweep")
-			d.sweepOrphanItemBlobs(now)
-		}()
-	}
-}
-
-// sweepOrphanItemBlobs deletes item blobs no row references.
-//
-// A coordinator that crashes between sealing an item body and committing the
-// batch's rows leaves blobs behind that nothing will ever read or delete: the
-// file retention pass walks file rows, and every other deletion path starts
-// from an item row that does not exist. Only a directory listing can find them.
-//
-// Two guards keep the pass from deleting live data. It probes the store for
-// each ref's item id, so anything a row still references is kept whatever its
-// age; and it ignores blobs younger than the retention window, so a batch being
-// created right now — its blobs written, its rows not yet committed — is never
-// raced. Each pass is bounded on BOTH the probes it makes and the blobs it
-// unlinks; a backlog drains over several. It runs off the tick, so neither
-// bound is load bearing for the control loop's period.
-func (d *Dispatcher) sweepOrphanItemBlobs(now time.Time) {
-	blobs, err := d.blob.List()
-	if err != nil {
-		d.logger.Error("batch lane: could not list blobs for the orphan sweep", "error", err)
-		return
-	}
-	cutoff := now.Add(-d.cfg.OutputRetention)
-
-	scanned, deleted := 0, 0
-	for _, info := range blobs {
-		if deleted >= maxOrphanDeletes || scanned >= maxOrphanScan {
-			d.logger.Info("batch lane: orphan sweep hit its per-pass bound",
-				"deleted", deleted, "scanned", scanned)
-			break
-		}
-		if !strings.HasPrefix(info.Ref, itemBlobPrefix) || !info.ModTime.Before(cutoff) {
-			continue
-		}
-		scanned++
-		itemID := strings.TrimSuffix(info.Ref, itemInputBlobSuffix)
-		exists, err := d.st.BatchItemExists(itemID)
-		if err != nil {
-			d.logger.Error("batch lane: orphan sweep could not probe an item", "item_id", itemID, "error", err)
-			return // a failing store read must not be read as "no row exists"
-		}
-		if exists {
-			continue
-		}
-		if err := d.blob.Delete(info.Ref); err != nil && !errors.Is(err, sealedblob.ErrNotFound) {
-			d.logger.Error("batch lane: could not delete an orphan blob", "item_id", itemID, "error", err)
-			continue
-		}
-		deleted++
-	}
-	if deleted > 0 {
-		d.logger.Info("batch lane: orphan sweep removed unreferenced item blobs",
-			"blobs", deleted, "candidates", scanned)
-	}
-}
-
-// purgeItemResults deletes every result blob of one finalized batch.
-func (d *Dispatcher) purgeItemResults(batchID string) {
-	items, err := d.st.ListItems(batchID)
-	if err != nil {
-		d.logger.Error("batch lane: could not list items for retention", "batch_id", batchID, "error", err)
-		return
-	}
-	deleted := 0
-	for _, it := range items {
-		ref := it.ResultBlobRef
-		if ref == "" {
-			continue
-		}
-		if err := d.blob.Delete(ref); err != nil && !errors.Is(err, sealedblob.ErrNotFound) {
-			d.logger.Error("batch lane: could not purge a result blob",
-				"batch_id", batchID, "item_id", it.ID, "error", err)
-			continue
-		}
-		deleted++
-	}
-	if deleted > 0 {
-		d.logger.Info("batch lane: retention purged item results", "batch_id", batchID, "blobs", deleted)
 	}
 }
 
