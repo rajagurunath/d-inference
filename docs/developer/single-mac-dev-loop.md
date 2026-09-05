@@ -1,6 +1,6 @@
 # Single-Mac dev loop
 
-> Last updated: 2026-09-05 · commit `897e32333`
+> Last updated: 2026-09-05 · commit `9611f8771`
 
 Run a coordinator and one provider on one Mac for manual testing, without
 touching the shared dev environment or writing a throwaway launch script. For
@@ -165,7 +165,7 @@ export EIGENINFERENCE_BATCH_BLOB_DIR=$TMPDIR/darkbloom-batch
 make dev-stack
 ```
 
-Expect, within about 15 seconds:
+Expect, in about 20 seconds:
 
 ```
 level=INFO msg="test coordinator started" port=18080 base_url=http://127.0.0.1:18080
@@ -173,6 +173,7 @@ level=INFO msg="provider registered" chip="Apple M4 Pro" memory_gb=48 models=1 b
 level=INFO msg="providers registered" count=1
 Dev stack ready.
   Base URL: http://127.0.0.1:18080
+  API key:  sk-db-…
   Provider PID: <pid> (model: mlx-community/Qwen3.5-0.8B-MLX-4bit)
 ```
 
@@ -197,6 +198,8 @@ MODEL=$DARKBLOOM_TESTBED_MODEL ./scripts/dev-smoke-batch-api.sh
 Expect:
 
 ```
+--- build a 3-line input file ---
+wrote 3 lines
 --- warm the model with one synchronous completion ---
 model warm
 --- POST /v1/files ---
@@ -278,6 +281,17 @@ kill -INT "$(lsof -t -nP -iTCP:18080 -sTCP:LISTEN)"
 DARKBLOOM_DEV_KEY=<the key terminal A printed> make dev-stack
 ```
 
+While the stack is down, the rows are still there. The item column is `state`,
+not `status` (`coordinator/store/postgres.go`, the `batch_items` DDL), so the
+obvious hand query is:
+
+```bash
+psql dinf_devstack -c 'select state, count(*) from batch_items group by state;'
+#  inflight  |  3
+#  pending   | 21
+#  succeeded |  6
+```
+
 The second start logs the resume and reuses the key:
 
 ```
@@ -299,6 +313,24 @@ banner.
 Clean up with `dropdb dinf_devstack` and `rm -rf /tmp/dinf-devstack-blobs`;
 with neither URL variable set the stack is back to the ephemeral store that is
 thrown away on every stop.
+
+## Co-serving benchmark
+
+`make e2e-coserve` runs `TestBenchmarkBatchCoServe` (`e2e/batch_coserve_test.go`)
+over the same testbed this loop uses. It starts its own coordinator and
+provider on an ephemeral port, so stop `make dev-stack` first rather than
+loading the model twice on one box. Four phases, about 9 minutes.
+
+The target leaves `COSERVE_REPORT_PATH` unset, and the test writes the rendered
+markdown report to a file **only** when that variable is set; otherwise the
+report exists solely in the `-v` test log:
+
+```bash
+COSERVE_REPORT_PATH=/tmp/coserve-report.md make e2e-coserve
+```
+
+The most recent run is kept at
+[`../reports/2026-09-05-batch-coserve-benchmark-rerun.md`](../reports/2026-09-05-batch-coserve-benchmark-rerun.md).
 
 ## Measured on this loop
 
