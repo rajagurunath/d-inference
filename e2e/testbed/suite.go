@@ -462,7 +462,7 @@ func startTestbedBatchDispatcher(
 		batchlane.Config{
 			Tick:            batchlane.DefaultTick,
 			MaxAttempts:     batchlane.DefaultMaxAttempts,
-			OutputRetention: api.BatchOutputRetention,
+			OutputRetention: batchlane.DefaultOutputRetention,
 			Purge:           srv.PurgeExpiredBatchFiles,
 		},
 		logger,
