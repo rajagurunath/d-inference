@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -47,22 +48,43 @@ func testBlobs(t *testing.T) *sealedblob.Store {
 
 // itemBody is the sealed request body of one line: the plain OpenAI chat body,
 // which is what PR2's JSONL parser stores under the item's blob ref.
-func itemBody(line int) []byte {
+func itemBody(line int) []byte { return itemBodyWith("line", line) }
+
+// itemBodyWith is itemBody with a caller-chosen prompt, so a test can put a
+// string into the plaintext it then looks for in the logs.
+func itemBodyWith(prompt string, line int) []byte {
 	return []byte(fmt.Sprintf(
-		`{"model":%q,"messages":[{"role":"user","content":"line-%d"}]}`, testModel, line))
+		`{"model":%q,"messages":[{"role":"user","content":"%s-%d"}]}`, testModel, prompt, line))
+}
+
+// seedOpts are the batch-level knobs the seeders vary. The zero value is the
+// file form: no batch model, no consumer key, no submitting API key.
+type seedOpts struct {
+	// resultPublicKey selects consumer sealing.
+	resultPublicKey string
+	// apiKeyID is the key the batch was submitted with ("" for a caller that
+	// had none).
+	apiKeyID string
+	// model is the batch-level model of the inline form ("" for the file form,
+	// whose lines each carry their own).
+	model string
+	// prompt replaces the per-line prompt content ("line" by default).
+	prompt string
+	// customIDPrefix replaces the per-line custom_id prefix ("cid" by default).
+	customIDPrefix string
 }
 
 // seedBatch creates an in_progress batch of n items with their bodies sealed.
 func seedBatch(t *testing.T, st store.Store, blobs *sealedblob.Store, id string, n int, expiresAt time.Time) *store.Batch {
 	t.Helper()
-	return seedBatchKeyed(t, st, blobs, id, n, expiresAt, "")
+	return seedBatchWith(t, st, blobs, id, n, expiresAt, seedOpts{})
 }
 
 // seedBatchKeyed is seedBatch for a batch whose results the consumer wants
 // sealed to its own key.
 func seedBatchKeyed(t *testing.T, st store.Store, blobs *sealedblob.Store, id string, n int, expiresAt time.Time, resultPublicKey string) *store.Batch {
 	t.Helper()
-	return seedBatchWith(t, st, blobs, id, n, expiresAt, resultPublicKey, "", "")
+	return seedBatchWith(t, st, blobs, id, n, expiresAt, seedOpts{resultPublicKey: resultPublicKey})
 }
 
 // seedBatchForModel is seedBatch for the inline form, which declares its model
@@ -76,13 +98,10 @@ func seedBatchForModel(
 	expiresAt time.Time,
 ) *store.Batch {
 	t.Helper()
-	return seedBatchWith(t, st, blobs, id, n, expiresAt, "", "", model)
+	return seedBatchWith(t, st, blobs, id, n, expiresAt, seedOpts{model: model})
 }
 
-// seedBatchWith is the full seeder: resultPublicKey selects consumer sealing,
-// apiKeyID is the key the batch was submitted with ("" for a caller that had
-// none), and model is the batch-level model of the inline form ("" for the file
-// form, whose lines each carry their own).
+// seedBatchWith is the full seeder.
 func seedBatchWith(
 	t *testing.T,
 	st store.Store,
@@ -90,9 +109,18 @@ func seedBatchWith(
 	id string,
 	n int,
 	expiresAt time.Time,
-	resultPublicKey, apiKeyID, model string,
+	opts seedOpts,
 ) *store.Batch {
 	t.Helper()
+	resultPublicKey, apiKeyID, model := opts.resultPublicKey, opts.apiKeyID, opts.model
+	prompt := opts.prompt
+	if prompt == "" {
+		prompt = "line"
+	}
+	customIDPrefix := opts.customIDPrefix
+	if customIDPrefix == "" {
+		customIDPrefix = "cid"
+	}
 	b := &store.Batch{
 		ID:               id,
 		AccountID:        testAccount,
@@ -118,13 +146,13 @@ func seedBatchWith(
 	for i := 0; i < n; i++ {
 		itemID := fmt.Sprintf("bitem_%s_%02d", id, i)
 		inputRef := itemID + "-in" // api.BatchItemInputRef
-		if err := blobs.PutPlain(inputRef, itemBody(i)); err != nil {
+		if err := blobs.PutPlain(inputRef, itemBodyWith(prompt, i)); err != nil {
 			t.Fatalf("seal item body: %v", err)
 		}
 		items = append(items, &store.BatchItem{
 			ID:       itemID,
 			BatchID:  id,
-			CustomID: fmt.Sprintf("cid-%02d", i),
+			CustomID: fmt.Sprintf("%s-%02d", customIDPrefix, i),
 			LineNo:   i + 1,
 			State:    store.ItemPending,
 			BlobRef:  inputRef,
@@ -190,46 +218,6 @@ func (h *harness) tick(t *testing.T, ctx context.Context, now time.Time) {
 	t.Helper()
 	h.d.Tick(ctx, now)
 	h.d.AwaitDispatch()
-}
-
-// assemblerFinalize is the part of api's FinalizeBatchIfDone the dispatcher's
-// sweep now depends on: once a batch has no open items left, finalize — not the
-// sweep — performs the terminal transition. Expired items make the target
-// expired, a cancelling batch becomes cancelled, everything else completes.
-func assemblerFinalize(st store.Store) func(string, time.Time) error {
-	return func(batchID string, now time.Time) error {
-		b, ok := st.GetBatchByID(batchID)
-		if !ok {
-			return nil
-		}
-		_, pending, inflight, _, _, err := st.CountItems(batchID)
-		if err != nil {
-			return err
-		}
-		if pending+inflight > 0 {
-			return nil
-		}
-		to := store.BatchCompleted
-		switch b.Status {
-		case store.BatchCancelling:
-			to = store.BatchCancelled
-		case store.BatchInProgress:
-			items, err := st.ListItems(batchID)
-			if err != nil {
-				return err
-			}
-			for _, it := range items {
-				if it.State == store.ItemExpired {
-					to = store.BatchExpired
-					break
-				}
-			}
-		default:
-			return nil
-		}
-		_, err = st.SetBatchStatus(batchID, b.Status, to, now)
-		return err
-	}
 }
 
 func itemStates(t *testing.T, st store.Store, batchID string) map[store.ItemState]int {
@@ -483,9 +471,6 @@ func TestSweepExpiresPastDeadline(t *testing.T) {
 	h := newHarness(t, batchlane.Config{MaxAttempts: 3})
 	idleSlot(h.view, 4)
 	h.dispatch.Block = make(chan struct{})
-	// The sweep expires the items and hands the terminal transition to
-	// finalize, which is where the assembled files are attached first.
-	h.finalize.Then = assemblerFinalize(h.st)
 	expires := testStart.Add(30 * time.Second)
 	seedBatch(t, h.st, h.blobs, "batch_expire", 3, expires)
 
@@ -498,19 +483,25 @@ func TestSweepExpiresPastDeadline(t *testing.T) {
 	close(h.dispatch.Block)
 	h.d.AwaitDispatch()
 
-	b, _ := h.st.GetBatch(testAccount, "batch_expire")
-	if b.Status != store.BatchExpired {
-		t.Fatalf("status = %s, want expired", b.Status)
-	}
 	states := itemStates(t, h.st, "batch_expire")
 	if states[store.ItemExpired] != 3 {
 		t.Fatalf("expired items = %d, want 3: %v", states[store.ItemExpired], states)
 	}
+	b, _ := h.st.GetBatch(testAccount, "batch_expire")
 	if b.CountsCompleted != 0 || b.CountsFailed != 0 {
 		t.Fatalf("counts = %d/%d, want 0/0 — expiry moves neither", b.CountsCompleted, b.CountsFailed)
 	}
 	if !h.finalize.Called("batch_expire") {
 		t.Fatal("an expired batch was not finalized")
+	}
+	// With an assembler wired the terminal transition is ITS job: the batch
+	// must still be in_progress here, because finalize attaches the output and
+	// error files before it CASes. Closing it first would hand the assembler a
+	// batch that is no longer open and the consumer an expired batch with no
+	// files at all.
+	if b.Status != store.BatchInProgress {
+		t.Fatalf("status = %s, want in_progress — the sweep must leave the "+
+			"transition to the assembler", b.Status)
 	}
 
 	// A result that lands after the sweep is ignored.
@@ -556,7 +547,6 @@ func TestCancelStopsInflightWork(t *testing.T) {
 	idleSlot(h.view, 4)
 	release := make(chan struct{})
 	h.dispatch.Block = release
-	h.finalize.Then = assemblerFinalize(h.st)
 	seedBatch(t, h.st, h.blobs, "batch_cancel", 2, testStart.Add(24*time.Hour))
 
 	h.d.Tick(ctx, testStart)
@@ -589,12 +579,77 @@ func TestCancelStopsInflightWork(t *testing.T) {
 		t.Fatalf("a late outcome moved a cancelled item: %v", states)
 	}
 	b, _ := h.st.GetBatch(testAccount, "batch_cancel")
-	if b.Status != store.BatchCancelled {
-		t.Fatalf("status = %s, want cancelled", b.Status)
-	}
 	if b.CountsCompleted != 0 || b.CountsFailed != 0 {
 		t.Fatalf("counts = %d/%d, want 0/0", b.CountsCompleted, b.CountsFailed)
 	}
+	if !h.finalize.Called("batch_cancel") {
+		t.Fatal("a drained cancelling batch was not finalized")
+	}
+	// As in expiry, the cancelling → cancelled CAS belongs to the assembler.
+	if b.Status != store.BatchCancelling {
+		t.Fatalf("status = %s, want cancelling — the sweep must leave the "+
+			"transition to the assembler", b.Status)
+	}
+}
+
+// newHarnessNoFinalize is newHarness with NO assembler wired, which is the
+// coordinator that starts the lane before the api layer hands it a finalize
+// hook. There is then nothing to order the terminal transition against, so the
+// dispatcher performs the CAS itself rather than leaving the batch open forever.
+func newHarnessNoFinalize(t *testing.T, cfg batchlane.Config) *harness {
+	t.Helper()
+	h := &harness{
+		st:       store.NewMemory(store.Config{}),
+		blobs:    testBlobs(t),
+		view:     batchlanetest.NewFakeView(),
+		dispatch: &batchlanetest.FakeDispatch{},
+		finalize: &batchlanetest.FakeFinalize{},
+	}
+	h.d = batchlane.New(h.st, h.blobs, h.view, h.dispatch.Fn(), nil, cfg, testLogger())
+	return h
+}
+
+// The no-assembler fallback: without a finalize hook the sweep is the only
+// thing that can close a batch, so it does the CAS itself.
+func TestSweepClosesBatchesItselfWithNoAssembler(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("expiry", func(t *testing.T) {
+		h := newHarnessNoFinalize(t, batchlane.Config{MaxAttempts: 3})
+		idleSlot(h.view, 4)
+		expires := testStart.Add(30 * time.Second)
+		seedBatch(t, h.st, h.blobs, "batch_expire_noasm", 2, expires)
+
+		h.tick(t, ctx, expires.Add(time.Second))
+
+		b, _ := h.st.GetBatch(testAccount, "batch_expire_noasm")
+		if b.Status != store.BatchExpired {
+			t.Fatalf("status = %s, want expired", b.Status)
+		}
+		if states := itemStates(t, h.st, "batch_expire_noasm"); states[store.ItemExpired] != 2 {
+			t.Fatalf("item states = %v, want 2 expired", states)
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		h := newHarnessNoFinalize(t, batchlane.Config{MaxAttempts: 3})
+		idleSlot(h.view, 4)
+		seedBatch(t, h.st, h.blobs, "batch_cancel_noasm", 2, testStart.Add(24*time.Hour))
+		if ok, err := h.st.SetBatchStatus(
+			"batch_cancel_noasm", store.BatchInProgress, store.BatchCancelling, testStart); err != nil || !ok {
+			t.Fatalf("cancel: ok=%v err=%v", ok, err)
+		}
+
+		h.tick(t, ctx, testStart.Add(time.Second))
+
+		b, _ := h.st.GetBatch(testAccount, "batch_cancel_noasm")
+		if b.Status != store.BatchCancelled {
+			t.Fatalf("status = %s, want cancelled", b.Status)
+		}
+		if states := itemStates(t, h.st, "batch_cancel_noasm"); states[store.ItemCancelled] != 2 {
+			t.Fatalf("item states = %v, want 2 cancelled", states)
+		}
+	})
 }
 
 // A batch whose slack has run out is granted a progress floor of one in-flight
@@ -756,7 +811,7 @@ func TestDispatchCarriesTheBatchesAPIKey(t *testing.T) {
 	h := newHarness(t, batchlane.Config{MaxAttempts: 3})
 	idleSlot(h.view, 4)
 	const keyID = "key_submitter"
-	seedBatchWith(t, h.st, h.blobs, "batch_keyed", 1, testStart.Add(24*time.Hour), "", keyID, "")
+	seedBatchWith(t, h.st, h.blobs, "batch_keyed", 1, testStart.Add(24*time.Hour), seedOpts{apiKeyID: keyID})
 
 	h.tick(t, ctx, testStart)
 	waitForCalls(t, h.dispatch, 1)
@@ -1523,5 +1578,87 @@ func TestModelHeadroomCountsItsOwnInflightItems(t *testing.T) {
 	}
 	if n := h.d.InflightItems(); n != 4 {
 		t.Fatalf("in-flight items = %d, want 4 — the model's headroom is shared", n)
+	}
+}
+
+// syncBuffer is a concurrency-safe log sink: the dispatch goroutines log while
+// the tick that started them is still running.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Invariant 6 inside the dispatcher, mirroring the request-path assertion in
+// api/batch_handlers_test.go: no log line the control loop emits carries a
+// prompt or a custom_id. One full lifecycle is driven at Debug level — claim,
+// dispatch, a success whose response echoes the prompt, a permanent failure
+// whose provider error quotes it, expiry, the terminal transition, retention
+// and the orphan sweep — and the whole transcript is searched.
+func TestTickLogsNoPromptOrCustomID(t *testing.T) {
+	ctx := context.Background()
+	const (
+		prompt   = "PROMPT-SECRET-9f3a"
+		customID = "CUSTOMID-SECRET-7b21"
+	)
+	logs := &syncBuffer{}
+	h := &harness{
+		st:       store.NewMemory(store.Config{}),
+		blobs:    testBlobs(t),
+		view:     batchlanetest.NewFakeView(),
+		dispatch: &batchlanetest.FakeDispatch{},
+		finalize: &batchlanetest.FakeFinalize{},
+	}
+	// No assembler: the dispatcher then closes the batch itself, so this one
+	// tick loop also reaches retention and the orphan sweep.
+	h.d = batchlane.New(h.st, h.blobs, h.view, h.dispatch.Fn(), nil, batchlane.Config{
+		MaxAttempts:     1,
+		OutputRetention: time.Nanosecond,
+		PurgeInterval:   time.Nanosecond,
+		OrphanInterval:  time.Nanosecond,
+		Purge:           func(time.Time) (int, error) { return 0, nil },
+	}, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	idleSlot(h.view, 4)
+
+	// The provider's answer echoes the prompt and its error quotes it, so a
+	// settle that logged either would leak it.
+	h.dispatch.Respond = func(n int, model string, body []byte) (batchlane.Outcome, error) {
+		if n%2 == 1 {
+			return batchlane.Outcome{ErrCode: batchlane.ErrCodeRequestFailed},
+				fmt.Errorf("provider refused: %s", prompt)
+		}
+		return batchlane.Outcome{ResponseBody: []byte(`{"echo":"` + prompt + `"}`)}, nil
+	}
+	seedBatchWith(t, h.st, h.blobs, "batch_privacy", 4, testStart.Add(30*time.Second),
+		seedOpts{prompt: prompt, customIDPrefix: customID})
+
+	for i := 0; i < 6; i++ {
+		h.tick(t, ctx, testStart.Add(time.Duration(i)*10*time.Second))
+	}
+
+	transcript := logs.String()
+	// The assertion is only worth anything if the loop actually logged.
+	if !strings.Contains(transcript, "batch_privacy") {
+		t.Fatalf("the tick loop logged nothing about the batch:\n%s", transcript)
+	}
+	if h.dispatch.Len() == 0 {
+		t.Fatal("nothing was dispatched, so the settle paths never logged")
+	}
+	if strings.Contains(transcript, prompt) {
+		t.Fatalf("a log line carries the prompt:\n%s", transcript)
+	}
+	if strings.Contains(transcript, customID) || strings.Contains(transcript, "custom_id") {
+		t.Fatalf("a log line carries a custom_id:\n%s", transcript)
 	}
 }
