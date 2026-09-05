@@ -541,6 +541,18 @@ func (s *Server) noteInferenceSuccess(pr *registry.PendingRequest) {
 	if pr == nil || pr.ProviderID == "" {
 		return
 	}
+	// The exact mirror of noteInferenceError's exemption: a batch attempt feeds
+	// no provider health or capacity tracker, in EITHER direction. Every call
+	// below re-admits a pair that online traffic quarantined — it clears the
+	// inference-error strike state, clears the capacity-reject cooldown and its
+	// re-trip backoff, closes the node-health breaker and recovers a
+	// stable-identity ejection. A batch attempt is placed on leftover headroom
+	// against a 120s deadline; its success proves nothing about whether the pair
+	// can carry the online traffic that shut it out, so letting it reopen the
+	// gate would make co-serving UNDO online routing's own decisions.
+	if pr.Traits.Lane == registry.LaneBatch {
+		return
+	}
 	s.registry.RecordInferenceSuccess(pr.ProviderID, pr.Model, pr.Traits.CooldownShape())
 	// A clean completion is an ACCEPT for the capacity-reject cooldown: clear
 	// the pair's reject streak, any active capacity cooldown, and the re-trip

@@ -170,6 +170,14 @@ func (d *dispatchState) maybeProbePlanCandidates() {
 	if d.policy.enabled || d.policy.prefer {
 		return
 	}
+	// A batch attempt never hedges (skipSpeculativeBackup) and never queues, so
+	// the only consumer of a confirmed alternate does not exist for it. Probing
+	// anyway spends a capacity_quote round trip on every provider the plan
+	// retained — work charged to the online fleet's slots on behalf of traffic
+	// that cannot use the answer.
+	if d.lane == registry.LaneBatch {
+		return
+	}
 	receivedAt := timingReceivedAt(d.timing)
 	remaining, ok := d.firstTokenRemaining()
 	if receivedAt.IsZero() || !ok || remaining <= 0 {

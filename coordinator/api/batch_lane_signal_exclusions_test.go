@@ -158,3 +158,79 @@ func TestBatchLaneNeverHedgesUnderPreferPolicy(t *testing.T) {
 		t.Fatal("prefer request served by the caller's OWN machine was raced by a paid public backup")
 	}
 }
+
+// TestBatchSuccessesFeedNoCapacitySignal is the other half of the co-serving
+// invariant, and the one that was missing: batch must not RE-ADMIT a pair that
+// online traffic quarantined. noteInferenceSuccess clears the inference-error
+// strike state, the capacity-reject cooldown and its re-trip backoff, and closes
+// the node-health breaker — every one of them a gate the ONLINE reservation path
+// respects. A batch attempt runs on leftover headroom, so its success says
+// nothing about whether the pair can carry the traffic that shut it out.
+//
+// Both halves quarantine an identically-built pair with the same eight ONLINE
+// terminals and then differ in exactly one field: the lane of the completion.
+func TestBatchSuccessesFeedNoCapacitySignal(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	st := store.NewMemory(store.Config{AdminKey: "test-key"})
+	reg := registry.New(logger)
+
+	const model = "batch-success-model"
+	const rejectStr = "token_budget_exhausted: request exceeds active token budget"
+	batchPair := makeRoutableProvider(t, reg, "p-batch", model)
+	onlinePair := makeRoutableProvider(t, reg, "p-online", model)
+	srv := NewServer(reg, st, ServerConfig{}, logger)
+
+	// Quarantine both pairs with ONLINE terminals, so what differs below is the
+	// lane of the completion and nothing else.
+	quarantine := func(providerID string) {
+		for i := 0; i < 8; i++ {
+			srv.noteInferenceError(providerID, batchLanePending(model, providerID, i, registry.LaneOnline),
+				503, rejectStr, "", "")
+			// A second, non-capacity terminal so the inference-error strike
+			// state and the node-health breaker are armed as well: the capacity
+			// funnel and the error funnel are separate trackers and
+			// noteInferenceSuccess clears BOTH.
+			srv.noteInferenceError(providerID, batchLanePending(model, providerID, i, registry.LaneOnline),
+				500, "provider crashed while generating", "", "")
+		}
+		if !reg.CapacityCooldownActive(providerID, model) {
+			t.Fatalf("fixture: %s kept no capacity cooldown, so a clearing test proves nothing", providerID)
+		}
+		if !reg.InferenceErrorCooldownActive(providerID, model, registry.RequestTraits{}.CooldownShape()) {
+			t.Fatalf("fixture: %s kept no inference-error cooldown, so a clearing test proves nothing", providerID)
+		}
+		if !reg.ProviderBreakerOpen(providerID) {
+			t.Fatalf("fixture: %s kept no open node-health breaker, so a clearing test proves nothing", providerID)
+		}
+	}
+	quarantine(batchPair.ID)
+	quarantine(onlinePair.ID)
+
+	batchDone := batchLanePending(model, batchPair.ID, 99, registry.LaneBatch)
+	batchDone.ProviderID = batchPair.ID
+	srv.noteInferenceSuccess(batchDone)
+
+	if !reg.CapacityCooldownActive(batchPair.ID, model) {
+		t.Error("a batch success cleared the capacity-reject cooldown — the pair is routable online again")
+	}
+	if !reg.InferenceErrorCooldownActive(batchPair.ID, model, batchDone.Traits.CooldownShape()) {
+		t.Error("a batch success cleared the inference-error cooldown")
+	}
+	if reg.ProviderBreakerOpen(batchPair.ID) != true {
+		t.Error("a batch success closed the node-health breaker")
+	}
+
+	// Online control: the identical completion on the identically-quarantined
+	// pair DOES re-admit it, so the assertions above are the lane and not a
+	// cooldown that simply never clears.
+	onlineDone := batchLanePending(model, onlinePair.ID, 99, registry.LaneOnline)
+	onlineDone.ProviderID = onlinePair.ID
+	srv.noteInferenceSuccess(onlineDone)
+	if reg.CapacityCooldownActive(onlinePair.ID, model) {
+		t.Fatal("online control did not clear the capacity cooldown — the fixture no longer proves the lane is the cause")
+	}
+	if reg.InferenceErrorCooldownActive(onlinePair.ID, model, onlineDone.Traits.CooldownShape()) {
+		t.Fatal("online control did not clear the inference-error cooldown — fixture proves nothing")
+	}
+}
