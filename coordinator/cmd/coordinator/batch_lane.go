@@ -66,6 +66,12 @@ func startBatchDispatcher(
 			// constant, so there is one number, not two that must agree.
 			OutputRetention: batchlane.DefaultOutputRetention,
 			Purge:           srv.PurgeExpiredBatchFiles,
+			// A successful item whose result the dispatcher then discards —
+			// its batch went terminal mid-flight, or the sweep had already
+			// closed it — was charged by the funnel before the dispatcher
+			// could know that. RefundBatchItem gives that money back; without
+			// it the consumer pays for tokens they can never read.
+			RefundItem: srv.RefundBatchItem,
 		},
 		logger,
 	)

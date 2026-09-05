@@ -541,3 +541,77 @@ func TestDispatchBatchItemAppliesThePerKeyRPMLimit(t *testing.T) {
 		t.Fatalf("control error.code=%q body=%s, want %q", code, third.ResponseBody, batchNoCapacityCode)
 	}
 }
+
+// TestRefundBatchItemReversesTheCharge drives a real batch item through the
+// funnel against a fake provider — which charges the account for it — and then
+// asks RefundBatchItem to give the money back, as the dispatcher does for a
+// result it is about to discard. The account must end where it started, and the
+// credit must be a LedgerRefund carrying the discarded-item reference.
+func TestRefundBatchItemReversesTheCharge(t *testing.T) {
+	const model = "test-model"
+	const account = "acct-batch-refund"
+	usage := protocol.UsageInfo{PromptTokens: 3000, CompletionTokens: 500}
+	srv, _, st, ctx, providerDone := batchFakeProviderWithStore(t, model, usage, "Hello batch")
+
+	if err := st.Credit(account, 100_000_000, store.LedgerDeposit, "seed"); err != nil {
+		t.Fatalf("seed balance: %v", err)
+	}
+	opening := st.GetBalance(account)
+	providerKey := testPublicKeyB64()
+	earningsBefore, err := st.GetProviderEarningsSummary(providerKey)
+	if err != nil {
+		t.Fatalf("provider earnings summary: %v", err)
+	}
+
+	outcome, err := srv.DispatchBatchItem(ctx, account, "", model,
+		[]byte(`{"model":"ignored","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("DispatchBatchItem: %v", err)
+	}
+	if outcome.ErrCode != "" {
+		t.Fatalf("ErrCode=%q body=%s, want success", outcome.ErrCode, outcome.ResponseBody)
+	}
+	<-providerDone
+
+	charged := opening - st.GetBalance(account)
+	if charged <= 0 {
+		t.Fatalf("the funnel charged %d micro-USD — a refund would prove nothing", charged)
+	}
+
+	if err := srv.RefundBatchItem(account, outcome.RequestID,
+		outcome.PromptTokens, outcome.CompletionTokens); err != nil {
+		t.Fatalf("RefundBatchItem: %v", err)
+	}
+	if got := st.GetBalance(account); got != opening {
+		t.Fatalf("balance after refund = %d, want the opening %d (charged %d)", got, opening, charged)
+	}
+
+	var refund *store.LedgerEntry
+	entries := st.LedgerHistory(account)
+	for i := range entries {
+		if entries[i].Reference == batchDiscardedRefundPrefix+outcome.RequestID {
+			refund = &entries[i]
+			break
+		}
+	}
+	if refund == nil {
+		t.Fatalf("no ledger entry referencing %q", batchDiscardedRefundPrefix+outcome.RequestID)
+	}
+	if refund.Type != store.LedgerRefund {
+		t.Fatalf("refund entry type = %q, want %q", refund.Type, store.LedgerRefund)
+	}
+	if refund.AmountMicroUSD != charged {
+		t.Fatalf("refund = %d micro-USD, want the %d that was charged", refund.AmountMicroUSD, charged)
+	}
+
+	// The provider's payout is deliberately NOT clawed back: it served the
+	// request. Dropping the answer is the coordinator's doing, so the platform
+	// absorbs the difference (see RefundBatchItem).
+	earningsAfter, err := st.GetProviderEarningsSummary(providerKey)
+	if err != nil {
+		t.Fatalf("provider earnings summary: %v", err)
+	}
+	if earningsAfter != earningsBefore {
+		t.Fatalf("provider earnings moved on a consumer refund: %+v -> %+v", earningsBefore, earningsAfter)
+	}
+}

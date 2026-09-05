@@ -103,6 +103,10 @@ func (d *Dispatcher) settleSuccess(res itemOutcome, claimable bool, now time.Tim
 		return
 	}
 	if !claimable {
+		// The batch went terminal while this item was in flight. The attempt
+		// still reached a provider and the funnel still charged for it, so the
+		// money goes back before the response is dropped.
+		d.refundDiscardedItem(res)
 		d.forgetAttempts(res.itemID)
 		return
 	}
@@ -161,11 +165,14 @@ func (d *Dispatcher) settleSuccess(res itemOutcome, claimable bool, now time.Tim
 	}
 	if !ok {
 		// A late result for an item the sweep already closed. Drop the blob we
-		// just wrote so an expired batch leaves nothing behind.
+		// just wrote so an expired batch leaves nothing behind — and refund it,
+		// for the same reason the !claimable branch above does: the response is
+		// gone but the funnel charged for the attempt that produced it.
 		if err := d.blob.Delete(ref); err != nil && !errors.Is(err, sealedblob.ErrNotFound) {
 			d.logger.Error("batch lane: could not drop a late result blob",
 				"batch_id", res.batchID, "item_id", res.itemID, "error", err)
 		}
+		d.refundDiscardedItem(res)
 		d.forgetAttempts(res.itemID)
 		return
 	}
@@ -178,6 +185,25 @@ func (d *Dispatcher) settleSuccess(res itemOutcome, claimable bool, now time.Tim
 	d.mu.Unlock()
 
 	d.runFinalize(res.batchID, now)
+}
+
+// refundDiscardedItem credits back a charged attempt whose result is being
+// thrown away. Failures are logged, never propagated: the settle path must
+// still complete, and a refund that did not land is a ledger problem, not a
+// reason to leave an item inflight until expiry.
+//
+// Only the SUCCESS path calls it. settle's ErrCodeNoCapacity and
+// ErrCodeCancelled outcomes never reached a provider, so nothing was charged
+// for them and there is nothing to give back.
+func (d *Dispatcher) refundDiscardedItem(res itemOutcome) {
+	if d.cfg.RefundItem == nil || res.batch == nil || res.outcome.RequestID == "" {
+		return
+	}
+	if err := d.cfg.RefundItem(res.batch.AccountID, res.outcome.RequestID,
+		res.outcome.PromptTokens, res.outcome.CompletionTokens); err != nil {
+		d.logger.Error("batch lane: could not refund a discarded result",
+			"batch_id", res.batchID, "item_id", res.itemID, "error", err)
+	}
 }
 
 // forgetAttempts drops one item's in-memory retry tally.
