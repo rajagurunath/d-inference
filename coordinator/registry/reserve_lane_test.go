@@ -51,8 +51,8 @@ func TestBatchRowsAllowedIsRouterCapMinusOne(t *testing.T) {
 	if want < 0 {
 		want = 0
 	}
-	if got := reg.BatchRowsAllowed(p, model); got != want {
-		t.Fatalf("BatchRowsAllowed=%d, want %d (router cap %d minus one)",
+	if got := reg.batchRowsAllowed(p, model); got != want {
+		t.Fatalf("batchRowsAllowed=%d, want %d (router cap %d minus one)",
 			got, want, want+1)
 	}
 
@@ -68,8 +68,8 @@ func TestBatchRowsAllowedIsRouterCapMinusOne(t *testing.T) {
 	if wantCapped < 0 {
 		wantCapped = 0
 	}
-	if got := reg.BatchRowsAllowed(p, model); got != wantCapped {
-		t.Fatalf("BatchRowsAllowed with quality cap=%d, want %d (quality cap %d minus one)",
+	if got := reg.batchRowsAllowed(p, model); got != wantCapped {
+		t.Fatalf("batchRowsAllowed with quality cap=%d, want %d (quality cap %d minus one)",
 			got, wantCapped, capped)
 	}
 }
@@ -84,8 +84,8 @@ func TestBatchRowsAllowedFloorsAtZero(t *testing.T) {
 	p.BackendCapacity.Slots[0].MaxConcurrency = 1
 	p.mu.Unlock()
 
-	if got := reg.BatchRowsAllowed(p, model); got != 0 {
-		t.Fatalf("BatchRowsAllowed=%d, want 0 for a cap-1 pair", got)
+	if got := reg.batchRowsAllowed(p, model); got != 0 {
+		t.Fatalf("batchRowsAllowed=%d, want 0 for a cap-1 pair", got)
 	}
 }
 
@@ -108,7 +108,7 @@ func TestReserveLaneBatchOnlyTakesHeadroomSlots(t *testing.T) {
 		// C: running exactly at its batch allowance. Admittable online (the
 		// reserved online row is precisely what is left), closed to batch.
 		c := laneTestProvider(t, reg, "C", model, 40, 0, 0)
-		allowance := reg.BatchRowsAllowed(c, model)
+		allowance := reg.batchRowsAllowed(c, model)
 		if allowance < 1 {
 			t.Fatalf("fixture: batch allowance %d leaves nothing to fill", allowance)
 		}
@@ -203,8 +203,8 @@ func TestReserveLaneBatchDebitsLiveLoadWithinOneScan(t *testing.T) {
 	p.BackendCapacity.Slots[0].MaxConcurrency = 3
 	p.mu.Unlock()
 
-	if got := reg.BatchRowsAllowed(p, model); got != 2 {
-		t.Fatalf("fixture: BatchRowsAllowed=%d, want 2", got)
+	if got := reg.batchRowsAllowed(p, model); got != 2 {
+		t.Fatalf("fixture: batchRowsAllowed=%d, want 2", got)
 	}
 
 	for i := 1; i <= 2; i++ {

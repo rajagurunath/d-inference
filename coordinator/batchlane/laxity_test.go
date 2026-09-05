@@ -142,7 +142,7 @@ func TestObservedRateEvictsPastTheWindow(t *testing.T) {
 		t.Fatal("a fully evicted window must report unknown")
 	}
 	// And the eviction must actually release the samples, not just hide them.
-	if n := r.Len(); n != 0 {
+	if n := len(r.events); n != 0 {
 		t.Fatalf("retained %d events after eviction, want 0", n)
 	}
 }

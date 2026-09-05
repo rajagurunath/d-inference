@@ -131,7 +131,7 @@ type routingSnapshot struct {
 	pendingBytesKnown        bool
 	backendRunning           int
 	backendWaiting           int
-	// batchRowsAllowed is Registry.BatchRowsAllowed for this (provider, model)
+	// batchRowsAllowed is batchRowsAllowedLocked for this (provider, model)
 	// pair, captured under the same p.mu as backendRunning/backendWaiting so the
 	// batch-lane candidate filter compares the allowance against exactly the live
 	// slot state the online reservation is scored on. Filled ONLY for a batch-lane

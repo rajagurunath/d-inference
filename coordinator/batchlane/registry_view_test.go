@@ -50,7 +50,7 @@ func TestRegistryViewMapsSlotSignals(t *testing.T) {
 	reg := viewTestRegistry(t)
 	reg.SetQualityConcurrencyCap(true, 1.2, 15, 4)
 	model := "view-model"
-	p := viewTestProvider(t, reg, "A", model, protocol.BackendSlotCapacity{
+	viewTestProvider(t, reg, "A", model, protocol.BackendSlotCapacity{
 		NumRunning:            2,
 		NumWaiting:            1,
 		ObservedDecodeTPS:     22,
@@ -78,9 +78,31 @@ func TestRegistryViewMapsSlotSignals(t *testing.T) {
 	if sig.DecodeFloor != reg.QualityCapFloorTPS() {
 		t.Fatalf("DecodeFloor = %v, want the registry floor %v", sig.DecodeFloor, reg.QualityCapFloorTPS())
 	}
-	if want := reg.BatchRowsAllowed(p, model); sig.MaxPerSlot != want {
-		t.Fatalf("MaxPerSlot = %d, want BatchRowsAllowed %d", sig.MaxPerSlot, want)
+	// MaxPerSlot must be the registry's own number, passed straight through.
+	// The registry owns what that number means (its admission cap minus the row
+	// reserved for online); registry/reserve_lane_test.go pins that. What this
+	// asserts is that the adapter does not derive a second one.
+	slot, ok := batchSlotFor(reg, "A", model)
+	if !ok {
+		t.Fatalf("registry reported no batch slot for A/%s", model)
 	}
+	if sig.MaxPerSlot != slot.BatchRowsAllowed {
+		t.Fatalf("MaxPerSlot = %d, want the registry's allowance %d",
+			sig.MaxPerSlot, slot.BatchRowsAllowed)
+	}
+	if slot.BatchRowsAllowed == 0 {
+		t.Fatal("fixture: the allowance is 0, so the pass-through proves nothing")
+	}
+}
+
+// batchSlotFor is the registry's own BatchSlot for one pair.
+func batchSlotFor(reg *registry.Registry, providerID, model string) (registry.BatchSlot, bool) {
+	for _, s := range reg.BatchSlots(model) {
+		if s.ProviderID == providerID && s.Model == model {
+			return s, true
+		}
+	}
+	return registry.BatchSlot{}, false
 }
 
 // A slot that reports no token budget has no KV signal to read. The view must

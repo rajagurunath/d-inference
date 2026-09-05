@@ -130,9 +130,6 @@ func (r *ObservedRate) PerSec(now time.Time) (itemsPerSec float64, known bool) {
 	return float64(len(r.events)) / r.window().Seconds(), true
 }
 
-// Len is the number of samples still inside the window as of the last eviction.
-func (r *ObservedRate) Len() int { return len(r.events) }
-
 func (r *ObservedRate) evict(now time.Time) {
 	cutoff := now.Add(-r.window())
 	keep := 0
