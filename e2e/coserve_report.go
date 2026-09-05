@@ -1,12 +1,12 @@
-package testbed
+package e2e
 
 // coserve_report.go — the markdown the co-serving benchmark emits.
 //
 // The benchmark's product is a frozen report under docs/reports/ (docs/AGENTS.md
 // §"Reports"): a header, what was measured on what, one metric table, and the
 // caveats that bound how far the numbers travel. Rendering it here rather than
-// in the test keeps the test about measurement and makes the table shape
-// unit-testable without a provider.
+// inside the benchmark keeps the test about measurement and makes the table
+// shape unit-testable without a provider.
 
 import (
 	"fmt"

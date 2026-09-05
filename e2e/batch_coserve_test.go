@@ -408,6 +408,142 @@ func providerAccountID(s *testbed.Suite) string {
 	return accountID
 }
 
+// ---------------------------------------------------------------- phases
+
+// coServeResults is what the four phases measure. Each phase helper fills its
+// own fields and stamps its wall-clock window; the top-level test reads the
+// whole thing for the gates, the earnings buckets and the report.
+type coServeResults struct {
+	OnlineOnly  onlineStats
+	CoServe     onlineStats
+	Flex        onlineStats
+	Ceiling     batchRate
+	HarvestRate batchRate
+
+	PhaseWindows map[string][2]time.Time
+	PhaseElapsed map[string]time.Duration
+}
+
+func newCoServeResults() *coServeResults {
+	return &coServeResults{
+		PhaseWindows: map[string][2]time.Time{},
+		PhaseElapsed: map[string]time.Duration{},
+	}
+}
+
+// record stamps a phase's wall-clock window. The earnings buckets and their
+// per-hour scaling are taken over it.
+func (r *coServeResults) record(name string, start time.Time, elapsed time.Duration) {
+	r.PhaseWindows[name] = [2]time.Time{start, start.Add(elapsed)}
+	r.PhaseElapsed[name] = elapsed
+}
+
+// runOnlineOnlyPhase replays the seeded schedule with nothing else running.
+// This is the baseline every ratio is taken against.
+func runOnlineOnlyPhase(t *testing.T, ctx context.Context, h *coServeHarness, res *coServeResults) bool {
+	return t.Run("online_only", func(t *testing.T) {
+		start := time.Now()
+		samples, elapsed := h.runSchedule(ctx, "")
+		res.record("online_only", start, elapsed)
+		res.OnlineOnly = summariseOnline(samples, elapsed)
+		t.Logf("online_only: n=%d ok=%d 429=%d other=%d p50=%s p99=%s mean=%s max=%s",
+			res.OnlineOnly.Total, res.OnlineOnly.OK, res.OnlineOnly.Reject, res.OnlineOnly.Other,
+			res.OnlineOnly.P50.Round(time.Millisecond), res.OnlineOnly.P99.Round(time.Millisecond),
+			res.OnlineOnly.Mean.Round(time.Millisecond), res.OnlineOnly.Max.Round(time.Millisecond))
+		require.Greater(t, res.OnlineOnly.OK, 0, "the online-only baseline served nothing")
+	})
+}
+
+// runOfflineOnlyPhase runs the offline job alone. Its items/s over the measured
+// window is the ceiling the harvest ratio divides into.
+func runOfflineOnlyPhase(t *testing.T, ctx context.Context, h *coServeHarness, res *coServeResults) bool {
+	return t.Run("offline_only", func(t *testing.T) {
+		start := time.Now()
+		samples, err := h.runBatch(ctx, "offline", coServeWarmup+coServeMeasure)
+		res.record("offline_only", start, time.Since(start))
+		require.NoError(t, err)
+		var found bool
+		res.Ceiling, found = batchRateOverWindow(samples, coServeWarmup, coServeWarmup+coServeMeasure)
+		require.True(t, found,
+			"no usable throughput window in %d samples — the batch settled before %s",
+			len(samples), coServeWarmup)
+		t.Logf("offline ceiling: %.3f items/s over [%s, %s] (%d -> %d items)",
+			res.Ceiling.ItemsPerSec, res.Ceiling.From.Round(time.Second), res.Ceiling.To.Round(time.Second),
+			res.Ceiling.FromItems, res.Ceiling.ToItems)
+		require.Greater(t, res.Ceiling.ItemsPerSec, 0.0, "the batch made no progress alone")
+	})
+}
+
+// runCoServePhase runs the same batch and the same arrival schedule together,
+// measuring both arms the same way as their solo phases.
+func runCoServePhase(t *testing.T, ctx context.Context, h *coServeHarness, res *coServeResults) bool {
+	return t.Run("coserve", func(t *testing.T) {
+		hold := coServeWarmup + coServeMeasure
+		if coServeOnlineWindow > hold {
+			hold = coServeOnlineWindow
+		}
+		start := time.Now()
+
+		var (
+			wg            sync.WaitGroup
+			batchSamples  []batchSample
+			batchErr      error
+			onlineSamples []onlineSample
+			onlineElapsed time.Duration
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			batchSamples, batchErr = h.runBatch(ctx, "coserve", hold)
+		}()
+		go func() {
+			defer wg.Done()
+			onlineSamples, onlineElapsed = h.runSchedule(ctx, "")
+		}()
+		wg.Wait()
+		res.record("coserve", start, time.Since(start))
+		require.NoError(t, batchErr)
+
+		res.CoServe = summariseOnline(onlineSamples, onlineElapsed)
+		var found bool
+		res.HarvestRate, found = batchRateOverWindow(batchSamples, coServeWarmup, coServeWarmup+coServeMeasure)
+		require.True(t, found, "no usable co-serving throughput window in %d samples", len(batchSamples))
+
+		t.Logf("coserve online: n=%d ok=%d 429=%d other=%d p50=%s p99=%s mean=%s max=%s",
+			res.CoServe.Total, res.CoServe.OK, res.CoServe.Reject, res.CoServe.Other,
+			res.CoServe.P50.Round(time.Millisecond), res.CoServe.P99.Round(time.Millisecond),
+			res.CoServe.Mean.Round(time.Millisecond), res.CoServe.Max.Round(time.Millisecond))
+		t.Logf("coserve batch: %.3f items/s over [%s, %s] (%d -> %d items)",
+			res.HarvestRate.ItemsPerSec, res.HarvestRate.From.Round(time.Second),
+			res.HarvestRate.To.Round(time.Second),
+			res.HarvestRate.FromItems, res.HarvestRate.ToItems)
+		require.Greater(t, res.CoServe.OK, 0, "online traffic stopped entirely under batch load")
+	})
+}
+
+// runFlexPhase replays the schedule once more with service_tier: "batch" on
+// every synchronous request — the OpenRouter path — counting 200s against 429s.
+func runFlexPhase(t *testing.T, ctx context.Context, h *coServeHarness, res *coServeResults) bool {
+	return t.Run("flex", func(t *testing.T) {
+		start := time.Now()
+		samples, elapsed := h.runSchedule(ctx, "batch")
+		res.record("flex", start, elapsed)
+		res.Flex = summariseOnline(samples, elapsed)
+		t.Logf("flex (service_tier=batch): n=%d 200=%d 429=%d other=%d p50=%s p99=%s mean=%s max=%s",
+			res.Flex.Total, res.Flex.OK, res.Flex.Reject, res.Flex.Other,
+			res.Flex.P50.Round(time.Millisecond), res.Flex.P99.Round(time.Millisecond),
+			res.Flex.Mean.Round(time.Millisecond), res.Flex.Max.Round(time.Millisecond))
+		// A service_tier=batch request is expected to be served or refused with
+		// a 429 carrying Retry-After. Anything else is recorded rather than
+		// asserted: the report's job is to say what happened, and only the two
+		// plan gates fail the run.
+		if res.Flex.Other > 0 {
+			t.Logf("WARNING: %d service_tier=batch requests ended on neither 200 nor 429", res.Flex.Other)
+		}
+		require.Greater(t, res.Flex.OK+res.Flex.Reject, 0, "the flex arm produced no admission decision at all")
+	})
+}
+
 // ---------------------------------------------------------------- the test
 
 func TestBenchmarkBatchCoServe(t *testing.T) {
@@ -468,125 +604,28 @@ func TestBenchmarkBatchCoServe(t *testing.T) {
 		t.Logf("warm-up %d: %s", i, warm.Duration.Round(time.Millisecond))
 	}
 
-	var (
-		onlineOnly   onlineStats
-		coserve      onlineStats
-		flex         onlineStats
-		ceiling      batchRate
-		harvestRate  batchRate
-		phaseWindows = map[string][2]time.Time{}
-		phaseElapsed = map[string]time.Duration{}
-	)
+	// --- phases ----------------------------------------------------------
 
-	record := func(name string, start time.Time, elapsed time.Duration) {
-		phaseWindows[name] = [2]time.Time{start, start.Add(elapsed)}
-		phaseElapsed[name] = elapsed
-	}
+	res := newCoServeResults()
 
-	ok := t.Run("online_only", func(t *testing.T) {
-		start := time.Now()
-		samples, elapsed := h.runSchedule(ctx, "")
-		record("online_only", start, elapsed)
-		onlineOnly = summariseOnline(samples, elapsed)
-		t.Logf("online_only: n=%d ok=%d 429=%d other=%d p50=%s p99=%s mean=%s max=%s",
-			onlineOnly.Total, onlineOnly.OK, onlineOnly.Reject, onlineOnly.Other,
-			onlineOnly.P50.Round(time.Millisecond), onlineOnly.P99.Round(time.Millisecond),
-			onlineOnly.Mean.Round(time.Millisecond), onlineOnly.Max.Round(time.Millisecond))
-		require.Greater(t, onlineOnly.OK, 0, "the online-only baseline served nothing")
-	})
-	require.True(t, ok, "online_only phase failed; later phases have no baseline")
-
-	ok = t.Run("offline_only", func(t *testing.T) {
-		start := time.Now()
-		samples, err := h.runBatch(ctx, "offline", coServeWarmup+coServeMeasure)
-		record("offline_only", start, time.Since(start))
-		require.NoError(t, err)
-		var found bool
-		ceiling, found = batchRateOverWindow(samples, coServeWarmup, coServeWarmup+coServeMeasure)
-		require.True(t, found,
-			"no usable throughput window in %d samples — the batch settled before %s",
-			len(samples), coServeWarmup)
-		t.Logf("offline ceiling: %.3f items/s over [%s, %s] (%d -> %d items)",
-			ceiling.ItemsPerSec, ceiling.From.Round(time.Second), ceiling.To.Round(time.Second),
-			ceiling.FromItems, ceiling.ToItems)
-		require.Greater(t, ceiling.ItemsPerSec, 0.0, "the batch made no progress alone")
-	})
-	require.True(t, ok, "offline_only phase failed; harvest has no denominator")
+	require.True(t, runOnlineOnlyPhase(t, ctx, h, res),
+		"online_only phase failed; later phases have no baseline")
+	require.True(t, runOfflineOnlyPhase(t, ctx, h, res),
+		"offline_only phase failed; harvest has no denominator")
 
 	quiesce(t, coServeQuiet)
-
-	ok = t.Run("coserve", func(t *testing.T) {
-		hold := coServeWarmup + coServeMeasure
-		if coServeOnlineWindow > hold {
-			hold = coServeOnlineWindow
-		}
-		start := time.Now()
-
-		var (
-			wg            sync.WaitGroup
-			batchSamples  []batchSample
-			batchErr      error
-			onlineSamples []onlineSample
-			onlineElapsed time.Duration
-		)
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			batchSamples, batchErr = h.runBatch(ctx, "coserve", hold)
-		}()
-		go func() {
-			defer wg.Done()
-			onlineSamples, onlineElapsed = h.runSchedule(ctx, "")
-		}()
-		wg.Wait()
-		record("coserve", start, time.Since(start))
-		require.NoError(t, batchErr)
-
-		coserve = summariseOnline(onlineSamples, onlineElapsed)
-		var found bool
-		harvestRate, found = batchRateOverWindow(batchSamples, coServeWarmup, coServeWarmup+coServeMeasure)
-		require.True(t, found, "no usable co-serving throughput window in %d samples", len(batchSamples))
-
-		t.Logf("coserve online: n=%d ok=%d 429=%d other=%d p50=%s p99=%s mean=%s max=%s",
-			coserve.Total, coserve.OK, coserve.Reject, coserve.Other,
-			coserve.P50.Round(time.Millisecond), coserve.P99.Round(time.Millisecond),
-			coserve.Mean.Round(time.Millisecond), coserve.Max.Round(time.Millisecond))
-		t.Logf("coserve batch: %.3f items/s over [%s, %s] (%d -> %d items)",
-			harvestRate.ItemsPerSec, harvestRate.From.Round(time.Second), harvestRate.To.Round(time.Second),
-			harvestRate.FromItems, harvestRate.ToItems)
-		require.Greater(t, coserve.OK, 0, "online traffic stopped entirely under batch load")
-	})
-	require.True(t, ok, "coserve phase failed")
+	require.True(t, runCoServePhase(t, ctx, h, res), "coserve phase failed")
 
 	quiesce(t, coServeQuiet)
-
-	ok = t.Run("flex", func(t *testing.T) {
-		start := time.Now()
-		samples, elapsed := h.runSchedule(ctx, "batch")
-		record("flex", start, elapsed)
-		flex = summariseOnline(samples, elapsed)
-		t.Logf("flex (service_tier=batch): n=%d 200=%d 429=%d other=%d p50=%s p99=%s mean=%s max=%s",
-			flex.Total, flex.OK, flex.Reject, flex.Other,
-			flex.P50.Round(time.Millisecond), flex.P99.Round(time.Millisecond),
-			flex.Mean.Round(time.Millisecond), flex.Max.Round(time.Millisecond))
-		// A service_tier=batch request is expected to be served or refused with
-		// a 429 carrying Retry-After. Anything else is recorded rather than
-		// asserted: the report's job is to say what happened, and only the two
-		// plan gates below fail the run.
-		if flex.Other > 0 {
-			t.Logf("WARNING: %d service_tier=batch requests ended on neither 200 nor 429", flex.Other)
-		}
-		require.Greater(t, flex.OK+flex.Reject, 0, "the flex arm produced no admission decision at all")
-	})
-	require.True(t, ok, "flex phase failed")
+	require.True(t, runFlexPhase(t, ctx, h, res), "flex phase failed")
 
 	// --- gates -----------------------------------------------------------
 
-	p99Ratio := ratio(coserve.P99, onlineOnly.P99)
-	p50Ratio := ratio(coserve.P50, onlineOnly.P50)
+	p99Ratio := ratio(res.CoServe.P99, res.OnlineOnly.P99)
+	p50Ratio := ratio(res.CoServe.P50, res.OnlineOnly.P50)
 	harvest := 0.0
-	if ceiling.ItemsPerSec > 0 {
-		harvest = harvestRate.ItemsPerSec / ceiling.ItemsPerSec
+	if res.Ceiling.ItemsPerSec > 0 {
+		harvest = res.HarvestRate.ItemsPerSec / res.Ceiling.ItemsPerSec
 	}
 
 	t.Logf("GATES: p99 ratio %.2f (< %.1f), harvest %.2f (> %.2f)",
@@ -597,12 +636,12 @@ func TestBenchmarkBatchCoServe(t *testing.T) {
 	payoutAccount := providerAccountID(s)
 	earnings := map[string]map[string]laneEarnings{}
 	for _, phase := range []string{"online_only", "offline_only", "coserve", "flex"} {
-		window := phaseWindows[phase]
+		window := res.PhaseWindows[phase]
 		earnings[phase] = earningsByLane(t, s.PgStore, payoutAccount, window[0], window[1])
 		for lane, agg := range earnings[phase] {
 			t.Logf("earnings %s/%s: %d rows, %.4f USD -> %.4f USD/h",
 				phase, lane, agg.Rows, float64(agg.MicroUSD)/1e6,
-				earningsPerHour(agg.MicroUSD, phaseElapsed[phase]))
+				earningsPerHour(agg.MicroUSD, res.PhaseElapsed[phase]))
 		}
 	}
 
@@ -612,16 +651,16 @@ func TestBenchmarkBatchCoServe(t *testing.T) {
 		Suite:        s,
 		Model:        h.model,
 		Schedule:     h.schedule,
-		OnlineOnly:   onlineOnly,
-		CoServe:      coserve,
-		Flex:         flex,
-		Ceiling:      ceiling,
-		HarvestRate:  harvestRate,
+		OnlineOnly:   res.OnlineOnly,
+		CoServe:      res.CoServe,
+		Flex:         res.Flex,
+		Ceiling:      res.Ceiling,
+		HarvestRate:  res.HarvestRate,
 		Harvest:      harvest,
 		P50Ratio:     p50Ratio,
 		P99Ratio:     p99Ratio,
 		Earnings:     earnings,
-		PhaseElapsed: phaseElapsed,
+		PhaseElapsed: res.PhaseElapsed,
 	})
 	rendered := report.Render()
 	t.Logf("\n%s", rendered)
@@ -670,10 +709,10 @@ type coServeReportInput struct {
 	PhaseElapsed map[string]time.Duration
 }
 
-func buildCoServeReport(in coServeReportInput) testbed.CoServeReport {
+func buildCoServeReport(in coServeReportInput) CoServeReport {
 	ms := func(d time.Duration) string { return fmt.Sprintf("%d ms", d.Round(time.Millisecond).Milliseconds()) }
 
-	metrics := []testbed.CoServeMetric{
+	metrics := []CoServeMetric{
 		{
 			Name:       "offline ceiling",
 			Definition: fmt.Sprintf("batch items settled per second with no online load, measured over the %s window that opens %s after the batch is created", coServeMeasure, coServeWarmup),
@@ -730,19 +769,19 @@ func buildCoServeReport(in coServeReportInput) testbed.CoServeReport {
 	for _, phase := range []string{"online_only", "offline_only", "coserve", "flex"} {
 		lanes := in.Earnings[phase]
 		elapsed := in.PhaseElapsed[phase]
-		metrics = append(metrics, testbed.CoServeMetric{
+		metrics = append(metrics, CoServeMetric{
 			Name:       "earnings/hour — " + phase,
 			Definition: fmt.Sprintf("Σ provider_earnings rows created during the phase, by Lane, scaled from the phase's %s to one hour", elapsed.Round(time.Second)),
 			Value:      formatLaneEarnings(lanes, elapsed),
 		})
 	}
 
-	return testbed.CoServeReport{
+	return CoServeReport{
 		Title: "Batch co-serving benchmark",
 		Intro: "What one Mac gives back when the Tidal batch lane fills the gaps between online requests, " +
 			"and what that costs the online requests. Produced by `TestBenchmarkBatchCoServe` " +
 			"(`e2e/batch_coserve_test.go`) against a real coordinator, a real Swift provider and real MLX inference.",
-		Setup: []testbed.CoServeSetting{
+		Setup: []CoServeSetting{
 			{Name: "host", Value: envOr("RUNNER_DESC", fmt.Sprintf("local %s/%s", runtime.GOOS, runtime.GOARCH))},
 			{Name: "run", Value: time.Now().UTC().Format("2006-01-02 15:04 UTC")},
 			{Name: "model", Value: "`" + in.Model + "`"},

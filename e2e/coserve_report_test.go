@@ -1,4 +1,4 @@
-package testbed
+package e2e
 
 import (
 	"strings"
