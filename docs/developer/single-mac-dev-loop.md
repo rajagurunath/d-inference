@@ -1,6 +1,6 @@
 # Single-Mac dev loop
 
-> Last updated: 2026-09-05 · commit `9611f8771`
+> Last updated: 2026-09-05 · commit `9db54d94c`
 
 Run a coordinator and one provider on one Mac for manual testing, without
 touching the shared dev environment or writing a throwaway launch script. For
@@ -87,9 +87,12 @@ Ctrl-C.
 
 Other flags, via `DEVSTACK_ARGS`: `--provider-binary <path>` (skip the
 from-source build), `--model <id>` (default: `DARKBLOOM_TESTBED_MODEL`),
-`--postgres` (a real Postgres store instead of memory — see below), and
+`--postgres` (a real Postgres store instead of memory — see below),
 `--api-key <sk-db-…>` (default: `DARKBLOOM_DEV_KEY`; reuse a key the store
-already holds instead of minting one).
+already holds instead of minting one), and `--real-challenges` (default:
+`DARKBLOOM_DEVSTACK_REAL_CHALLENGES`; run the production attestation
+challenge/response loop instead of the testbed's skip posture — see
+[Troubleshooting](#troubleshooting)).
 
 `--postgres` has two modes, chosen by the first of these that is set:
 
@@ -384,6 +387,7 @@ operator-facing surface for the model-load verdict.
 | Port 18080 still held after you stopped the stack | SIGINT went to `make`/`sh`, not the Go binary — or to a `pgrep -f 'exe/devstack'` pattern that matched nothing because Go reused its cached executable | `kill -INT "$(lsof -t -nP -iTCP:18080 -sTCP:LISTEN)"` |
 | A batch stays at `in_progress` with `completed: 0` and nothing in the log | The model is not resident on any provider, so no slot has batch headroom and the dispatcher claims nothing | Serve one ordinary chat completion for that model first (`dev-smoke-batch-api.sh` now does this itself) |
 | Every `/v1/files` or `/v1/batches` call returns `503 batch_unavailable` | The coordinator has no batch blob store: `EIGENINFERENCE_BATCH_DEV_INSECURE_KEY` / `EIGENINFERENCE_BATCH_BLOB_DIR` were not exported *before* the stack started | Stop the stack, export both, start again; confirm `batch lane enabled` in the startup log |
+| Every request 429s with `no provider … available` after ~16 minutes of uptime, `/v1/models/capacity` is `{"models": []}`, and the provider is still connected and warm | The dev stack skips attestation challenges, and *skipping* used to mean the challenge-freshness stamp was written once at registration and never again. 16 minutes on (`challengeFreshnessMaxAge`, `coordinator/registry/scheduler.go`) the routing liveness gate closes with `challenge_stale` and drops the provider from every candidate scan, the capacity feed and the warm pool | Fixed in the coordinator: with challenges skipped it now restamps freshness every 5 minutes (`Server.skippedChallengeRefreshLoop`, `coordinator/api/provider.go`). On an older build the only lever is bouncing the provider, which buys another 16 minutes. To exercise the real attestation path instead, run `make dev-stack DEVSTACK_ARGS=--real-challenges` (or `DARKBLOOM_DEVSTACK_REAL_CHALLENGES=true`) |
 
 ## Related
 

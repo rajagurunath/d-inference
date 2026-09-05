@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased — skipped attestation challenges keep providers routable
+
+- Skipping attestation challenges (testing only) no longer behaves like failing them: the coordinator refreshes each connected provider's challenge-freshness stamp on a cadence inside the routing gate's window, so a long-lived stack no longer derouts every provider 16 minutes after it connects.
+- Added `SuiteConfig.RealChallenges` and `e2e/cmd/devstack --real-challenges` (`DARKBLOOM_DEVSTACK_REAL_CHALLENGES`) to run the production challenge/response path in the dev loop.
+
 ## Unreleased — stats location refresh
 
 - Restore public stats refreshes on large usage tables by aggregating locations per provider before combining location totals. Preserve distinct-provider and token counts and request-weighted coordinates without sorting every usage row. Keep the selective cutoff's query plan local to the analytics transaction.
