@@ -95,6 +95,37 @@ func ResolveKVBackend(explicit string) string {
 	return os.Getenv("DARKBLOOM_TESTBED_KV_BACKEND")
 }
 
+// DevRestartMnemonic is the fixed, publicly-known BIP39 all-zero test vector
+// the dev stack falls back to when it is asked to keep a persistent database
+// across restarts and the environment names no mnemonic of its own.
+//
+// It is NOT a secret and must never reach a deployment: it exists so
+// `make dev-stack --postgres` against EIGENINFERENCE_DATABASE_URL takes the
+// PRODUCTION key path (sealedblob.DeriveKey) instead of
+// EIGENINFERENCE_BATCH_DEV_INSECURE_KEY's process-local random key. A random
+// key makes every blob written by the previous process undecryptable, which
+// is what stops a restarted dev stack from resuming a batch it had already
+// sealed inputs for.
+const DevRestartMnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+
+// ResolveEncryptionMnemonic returns the BIP39 mnemonic the suite's coordinator
+// derives its sender-encryption and batch-store keys from: the explicit value
+// when set, else the same MNEMONIC / EIGENINFERENCE_MNEMONIC pair
+// billing.ReadConfig reads in production, else "".
+//
+// "" is not a failure: api.NewBatchBlobStore falls back to
+// EIGENINFERENCE_BATCH_DEV_INSECURE_KEY (a process-local random key) and
+// otherwise leaves the batch lane off.
+func ResolveEncryptionMnemonic(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if m := os.Getenv("MNEMONIC"); m != "" {
+		return m
+	}
+	return os.Getenv("EIGENINFERENCE_MNEMONIC")
+}
+
 // ResolveMaxConcurrent returns the per-slot concurrency cap: the explicit
 // value when non-zero, else DARKBLOOM_TESTBED_MAX_CONCURRENT, else 0 (leave
 // the provider to pick).
@@ -305,6 +336,38 @@ type SuiteConfig struct {
 	// REQUESTS a backend, this one asserts the CONSTRUCTED one — a lane
 	// exercising the `.auto` default sets only the expectation.
 	ExpectKVBackend string
+	// DatabaseURL attaches a non-memory suite to an EXISTING Postgres
+	// instead of provisioning an ephemeral one. Empty provisions the
+	// ephemeral container/initdb the testbed owns and removes on Stop.
+	//
+	// The testbed does not create, migrate away or drop a database named
+	// here — only Suite.Stop's ephemeral path removes anything — so a dev
+	// stack restarted against the same URL sees the rows the previous
+	// process left behind.
+	//
+	// DELIBERATELY has no environment fallback. The obvious candidate,
+	// EIGENINFERENCE_DATABASE_URL, is WRITTEN by the testbed itself:
+	// deps.PostgresLifecycle.SetEnv exports the ephemeral instance's URL into
+	// the process. A suite that read it back would, on the second suite in a
+	// test binary, attach to the first suite's already-removed database. Only
+	// a caller that knows it owns a database sets this field —
+	// e2e/cmd/devstack resolves the developer-facing variable itself.
+	DatabaseURL string
+	// APIKey asks the suite to reuse an already-issued raw key for Users[0]
+	// instead of minting a fresh one. Empty always mints.
+	//
+	// The store generates its own key material and stores only a hash, so a
+	// key that is not already present cannot be created from a caller-supplied
+	// secret: createUserPool adopts the key when the store validates it and
+	// otherwise WARNs and mints. That makes this useful for exactly one thing
+	// — carrying the key a previous run printed across a restart against a
+	// persistent DatabaseURL.
+	APIKey string
+	// EncryptionMnemonic is forwarded to billing.Config so the coordinator
+	// derives its sender-encryption key and the batch lane's seal key from it,
+	// exactly as coordinator/cmd/coordinator/main.go does. Empty falls back to
+	// MNEMONIC / EIGENINFERENCE_MNEMONIC (see ResolveEncryptionMnemonic).
+	EncryptionMnemonic string
 	// ListenAddr pins the coordinator's HTTP listener to a fixed address
 	// (e.g. "127.0.0.1:18080") instead of the ephemeral 127.0.0.1:0 default.
 	// Empty preserves the ephemeral-port behaviour every existing suite

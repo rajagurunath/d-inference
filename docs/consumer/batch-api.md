@@ -1,6 +1,6 @@
 # Batch API
 
-> Last updated: 2026-09-05 · commit `2838c3fbf`
+> Last updated: 2026-09-05 · commit `6a7000ee4`
 
 Send a large set of chat completions on a 24-hour deadline instead of one at a
 time. Batch work runs only on provider slots the online quality cap is already
@@ -232,6 +232,11 @@ request in memory while it routes it.
 where expired and cancelled items move neither counter, so
 `completed + failed ≤ total`.
 
+Cancelling is idempotent: `POST /v1/batches/{id}/cancel` on a batch already in
+`cancelling` or `cancelled` returns `200` with the batch as it stands, not an
+error. Only the other three terminal states — `completed`, `failed`, `expired` —
+answer `409` `batch_not_cancellable`.
+
 ## Pricing
 
 Batch is metered at half the list price with no per-request minimum charge; the
@@ -265,7 +270,7 @@ briefly holds more of your balance than it will finally cost.
 | `400` `unsupported_content` | An image/audio/video/file content part | Batch is text-only; use a synchronous request |
 | `404` `not_found` on a batch or file you own | The id belongs to another account, or does not exist | Both answer the same 404 by design |
 | `404` `file_content_purged` | Past the 7-day retention window, or an input file already fanned out into a batch | Metadata remains; the content is gone |
-| `409` `batch_not_cancellable` | The batch is already terminal | Nothing to do |
+| `409` `batch_not_cancellable` | The batch is `completed`, `failed` or `expired`. `cancelled` and `cancelling` are **not** in this set — re-cancelling one of those is `200` with the batch object, so cancel is idempotent (`handleBatchCancel`, `coordinator/api/batch_handlers.go`) | Nothing to do |
 | Batch sits at `in_progress` with no progress | No provider slot has headroom yet — the lane only uses capacity online traffic is not using | Wait; a batch escalates on its own as its slack runs out |
 
 ## Related

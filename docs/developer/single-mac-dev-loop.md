@@ -1,6 +1,6 @@
 # Single-Mac dev loop
 
-> Last updated: 2026-09-05 · commit `2838c3fbf`
+> Last updated: 2026-09-05 · commit `897e32333`
 
 Run a coordinator and one provider on one Mac for manual testing, without
 touching the shared dev environment or writing a throwaway launch script. For
@@ -86,11 +86,30 @@ base URL, a test API key, and the provider's PID, then blocks until you press
 Ctrl-C.
 
 Other flags, via `DEVSTACK_ARGS`: `--provider-binary <path>` (skip the
-from-source build), `--model <id>` (default: `DARKBLOOM_TESTBED_MODEL`), and
-`--postgres` (a real Postgres store instead of memory; the harness provisions
-its own ephemeral instance via Docker or a native `initdb`/`postgres` —
-`e2e/testbed/deps/postgres.go` — it does not attach to an already-running
-server).
+from-source build), `--model <id>` (default: `DARKBLOOM_TESTBED_MODEL`),
+`--postgres` (a real Postgres store instead of memory — see below), and
+`--api-key <sk-db-…>` (default: `DARKBLOOM_DEV_KEY`; reuse a key the store
+already holds instead of minting one).
+
+`--postgres` has two modes, chosen by the first of these that is set:
+
+| Variable (read only under `--postgres`) | Store | Lifecycle |
+|---|---|---|
+| neither (default) | an ephemeral instance the harness provisions via Docker or a native `initdb`/`postgres` (`e2e/testbed/deps/postgres.go`) | created at start, **removed** at stop — batches, items and keys are gone |
+| `DARKBLOOM_DEVSTACK_DATABASE_URL` | the database it names | the stack neither creates nor drops it; migrations run on connect, and every row survives a stop |
+| `EIGENINFERENCE_DATABASE_URL` | same, second choice | same |
+
+Prefer `DARKBLOOM_DEVSTACK_DATABASE_URL`. `EIGENINFERENCE_DATABASE_URL` is
+accepted because it is the name a coordinator already reads, but the testbed
+*writes* that variable when it provisions an ephemeral instance
+(`deps.PostgresLifecycle.SetEnv`), so it is not a reliable statement of intent
+inside a process that makes databases of its own. Resolution therefore happens
+in `e2e/cmd/devstack/main.go`; `testbed.SuiteConfig.DatabaseURL` has no
+environment fallback at all, and the startup log names the variable it used.
+
+Only the persistent modes make restart resilience observable, because all
+three of the database, the API key and the batch seal key have to survive
+together — see [Restart test](#restart-test).
 
 ### 2. Run the smoke script
 
@@ -114,12 +133,19 @@ to the `make` or `sh` PID never reaches it and leaves the provider and port
 18080 held.
 
 ```bash
-kill -INT "$(pgrep -f 'exe/devstack')"
+kill -INT "$(lsof -t -nP -iTCP:18080 -sTCP:LISTEN)"
 ```
 
-A clean stop prints `provider stopped` and `dev stack stopped`, releases port
-18080, and removes the testbed's migrated
-`~/.config/darkbloom/provider.toml`.
+Signal the listener, not a name: `pgrep -f 'exe/devstack'` matches only the
+**first** `go run` of a session. Afterwards Go reuses its cached executable
+and the process is `…/Library/Caches/go-build/…/devstack`, which that pattern
+misses — SIGINT then goes nowhere and port 18080 stays held.
+
+A clean stop prints `provider stopped` and `dev stack stopped` and releases
+port 18080. The provider's config is written into a per-instance temp state
+dir (`provider config written path=/var/folders/…/darkbloom-testbed-state-0-…/provider.toml`),
+so nothing under `~/.config/darkbloom/` is created or removed by a dev-stack
+run.
 
 ## Morning checklist
 
@@ -210,12 +236,69 @@ you start yourself):
 
 | Variable | Dev value | Why |
 |---|---|---|
-| `EIGENINFERENCE_BATCH_DEV_INSECURE_KEY` | `true` | No mnemonic locally, so the lane would otherwise refuse to start. Blobs become unreadable at restart; that is fine for a dev loop |
+| `EIGENINFERENCE_BATCH_DEV_INSECURE_KEY` | `true` | No mnemonic locally, so the lane would otherwise refuse to start. Blobs become unreadable at restart; that is fine for a dev loop, but leave it unset for the [Restart test](#restart-test) |
 | `EIGENINFERENCE_BATCH_BLOB_DIR` | `$TMPDIR/darkbloom-batch` | The default is `/mnt/disks/userdata/batch`, which does not exist on a Mac |
 | `EIGENINFERENCE_BATCH_LANE_ENABLED` | unset (`true`) | Set `false` to keep the API serving while nothing dispatches. Read only by `coordinator/cmd/coordinator/batch_lane.go`; `make dev-stack` starts its dispatcher unconditionally once the blob store exists |
 
 Full descriptions:
 [`../reference/configuration.md#batch-lane`](../reference/configuration.md#batch-lane).
+
+## Restart test
+
+The batch lane requeues items a previous process left in flight
+(`Dispatcher.requeueAfterRestart`). Reaching that path from this loop needs
+three things to outlive the process — the rows, the key that addresses them,
+and the key the blobs are sealed with — so the recipe sets all three:
+
+```bash
+createdb dinf_devstack        # once
+export DARKBLOOM_DEVSTACK_DATABASE_URL='postgres://localhost:5432/dinf_devstack?sslmode=disable'
+export EIGENINFERENCE_BATCH_BLOB_DIR=/tmp/dinf-devstack-blobs   # a FIXED dir, not mktemp -d
+unset EIGENINFERENCE_BATCH_DEV_INSECURE_KEY                     # would seal with a random key
+export DEVSTACK_ARGS=--postgres
+make dev-stack
+```
+
+The stack logs `persistent postgres store source=DARKBLOOM_DEVSTACK_DATABASE_URL`
+and `using persistent postgres store (not provisioned or dropped by the
+testbed)` and, because no `MNEMONIC` is set, a WARN that it is sealing with
+the fixed dev mnemonic — a publicly known BIP39 test vector, chosen so the seal
+key is *derived* (the production path, `sealedblob.DeriveKey`) instead of
+random. Set `MNEMONIC` yourself to override it; never run a deployment on the
+dev value.
+
+Start a batch, let some items settle, then stop and restart with the key the
+first run printed:
+
+```bash
+# terminal B: upload a 30-line JSONL, POST /v1/batches, poll until completed > 0
+kill -INT "$(lsof -t -nP -iTCP:18080 -sTCP:LISTEN)"
+
+# terminal A: same environment, plus the key from the first run's banner
+DARKBLOOM_DEV_KEY=<the key terminal A printed> make dev-stack
+```
+
+The second start logs the resume and reuses the key:
+
+```
+level=INFO msg="reusing configured API key" account_id=testbed-user-0
+level=INFO msg="batch lane: requeued items left inflight by a previous process" batches=1 items=3
+```
+
+`GET /v1/batches/{id}` with the **old** key answers 200 and the batch runs to
+`completed` with every item, including the ones whose results were sealed by
+the previous process. Warm the model again first — a restarted provider holds
+no slot for it, so the dispatcher claims nothing until one ordinary completion
+loads it.
+
+The key can be reused but not chosen: the store generates its own secrets and
+persists only a hash, so `--api-key` adopts a key the store already holds and
+otherwise WARNs and mints a fresh one. Take the key from the first run's
+banner.
+
+Clean up with `dropdb dinf_devstack` and `rm -rf /tmp/dinf-devstack-blobs`;
+with neither URL variable set the stack is back to the ephemeral store that is
+thrown away on every stop.
 
 ## Measured on this loop
 
@@ -266,7 +349,7 @@ operator-facing surface for the model-load verdict.
 | `dev stack failed to start` | Provider never registered, or the checkpoint is not CBv2-servable | Check `DARKBLOOM_TESTBED_MODEL` is in the HF cache and its family is CBv2-supported (`qwen3_5` is) |
 | smoke script prints `no SSE 'data:' line within 60s` | Slow first load, or the wrong model was requested | Re-run; confirm the script's `DARKBLOOM_TESTBED_MODEL` matches what `make dev-stack` served |
 | `DARKBLOOM_DEV_KEY not set` | Forgot to copy the key `make dev-stack` printed | Copy it from terminal A's startup output |
-| Port 18080 still held after you stopped the stack | SIGINT went to `make`/`sh`, not the Go binary | `kill -INT "$(pgrep -f 'exe/devstack')"` |
+| Port 18080 still held after you stopped the stack | SIGINT went to `make`/`sh`, not the Go binary — or to a `pgrep -f 'exe/devstack'` pattern that matched nothing because Go reused its cached executable | `kill -INT "$(lsof -t -nP -iTCP:18080 -sTCP:LISTEN)"` |
 | A batch stays at `in_progress` with `completed: 0` and nothing in the log | The model is not resident on any provider, so no slot has batch headroom and the dispatcher claims nothing | Serve one ordinary chat completion for that model first (`dev-smoke-batch-api.sh` now does this itself) |
 | Every `/v1/files` or `/v1/batches` call returns `503 batch_unavailable` | The coordinator has no batch blob store: `EIGENINFERENCE_BATCH_DEV_INSECURE_KEY` / `EIGENINFERENCE_BATCH_BLOB_DIR` were not exported *before* the stack started | Stop the stack, export both, start again; confirm `batch lane enabled` in the startup log |
 

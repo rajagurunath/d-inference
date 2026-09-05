@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,11 +62,18 @@ type Suite struct {
 	Logger *slog.Logger
 	Config SuiteConfig
 
+	// Pg is the ephemeral Postgres this suite provisioned, or nil when it
+	// attached to a persistent DatabaseURL (or runs on the memory store).
+	// Only a non-nil Pg is torn down by Stop.
 	Pg          *deps.PostgresLifecycle
 	PgStore     store.Store
 	Coordinator *Coordinator
 	Providers   []*Provider
 	Users       []UserAccount
+
+	// pgPersistent records that PgStore points at a database the caller owns,
+	// so Stop leaves it — and everything in it — alone.
+	pgPersistent bool
 
 	// privacyMu guards privacyAtRegistration, written once during Start and
 	// read afterwards from test goroutines.
@@ -229,7 +237,23 @@ func (s *Suite) Stop() {
 	}
 	if s.Pg != nil {
 		s.Pg.Stop()
+	} else if s.pgPersistent {
+		s.Logger.Info("persistent postgres left in place (SuiteConfig.DatabaseURL)")
 	}
+}
+
+// redactDatabaseURL strips any userinfo from a Postgres URL so a log line
+// never carries the password of a database the developer owns. A URL that
+// does not parse is reported as "<unparsable>" rather than echoed.
+func redactDatabaseURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparsable>"
+	}
+	if u.User != nil {
+		u.User = url.User(u.User.Username())
+	}
+	return u.String()
 }
 
 func (s *Suite) startPostgres() error {
@@ -242,14 +266,27 @@ func (s *Suite) startPostgres() error {
 		return nil
 	}
 
-	s.Pg = deps.NewPostgresLifecycle(s.Logger, 0)
-	if err := s.Pg.Start(s.Ctx); err != nil {
-		return fmt.Errorf("postgres: %w", err)
+	databaseURL := s.Config.DatabaseURL
+	if databaseURL != "" {
+		// A database the caller owns. The testbed neither provisions nor
+		// drops it, so its rows outlive Stop and a restarted stack can pick
+		// up the batches, items and keys the previous process left. Migrations
+		// still run — NewPostgres migrates on connect — so an empty database
+		// is a valid starting point.
+		s.pgPersistent = true
+		s.Logger.Info("using persistent postgres store (not provisioned or dropped by the testbed)",
+			"url", redactDatabaseURL(databaseURL))
+	} else {
+		s.Pg = deps.NewPostgresLifecycle(s.Logger, 0)
+		if err := s.Pg.Start(s.Ctx); err != nil {
+			return fmt.Errorf("postgres: %w", err)
+		}
+		databaseURL = s.Pg.DatabaseURL
+		s.Logger.Info("postgres started", "url", databaseURL)
 	}
-	s.Logger.Info("postgres started", "url", s.Pg.DatabaseURL)
 
 	var err error
-	s.PgStore, err = NewPostgresStore(s.Ctx, s.Pg.DatabaseURL)
+	s.PgStore, err = NewPostgresStore(s.Ctx, databaseURL)
 	if err != nil {
 		return fmt.Errorf("postgres store: %w", err)
 	}
@@ -262,10 +299,19 @@ func (s *Suite) startPostgres() error {
 func (s *Suite) createUserPool() error {
 	for i := 0; i < s.Config.NumUsers; i++ {
 		accountID := fmt.Sprintf("testbed-user-%d", i)
-		apiKey, err := s.PgStore.CreateKeyForAccount(accountID)
-		if err != nil {
-			return fmt.Errorf("create key for user %d: %w", i, err)
+
+		apiKey := ""
+		if i == 0 {
+			apiKey = s.adoptConfiguredKey(&accountID)
 		}
+		if apiKey == "" {
+			var err error
+			apiKey, err = s.PgStore.CreateKeyForAccount(accountID)
+			if err != nil {
+				return fmt.Errorf("create key for user %d: %w", i, err)
+			}
+		}
+
 		if err := s.PgStore.Credit(accountID, s.Config.SeedBalance, store.LedgerDeposit, "test-seed"); err != nil {
 			return fmt.Errorf("credit user %d: %w", i, err)
 		}
@@ -276,6 +322,37 @@ func (s *Suite) createUserPool() error {
 	}
 	s.Logger.Info("user pool created", "count", len(s.Users))
 	return nil
+}
+
+// adoptConfiguredKey returns SuiteConfig.APIKey when the store already holds
+// it as an active key, rewriting accountID to that key's owner so Users[0]
+// names the account the key actually spends from. It returns "" — leaving the
+// caller to mint a fresh key — when no key is configured or the store does not
+// know this one.
+//
+// The store never accepts a caller-supplied secret: CreateAPIKey generates its
+// own raw key and persists only SHA-256(key) (coordinator/store/postgres.go,
+// CreateAPIKey), and the only seeding path, PostgresStore.SeedKey, is
+// account-less and reserved for the admin key. So a key can be REUSED but not
+// CHOSEN: the first run against a persistent database prints a key, and later
+// runs carry it back in through this field.
+func (s *Suite) adoptConfiguredKey(accountID *string) string {
+	key := strings.TrimSpace(s.Config.APIKey)
+	if key == "" {
+		return ""
+	}
+	active, owner, err := s.PgStore.ValidateKeyFull(key)
+	if err != nil || !active {
+		s.Logger.Warn("configured API key is not in this store — minting a fresh one "+
+			"(the store mints its own secrets; a chosen key can only be reused, not created)",
+			"error", err)
+		return ""
+	}
+	if owner != "" {
+		*accountID = owner
+	}
+	s.Logger.Info("reusing configured API key", "account_id", *accountID)
+	return key
 }
 func (s *Suite) startCoordinator() error {
 	reg := registry.New(s.Logger)
@@ -304,7 +381,14 @@ func (s *Suite) startCoordinator() error {
 	srv.SetAllowDuplicateProviderSerialsForTesting(true)
 
 	ledger := payments.NewLedger(s.PgStore)
-	billingCfg := billing.Config{MockMode: true}
+	// EncryptionMnemonic travels the production path: billing.Config carries it
+	// into api.NewBatchBlobStore below, which derives the batch-store key with
+	// sealedblob.DeriveKey. Empty keeps the historical behaviour (no mnemonic,
+	// so the lane is off unless EIGENINFERENCE_BATCH_DEV_INSECURE_KEY is set).
+	billingCfg := billing.Config{
+		MockMode:           true,
+		EncryptionMnemonic: ResolveEncryptionMnemonic(s.Config.EncryptionMnemonic),
+	}
 	billingSvc := billing.NewService(s.PgStore, ledger, s.Logger, billingCfg)
 	srv.SetBilling(billingSvc)
 

@@ -1,6 +1,6 @@
 # Tidal batch lane: co-serving online and batch traffic on the idle fleet
 
-> Last updated: 2026-09-05 · commit `2838c3fbf`
+> Last updated: 2026-09-05 · commit `4796db242`
 
 **Status: In progress** — 2026-09-05. The store, the sealed blob store, the
 Batch API, the lane trait and reservation filter, the 1 Hz dispatcher and the
@@ -13,6 +13,18 @@ As-built deviation from §3.3: scrub triggers were not added to the batch
 tables; the accepted mitigation is `T-052` in
 [`../threat-model.yaml`](../threat-model.yaml) — the three tables carry no
 content column at all, asserted by `TestNoContentColumnsInBatchTables`.
+
+As-built deviation from §3.4 step 2: there is no per-slot AIMD `floor`. The
+decrease rule as built is `target = target / 2`; `AIMD.Floor` / `SetFloor` were
+dead code and have been removed. The deadline guarantee is the per-batch token
+bucket of step 3, not a floor under every slot's target
+(`coordinator/batchlane/control.go`).
+
+As-built deviation from §3.4 step 4: the claim is not an unscoped
+`Σ(target − inflight)`. Per-slot targets are summed into a per-model headroom
+as well as a fleet total, and each batch is capped at the headroom of the slots
+serving its own model. A batch declaring no model — the file form, whose lines
+each carry their own — still spends the fleet total.
 
 Original status: **Proposed** — 2026-09-05; evidence: fleet utilization of 12–19% and a
 99.94% free token budget recorded in [`routing-v2.md`](routing-v2.md), and the
